@@ -20,7 +20,7 @@ Open source. Linux first, cross-platform (Windows, macOS) after.
 | Decision | Choice |
 |---|---|
 | License | Open source |
-| UI framework | GPUI + gpui-component (pin git revisions, expect churn) |
+| UI framework | GPUI (base) + gpui-component, with gpui-base as the behavior layer (pin git revisions, expect churn) |
 | Export engine | Bundled darktable-cli, version-pinned (GPLv3 → subprocess only, never linked) |
 | Raw handling | NEF + other raws via rawler embedded-preview extraction (LGPL, pure Rust) |
 | LR interop | Best-effort `crs:` sidecars (ProcessVersion=11.0) so LR can read edits/crop; LR is never required in the flow |
@@ -72,6 +72,23 @@ Open source. Linux first, cross-platform (Windows, macOS) after.
                       │ resume, retry, status   │
                       └─────────────────────────┘
 ```
+
+### UI component mapping
+
+Styled widgets come from `gpui-component`; `gpui-base` provides the unstyled
+behavior layer (focus, overlay positioning, virtualization, a11y) so bespoke
+surfaces can use the same behaviors without fighting a styled component.
+
+| App surface | Component |
+|---|---|
+| Window shell | `Root`, `TitleBar`, `Sidebar`, `StatusBar` |
+| Contact sheet | Custom grid: `uniform_list` (gpui) of chunked rows over gpui-base virtualization; `DataTable` if a table view is ever needed |
+| Single view / crop | `canvas()` / custom `Element` + `paint_image`/`paint_path` (crop rect, thirds, handles); `Slider`s for quick edits |
+| IPTC template editor | `Form` (multi-column, validated) + `Input`/`Textarea`/`Select`/`Combobox` |
+| Ingest dialog | `Dialog` + per-card `Progress` + `Table` for file lists |
+| Send recipes | `Form` + named-recipe `List` |
+| Upload status | `Badge`/`Tag` on thumbnails, `Notification` for failures |
+| Menus / shortcuts | `Menu` (context menus), gpui actions + JSON keymaps (Alt+arrows, Alt+S), `Kbd` for cheat-sheet |
 
 ### Key mechanics
 
@@ -146,7 +163,7 @@ Each milestone is a vertical slice that runs end-to-end on Linux.
 
 | Concern | Choice |
 |---|---|
-| UI | gpui + gpui-component (git-pinned) |
+| UI | gpui + gpui-base + gpui-component (git-pinned to a matching zed revision) |
 | Raw previews | rawler (LGPL) |
 | Decode/encode | image + zune-jpeg (turbojpeg if encode speed matters) |
 | Pixel ops | rayon, fast_image_resize |
