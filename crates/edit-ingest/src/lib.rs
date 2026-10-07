@@ -16,15 +16,17 @@
 pub mod copy;
 pub mod ingest;
 pub mod naming;
+#[cfg(test)]
+pub(crate) mod testutil;
 pub mod volumes;
 
 pub use copy::{
     CopyError, CopyOutcome, CopyRequest, CopyStage, copy_verified, copy_verified_with, hash_file,
-    unique_path,
+    sweep_temp_files, unique_path,
 };
 pub use ingest::{
-    CardFile, IngestCopyPayload, IngestError, IngestSummary, enumerate_card, plan_card,
-    run_ingest_copy,
+    CardFile, FileMetadata, IngestCopyPayload, IngestError, IngestPlan, IngestPlanRequest,
+    IngestSummary, batch_volume_identity, enumerate_card, plan_card, plan_ingest, run_ingest_copy,
 };
 pub use naming::{
     NamingContext, NamingError, expand_tilde, render_dir, render_filename, static_prefix, validate,

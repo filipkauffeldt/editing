@@ -3,23 +3,29 @@
 //! One `ingest_copy` job runs one card (plan `PLAN.md` core loop: two cards
 //! ingest in parallel with per-card progress). The job enumerates the card,
 //! records every file, checks the Lightroom-style duplicate triple
-//! (original name, EXIF capture time, size), then copies each newcomer with
+//! (original name, capture time, size), then copies each newcomer with
 //! [`crate::copy`], inserts the catalog photo, and queues a thumbnail job.
 //!
-//! The job never reads EXIF itself: the caller injects a capture-time
-//! reader, keeping `edit-ingest` free of a dependency on `edit-metadata`
-//! (services do not depend on each other; the app composes them).
+//! The job never reads EXIF itself: the caller injects a metadata reader,
+//! keeping `edit-ingest` free of a dependency on `edit-metadata` (services do
+//! not depend on each other; the app composes them).
+//!
+//! Crash safety: landed paths and the verified hash are persisted (state
+//! `Renaming`) before the catalog insert, and the duplicate lookup also sees
+//! non-terminal rows, so a card job that died after the rename resumes by
+//! completing the catalog insert instead of landing a second copy.
 
 use std::fs;
 use std::path::{Path, PathBuf};
 
-use edit_catalog::models::{NewIngestFile, NewPhoto};
-use edit_catalog::{Catalog, JobKind, JobState};
+use edit_catalog::models::{IngestBatch, IngestFile, NewIngestBatch, NewIngestFile, NewPhoto};
+use edit_catalog::{Catalog, JobKind};
+use edit_core::IngestFileState;
 use serde::{Deserialize, Serialize};
 
-use crate::copy::{CopyError, CopyOutcome, CopyRequest, CopyStage, copy_verified_with};
+use crate::copy::{CopyError, CopyOutcome, CopyRequest, CopyStage, copy_verified_with, hash_file};
 use crate::naming::{
-    NamingContext, NamingError, expand_tilde, render_dir, render_filename, static_prefix,
+    NamingContext, NamingError, expand_tilde, render_dir, render_filename, static_prefix, validate,
     with_original_extension,
 };
 
@@ -29,6 +35,15 @@ const RAW_EXTS: &[&str] = &[
 ];
 /// Plain stills recognized on the ingest path.
 const PLAIN_EXTS: &[&str] = &["JPG", "JPEG", "TIF", "TIFF"];
+
+/// Capture metadata the naming and duplicate logic needs, read by the caller.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct FileMetadata {
+    /// EXIF capture time in Unix seconds, when present.
+    pub taken_at: Option<i64>,
+    /// Camera model for the `{camera}` variable.
+    pub camera: Option<String>,
+}
 
 /// Durable payload for one `ingest_copy` job: one card, one batch.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -63,6 +78,8 @@ pub struct CardFile {
 pub struct IngestSummary {
     pub files: usize,
     pub copied: usize,
+    /// Files whose landed copy was found and cataloged after a crash.
+    pub recovered: usize,
     pub duplicates: usize,
     pub failed: usize,
 }
@@ -77,12 +94,70 @@ pub enum IngestError {
     Catalog(#[from] edit_catalog::Error),
 }
 
+/// Inputs for planning one card's ingest.
+#[derive(Clone, Debug)]
+pub struct IngestPlanRequest<'a> {
+    pub volume_uuid: Option<&'a str>,
+    pub volume_label: Option<&'a str>,
+    pub source_root: &'a Path,
+    pub dest_dir_template: &'a str,
+    pub filename_template: &'a str,
+    pub backup_dir: Option<&'a str>,
+    pub session: &'a str,
+    pub start_seq: u64,
+}
+
+/// A planned batch: the `ingest_batches` row and the job payload.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct IngestPlan {
+    pub batch: NewIngestBatch,
+    pub payload: IngestCopyPayload,
+}
+
+/// Validate the rules and build the batch row plus job payload. Moving this
+/// out of the UI keeps naming rules and payload shape in `edit-ingest`.
+pub fn plan_ingest(request: &IngestPlanRequest<'_>) -> Result<IngestPlan, NamingError> {
+    let dest = request.dest_dir_template.trim();
+    let filename = request.filename_template.trim();
+    if dest.is_empty() {
+        return Err(NamingError::EmptyName);
+    }
+    validate(dest)?;
+    validate(filename)?;
+    let backup_dir = request
+        .backup_dir
+        .map(str::trim)
+        .filter(|dir| !dir.is_empty())
+        .map(str::to_string);
+    Ok(IngestPlan {
+        batch: NewIngestBatch {
+            volume_uuid: request.volume_uuid.map(str::to_string),
+            volume_label: request.volume_label.map(str::to_string),
+            session_name: Some(request.session.to_string()),
+            dest_dir: static_prefix(dest),
+            backup_dir: backup_dir.clone(),
+            template_id: None,
+            state: "running".to_string(),
+        },
+        payload: IngestCopyPayload {
+            batch_id: 0,
+            source_root: request.source_root.to_string_lossy().into_owned(),
+            dest_dir_template: dest.to_string(),
+            filename_template: filename.to_string(),
+            backup_dir,
+            session: request.session.to_string(),
+            start_seq: request.start_seq,
+        },
+    })
+}
+
 /// Enumerate supported photo files on a card.
 ///
 /// A camera card's photos live under `DCIM`; any other folder is walked
 /// directly so a plain folder can be ingested too. Symlinked directories are
-/// never descended into (a link cycle would loop forever), matching the
-/// browse scanner.
+/// never descended into (a link cycle would loop forever). An unreadable card
+/// root, or a walk that yields nothing but read errors, is an error so the
+/// batch is failed instead of silently reporting "done, 0 files".
 pub fn enumerate_card(root: &Path) -> std::io::Result<Vec<CardFile>> {
     let start = if root.join("DCIM").is_dir() {
         root.join("DCIM")
@@ -90,11 +165,18 @@ pub fn enumerate_card(root: &Path) -> std::io::Result<Vec<CardFile>> {
         root.to_path_buf()
     };
     let mut out = Vec::new();
-    let mut stack = vec![start];
+    let mut stack = vec![start.clone()];
+    let mut errors = 0usize;
     while let Some(dir) = stack.pop() {
         let read = match fs::read_dir(&dir) {
             Ok(read) => read,
-            Err(_) => continue,
+            Err(error) => {
+                if dir == start {
+                    return Err(error);
+                }
+                errors += 1;
+                continue;
+            }
         };
         let mut children: Vec<PathBuf> = read.filter_map(|e| e.ok().map(|e| e.path())).collect();
         children.sort();
@@ -111,6 +193,12 @@ pub fn enumerate_card(root: &Path) -> std::io::Result<Vec<CardFile>> {
                 out.push(file);
             }
         }
+    }
+    if out.is_empty() && errors > 0 {
+        return Err(std::io::Error::other(format!(
+            "card root {} is unreadable ({errors} directories failed)",
+            start.display()
+        )));
     }
     out.sort_by(|a, b| a.path.cmp(&b.path));
     Ok(out)
@@ -162,7 +250,7 @@ pub fn assign_sequence(files: &[CardFile], start_seq: u64) -> Vec<u64> {
     seqs
 }
 
-/// Plan a card into the ordered file list the worker will process.
+/// Plan a card into the ordered file list and sequence numbers.
 pub fn plan_card(root: &Path, start_seq: u64) -> std::io::Result<(Vec<CardFile>, Vec<u64>)> {
     let files = enumerate_card(root)?;
     let seqs = assign_sequence(&files, start_seq);
@@ -179,25 +267,54 @@ fn base_stem(name: &str) -> String {
 
 /// Run one card through the verified copy pipeline.
 ///
-/// `capture_time` reads the EXIF capture time for the duplicate check and the
-/// date variables; the caller injects it so this crate stays free of
-/// `edit-metadata`. `on_progress` fires once with `(0, total)` after
-/// enumeration and then after every file, so the dialog gets live counts.
+/// `metadata` reads the capture fields for the duplicate check, the date
+/// variables, and `{camera}`. `on_progress` fires once with `(0, total)`
+/// after enumeration and then after every file, so the dialog gets live
+/// counts. Any card-level error marks the batch `failed` before returning.
 pub fn run_ingest_copy<F>(
     catalog: &Catalog,
     payload: &IngestCopyPayload,
-    capture_time: F,
+    metadata: F,
     on_progress: &dyn Fn(usize, usize),
 ) -> Result<IngestSummary, IngestError>
 where
-    F: Fn(&Path) -> Option<i64>,
+    F: Fn(&Path) -> FileMetadata,
+{
+    match run_card(catalog, payload, &metadata, on_progress) {
+        Ok(summary) => {
+            let state = if summary.failed > 0
+                && summary.copied == 0
+                && summary.recovered == 0
+                && summary.duplicates == 0
+            {
+                "failed"
+            } else {
+                "done"
+            };
+            catalog.finish_ingest_batch(payload.batch_id, state)?;
+            Ok(summary)
+        }
+        Err(error) => {
+            // Never leave a card batch `running` after a card-level failure.
+            let _ = catalog.finish_ingest_batch(payload.batch_id, "failed");
+            Err(error)
+        }
+    }
+}
+
+fn run_card<F>(
+    catalog: &Catalog,
+    payload: &IngestCopyPayload,
+    metadata: &F,
+    on_progress: &dyn Fn(usize, usize),
+) -> Result<IngestSummary, IngestError>
+where
+    F: Fn(&Path) -> FileMetadata,
 {
     let (files, seqs) = plan_card(Path::new(&payload.source_root), payload.start_seq)?;
     let dest_root = resolve_dest_root(&payload.dest_dir_template)?;
-    let root_id = match catalog.get_root_by_path(&dest_root)? {
-        Some(root) => root.id,
-        None => catalog.insert_root(&dest_root, "folder")?,
-    };
+    // Get-or-create races safely when two cards land in a fresh destination.
+    let root_id = catalog.ensure_root(&dest_root, "folder")?;
 
     let total = files.len();
     on_progress(0, total);
@@ -207,88 +324,127 @@ where
     };
 
     for (index, file) in files.iter().enumerate() {
-        let taken_at = capture_time(&file.path);
-        if catalog
-            .find_duplicate_ingest_file(&file.original_name, taken_at, file.bytes as i64)?
-            .is_some()
-        {
-            catalog.record_ingest_file(&NewIngestFile {
-                batch_id: payload.batch_id,
-                original_name: file.original_name.clone(),
-                taken_at,
-                bytes: file.bytes as i64,
-                source_path: file.path.to_string_lossy().into_owned(),
-                state: "duplicate".to_string(),
-            })?;
-            summary.duplicates += 1;
-            on_progress(index + 1, total);
-            continue;
-        }
-
-        let file_id = catalog.record_ingest_file(&NewIngestFile {
-            batch_id: payload.batch_id,
-            original_name: file.original_name.clone(),
-            taken_at,
-            bytes: file.bytes as i64,
-            source_path: file.path.to_string_lossy().into_owned(),
-            state: "queued".to_string(),
-        })?;
-
+        let meta = metadata(&file.path);
+        // One capture time: EXIF when present, else the card mtime. Dedupe
+        // and the date variables must agree on it.
+        let taken_at = meta.taken_at.unwrap_or(file.mtime);
         let context = NamingContext {
             session: payload.session.clone(),
             original_name: file.original_name.clone(),
             seq: seqs[index],
-            // Date variables fall back to the card's mtime when EXIF has no
-            // capture time, so a rule never fails on a missing tag.
-            taken_at: Some(taken_at.unwrap_or(file.mtime)),
-            camera: None,
+            taken_at: Some(taken_at),
+            camera: meta.camera.clone(),
+        };
+
+        let existing = catalog.find_ingest_file_by_key(
+            &file.original_name,
+            Some(taken_at),
+            file.bytes as i64,
+        )?;
+        let registered =
+            catalog.find_photo_duplicate(&file.original_name, Some(taken_at), file.bytes as i64)?;
+
+        let row_id = match classify(existing, registered) {
+            Existing::Duplicate => {
+                // Record the duplicate so the dialog can report it.
+                catalog.record_ingest_file(&NewIngestFile {
+                    batch_id: payload.batch_id,
+                    original_name: file.original_name.clone(),
+                    taken_at: Some(taken_at),
+                    bytes: file.bytes as i64,
+                    source_path: file.path.to_string_lossy().into_owned(),
+                    state: IngestFileState::Duplicate,
+                })?;
+                summary.duplicates += 1;
+                on_progress(index + 1, total);
+                continue;
+            }
+            Existing::Recoverable(row) => {
+                match recover(catalog, file, &row, root_id, taken_at) {
+                    Ok(()) => summary.recovered += 1,
+                    Err(error) => {
+                        summary.failed += 1;
+                        catalog.set_ingest_file_state(
+                            row.id,
+                            IngestFileState::Failed,
+                            Some(&error),
+                        )?;
+                    }
+                }
+                on_progress(index + 1, total);
+                continue;
+            }
+            Existing::Resume(id) => id,
+            Existing::New => catalog.record_ingest_file(&NewIngestFile {
+                batch_id: payload.batch_id,
+                original_name: file.original_name.clone(),
+                taken_at: Some(taken_at),
+                bytes: file.bytes as i64,
+                source_path: file.path.to_string_lossy().into_owned(),
+                state: IngestFileState::Queued,
+            })?,
         };
 
         match land_one(
-            catalog, payload, &dest_root, root_id, file, file_id, &context,
+            catalog, payload, &dest_root, root_id, file, row_id, &context, taken_at,
         ) {
             Ok(()) => summary.copied += 1,
             Err(error) => {
                 summary.failed += 1;
-                catalog.set_ingest_file_state(file_id, "failed", Some(&error))?;
+                catalog.set_ingest_file_state(row_id, IngestFileState::Failed, Some(&error))?;
             }
         }
         on_progress(index + 1, total);
     }
 
-    let state = if summary.failed > 0 && summary.copied == 0 {
-        JobState::Failed
-    } else {
-        JobState::Done
-    };
-    catalog.finish_ingest_batch(payload.batch_id, state.as_str())?;
     Ok(summary)
 }
 
-/// Resolve the stable destination root (`static_prefix`, tilde-expanded and
-/// canonicalized) so the catalog root row matches how browse canonicalizes.
-fn resolve_dest_root(template: &str) -> Result<String, IngestError> {
-    let prefix = static_prefix(template);
-    let mut root = expand_tilde(&prefix);
-    if root.as_os_str().is_empty() {
-        root = std::env::current_dir()?;
-    }
-    fs::create_dir_all(&root)?;
-    let canonical = root.canonicalize().unwrap_or(root);
-    Ok(canonical.to_string_lossy().into_owned())
+/// What an existing history/photo row means for this file.
+enum Existing {
+    /// Already cataloged; do not copy.
+    Duplicate,
+    /// A previous run landed bytes; finish cataloging them.
+    Recoverable(Box<IngestFile>),
+    /// A previous run recorded a row but landed nothing; reuse its id.
+    Resume(i64),
+    /// No history; record a fresh row and copy.
+    New,
 }
 
-/// Copy one file, record per-stage state, and catalog the landed photo.
-///
-/// Errors are strings: a single bad file must not abort the card.
+/// Decide whether to skip, recover, or copy based on the ingest history and
+/// the photos table.
+fn classify(
+    existing: Option<IngestFile>,
+    registered: Option<edit_catalog::models::Photo>,
+) -> Existing {
+    if let Some(row) = existing {
+        if row.state == IngestFileState::Cataloged {
+            return Existing::Duplicate;
+        }
+        if row.state.has_landed_bytes() && row.dest_path.is_some() {
+            return Existing::Recoverable(Box::new(row));
+        }
+        return Existing::Resume(row.id);
+    }
+    if registered.is_some() {
+        return Existing::Duplicate;
+    }
+    Existing::New
+}
+
+/// Copy one file, persist the landed paths, catalog the photo, and complete
+/// the row. Errors are strings: one bad file must not abort the card.
+#[allow(clippy::too_many_arguments)]
 fn land_one(
     catalog: &Catalog,
     payload: &IngestCopyPayload,
     dest_root: &str,
     root_id: i64,
     file: &CardFile,
-    file_id: i64,
+    row_id: i64,
     context: &NamingContext,
+    taken_at: i64,
 ) -> Result<(), String> {
     let dest_folder = render_dir(&payload.dest_dir_template, context).map_err(naming_error)?;
     let dest_folder = if dest_folder.is_absolute() {
@@ -316,21 +472,36 @@ fn land_one(
         },
         &mut |stage| {
             let state = match stage {
-                CopyStage::Copying => "copying",
-                CopyStage::Verifying => "verifying",
-                CopyStage::BackingUp => "backup",
-                CopyStage::Renaming => "renaming",
+                CopyStage::Copying => IngestFileState::Copying,
+                CopyStage::Verifying => IngestFileState::Verifying,
+                CopyStage::BackingUp => IngestFileState::Backup,
+                CopyStage::Renaming => IngestFileState::Renaming,
             };
-            let _ = catalog.set_ingest_file_state(file_id, state, None);
+            let _ = catalog.set_ingest_file_state(row_id, state, None);
         },
     )
     .map_err(copy_error)?;
 
+    // Persist the landed paths and hash before the catalog insert, so a
+    // crash here is recoverable instead of a second copy.
+    catalog
+        .mark_ingest_file_landed(
+            row_id,
+            &outcome.dest_path.to_string_lossy(),
+            outcome
+                .backup_path
+                .as_ref()
+                .map(|p| p.to_string_lossy().into_owned())
+                .as_deref(),
+            &outcome.blake3,
+        )
+        .map_err(|e| e.to_string())?;
+
     let photo_id =
-        catalog_photo(catalog, root_id, &outcome, file.mtime).map_err(|e| e.to_string())?;
+        catalog_photo(catalog, root_id, &outcome, file, taken_at).map_err(|e| e.to_string())?;
     catalog
         .complete_ingest_file(
-            file_id,
+            row_id,
             &outcome.dest_path.to_string_lossy(),
             outcome
                 .backup_path
@@ -344,14 +515,64 @@ fn land_one(
     Ok(())
 }
 
-/// Insert the landed photo, pair it into an `items` row, and queue its
-/// thumbnail job. Returns the photo id (or `None` when a row for the path
-/// already exists).
+/// Finish cataloging a copy that a crash interrupted after the rename.
+fn recover(
+    catalog: &Catalog,
+    file: &CardFile,
+    row: &IngestFile,
+    root_id: i64,
+    taken_at: i64,
+) -> Result<(), String> {
+    let dest = row.dest_path.clone().ok_or("no landed path")?;
+    let actual = hash_file(Path::new(&dest)).map_err(|e| e.to_string())?;
+    if row.blake3.as_deref() != Some(actual.as_str()) {
+        return Err(format!("landed file at {dest} changed"));
+    }
+    let outcome = CopyOutcome {
+        dest_path: PathBuf::from(&dest),
+        backup_path: row.backup_path.as_ref().map(PathBuf::from),
+        bytes: file.bytes,
+        blake3: actual,
+    };
+    let photo_id = match row.photo_id {
+        Some(id) => Some(id),
+        None => {
+            catalog_photo(catalog, root_id, &outcome, file, taken_at).map_err(|e| e.to_string())?
+        }
+    };
+    catalog
+        .complete_ingest_file(
+            row.id,
+            &dest,
+            row.backup_path.as_deref(),
+            &outcome.blake3,
+            photo_id,
+        )
+        .map_err(|e| e.to_string())?;
+    Ok(())
+}
+
+/// Resolve the stable destination root (`static_prefix`, tilde-expanded and
+/// canonicalized) so the catalog root row matches how browse canonicalizes.
+fn resolve_dest_root(template: &str) -> Result<String, IngestError> {
+    let prefix = static_prefix(template);
+    let mut root = expand_tilde(&prefix);
+    if root.as_os_str().is_empty() {
+        root = std::env::current_dir()?;
+    }
+    fs::create_dir_all(&root)?;
+    let canonical = root.canonicalize().unwrap_or(root);
+    Ok(canonical.to_string_lossy().into_owned())
+}
+
+/// Insert the landed photo (or reuse the row a crash left behind), pair it
+/// into an `items` row, and queue its thumbnail job.
 fn catalog_photo(
     catalog: &Catalog,
     root_id: i64,
     outcome: &CopyOutcome,
-    fallback_mtime: i64,
+    file: &CardFile,
+    taken_at: i64,
 ) -> Result<Option<i64>, edit_catalog::Error> {
     let dest = &outcome.dest_path;
     let stem = dest
@@ -379,7 +600,7 @@ fn catalog_photo(
         .and_then(|m| m.modified().ok())
         .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
         .map(|d| d.as_secs() as i64)
-        .unwrap_or(fallback_mtime);
+        .unwrap_or(file.mtime);
 
     let photo_id = match catalog.insert_photo(&NewPhoto {
         root_id,
@@ -390,11 +611,14 @@ fn catalog_photo(
         kind: kind.to_string(),
         bytes: outcome.bytes as i64,
         mtime,
+        original_name: Some(file.original_name.clone()),
+        taken_at: Some(taken_at),
     }) {
         Ok(id) => Some(id),
-        // A photo with this path already exists: keep the row, but still
-        // ensure the item pairing and thumbnail job below.
-        Err(e) if e.is_unique_violation() => None,
+        // A crash may already have inserted the photo; reuse that row.
+        Err(e) if e.is_unique_violation() => {
+            catalog.get_photo_by_path(&path)?.map(|photo| photo.id)
+        }
         Err(e) => return Err(e),
     };
 
@@ -429,6 +653,14 @@ fn catalog_photo(
     Ok(photo_id)
 }
 
+/// Convenience for the app: derive the volume identity a batch is keyed by.
+pub fn batch_volume_identity(batch: &IngestBatch) -> String {
+    match batch.volume_uuid.as_deref().filter(|uuid| !uuid.is_empty()) {
+        Some(uuid) => format!("uuid:{uuid}"),
+        None => String::new(),
+    }
+}
+
 fn naming_error(error: NamingError) -> String {
     format!("naming: {error}")
 }
@@ -442,16 +674,7 @@ mod tests {
     use super::*;
 
     fn scratch(name: &str) -> PathBuf {
-        let dir = std::env::temp_dir().join(format!(
-            "edit-ingest-run-{}-{}-{name}",
-            std::process::id(),
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .map(|d| d.as_nanos())
-                .unwrap_or(0)
-        ));
-        fs::create_dir_all(&dir).unwrap();
-        dir
+        crate::testutil::scratch_dir(&format!("ingest-{name}"))
     }
 
     fn card_with(files: &[(&str, &[u8])]) -> PathBuf {
@@ -481,6 +704,27 @@ mod tests {
         }
     }
 
+    fn fixed_metadata(_: &Path) -> FileMetadata {
+        FileMetadata {
+            taken_at: Some(1_791_374_400),
+            camera: Some("Canon EOS R6".into()),
+        }
+    }
+
+    fn new_batch(catalog: &Catalog, dest: &Path, backup: Option<&Path>) -> i64 {
+        catalog
+            .create_ingest_batch(&NewIngestBatch {
+                volume_uuid: Some("UUID".into()),
+                volume_label: Some("CARD".into()),
+                session_name: Some("shoot".into()),
+                dest_dir: dest.to_string_lossy().into_owned(),
+                backup_dir: backup.map(|p| p.to_string_lossy().into_owned()),
+                template_id: None,
+                state: "running".into(),
+            })
+            .unwrap()
+    }
+
     #[test]
     fn enumerate_finds_dcim_and_sorts() {
         let card = card_with(&[
@@ -493,6 +737,12 @@ mod tests {
         assert_eq!(files[0].original_name, "DSC0001.JPG");
         assert_eq!(files[1].original_name, "DSC0002.NEF");
         fs::remove_dir_all(&card).ok();
+    }
+
+    #[test]
+    fn enumerate_fails_on_an_unreadable_card_root() {
+        let missing = scratch("gone").join("not-mounted");
+        assert!(enumerate_card(&missing).is_err());
     }
 
     #[test]
@@ -521,25 +771,14 @@ mod tests {
         let base = scratch("run");
         let dest = base.join("Photos");
         let backup = base.join("Backup");
-        let db_path = base.join("catalog.sqlite");
-        let catalog = Catalog::open(&db_path).unwrap();
-        let batch = catalog
-            .create_ingest_batch(&edit_catalog::models::NewIngestBatch {
-                volume_uuid: Some("UUID".into()),
-                volume_label: Some("CARD".into()),
-                session_name: Some("shoot".into()),
-                dest_dir: dest.to_string_lossy().into_owned(),
-                backup_dir: Some(backup.to_string_lossy().into_owned()),
-                template_id: None,
-                state: "running".into(),
-            })
-            .unwrap();
+        let catalog = Catalog::open(&base.join("catalog.sqlite")).unwrap();
+        let batch = new_batch(&catalog, &dest, Some(&backup));
 
         let progress = std::cell::RefCell::new(Vec::new());
         let summary = run_ingest_copy(
             &catalog,
             &payload(batch, &card, &dest, Some(&backup)),
-            |_| Some(1_791_374_400),
+            fixed_metadata,
             &|done, total| progress.borrow_mut().push((done, total)),
         )
         .unwrap();
@@ -555,7 +794,7 @@ mod tests {
         let rows = catalog.list_ingest_files(batch).unwrap();
         assert_eq!(rows.len(), 2);
         for row in &rows {
-            assert_eq!(row.state, "cataloged");
+            assert_eq!(row.state, IngestFileState::Cataloged);
             let dest_path = PathBuf::from(row.dest_path.as_ref().unwrap());
             let backup_path = PathBuf::from(row.backup_path.as_ref().unwrap());
             assert!(dest_path.is_file());
@@ -564,19 +803,16 @@ mod tests {
                 fs::read(&dest_path).unwrap(),
                 fs::read(&backup_path).unwrap()
             );
-            // The verified hash is recorded.
             assert_eq!(
                 row.blake3.as_deref(),
-                Some(crate::copy::hash_file(&dest_path).unwrap().as_str())
+                Some(hash_file(&dest_path).unwrap().as_str())
             );
             assert!(row.photo_id.is_some());
         }
-        // Folder rule produced nested date folders under both destinations.
         assert!(dest.join("2026-10-07/shoot_0001.JPG").is_file());
         assert!(dest.join("2026-10-07/shoot_0002.NEF").is_file());
         assert!(backup.join("2026-10-07/shoot_0001.JPG").is_file());
 
-        // Landed files are cataloged and paired into items with thumbnail jobs.
         let root = catalog
             .get_root_by_path(&dest.canonicalize().unwrap().to_string_lossy())
             .unwrap()
@@ -584,10 +820,8 @@ mod tests {
         assert_eq!(catalog.list_photos_by_root(root.id).unwrap().len(), 2);
         let jobs = catalog.list_jobs(50).unwrap();
         assert_eq!(jobs.iter().filter(|j| j.kind == JobKind::Thumb).count(), 2);
-        let batch_row = catalog.get_ingest_batch(batch).unwrap();
-        assert_eq!(batch_row.state, "done");
+        assert_eq!(catalog.get_ingest_batch(batch).unwrap().state, "done");
 
-        // No temp files survive in the destination.
         let leftovers: Vec<_> = fs::read_dir(dest.join("2026-10-07"))
             .unwrap()
             .filter_map(|e| e.ok())
@@ -604,86 +838,176 @@ mod tests {
         let card = card_with(&[("DSC0001.JPG", b"same bytes")]);
         let base = scratch("dup");
         let dest = base.join("Photos");
-        let db_path = base.join("catalog.sqlite");
-        let catalog = Catalog::open(&db_path).unwrap();
-        let payload = payload(
-            catalog
-                .create_ingest_batch(&edit_catalog::models::NewIngestBatch {
-                    volume_uuid: None,
-                    volume_label: None,
-                    session_name: None,
-                    dest_dir: dest.to_string_lossy().into_owned(),
-                    backup_dir: None,
-                    template_id: None,
-                    state: "running".into(),
-                })
-                .unwrap(),
-            &card,
-            &dest,
-            None,
-        );
-
-        let first = run_ingest_copy(&catalog, &payload, |_| Some(42), &|_, _| {}).unwrap();
+        let catalog = Catalog::open(&base.join("catalog.sqlite")).unwrap();
+        let first_batch = new_batch(&catalog, &dest, None);
+        let first = run_ingest_copy(
+            &catalog,
+            &payload(first_batch, &card, &dest, None),
+            fixed_metadata,
+            &|_, _| {},
+        )
+        .unwrap();
         assert_eq!(first.copied, 1);
 
-        // A second batch of the same card: the triple matches, so no recap.
-        let second_batch = catalog
-            .create_ingest_batch(&edit_catalog::models::NewIngestBatch {
-                volume_uuid: None,
-                volume_label: None,
-                session_name: None,
-                dest_dir: dest.to_string_lossy().into_owned(),
-                backup_dir: None,
-                template_id: None,
-                state: "running".into(),
-            })
-            .unwrap();
-        let mut second_payload = payload.clone();
-        second_payload.batch_id = second_batch;
-        let second = run_ingest_copy(&catalog, &second_payload, |_| Some(42), &|_, _| {}).unwrap();
+        let second_batch = new_batch(&catalog, &dest, None);
+        let second = run_ingest_copy(
+            &catalog,
+            &payload(second_batch, &card, &dest, None),
+            fixed_metadata,
+            &|_, _| {},
+        )
+        .unwrap();
         assert_eq!(second.copied, 0);
         assert_eq!(second.duplicates, 1);
 
         let rows = catalog.list_ingest_files(second_batch).unwrap();
         assert_eq!(rows.len(), 1);
-        assert_eq!(rows[0].state, "duplicate");
+        assert_eq!(rows[0].state, IngestFileState::Duplicate);
 
         fs::remove_dir_all(&base).ok();
         fs::remove_dir_all(&card).ok();
     }
 
     #[test]
-    fn a_bad_rule_fails_only_its_file() {
+    fn a_crash_after_rename_recovers_instead_of_recopying() {
+        let card = card_with(&[("DSC0001.JPG", b"recover me")]);
+        let base = scratch("recover");
+        let dest = base.join("Photos");
+        let catalog = Catalog::open(&base.join("catalog.sqlite")).unwrap();
+        let batch = new_batch(&catalog, &dest, None);
+        let payload = payload(batch, &card, &dest, None);
+
+        // Simulate: the previous run landed the file and recorded the paths,
+        // then died before the catalog insert (state `Renaming`).
+        let landed = dest.join("2026-10-07/shoot_0001.JPG");
+        fs::create_dir_all(landed.parent().unwrap()).unwrap();
+        fs::write(&landed, b"recover me").unwrap();
+        let hash = hash_file(&landed).unwrap();
+        let row = catalog
+            .record_ingest_file(&NewIngestFile {
+                batch_id: batch,
+                original_name: "DSC0001.JPG".into(),
+                taken_at: Some(1_791_374_400),
+                bytes: 10,
+                source_path: "/card/DCIM/DSC0001.JPG".into(),
+                state: IngestFileState::Queued,
+            })
+            .unwrap();
+        catalog
+            .mark_ingest_file_landed(row, &landed.to_string_lossy(), None, &hash)
+            .unwrap();
+
+        let summary = run_ingest_copy(&catalog, &payload, fixed_metadata, &|_, _| {}).unwrap();
+        assert_eq!(summary.copied, 0);
+        assert_eq!(summary.recovered, 1);
+        assert_eq!(summary.duplicates, 0);
+
+        // One landed file only, one cataloged row, one photo.
+        let files: Vec<_> = fs::read_dir(landed.parent().unwrap())
+            .unwrap()
+            .filter_map(|e| e.ok())
+            .filter(|e| e.file_name().to_string_lossy().ends_with(".JPG"))
+            .collect();
+        assert_eq!(files.len(), 1);
+        let rows = catalog.list_ingest_files(batch).unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].state, IngestFileState::Cataloged);
+        assert!(rows[0].photo_id.is_some());
+
+        fs::remove_dir_all(&base).ok();
+        fs::remove_dir_all(&card).ok();
+    }
+
+    #[test]
+    fn a_bad_rule_fails_only_its_file_and_the_batch() {
         let card = card_with(&[("DSC0001.JPG", b"a"), ("DSC0002.JPG", b"b")]);
         let base = scratch("badrule");
         let dest = base.join("Photos");
-        let db_path = base.join("catalog.sqlite");
-        let catalog = Catalog::open(&db_path).unwrap();
-        let batch = catalog
-            .create_ingest_batch(&edit_catalog::models::NewIngestBatch {
-                volume_uuid: None,
-                volume_label: None,
-                session_name: None,
-                dest_dir: dest.to_string_lossy().into_owned(),
-                backup_dir: None,
-                template_id: None,
-                state: "running".into(),
-            })
-            .unwrap();
+        let catalog = Catalog::open(&base.join("catalog.sqlite")).unwrap();
+        let batch = new_batch(&catalog, &dest, None);
         let mut p = payload(batch, &card, &dest, None);
-        // `{ext}` is fine, `{nope}` is not: every file fails, none panic.
         p.filename_template = "{nope}_{seq}".to_string();
-        let summary = run_ingest_copy(&catalog, &p, |_| None, &|_, _| {}).unwrap();
+        let summary = run_ingest_copy(&catalog, &p, fixed_metadata, &|_, _| {}).unwrap();
         assert_eq!(summary.failed, 2);
         assert_eq!(summary.copied, 0);
         let rows = catalog.list_ingest_files(batch).unwrap();
         assert!(
             rows.iter()
-                .all(|r| r.state == "failed" && r.error.is_some())
+                .all(|r| r.state == IngestFileState::Failed && r.error.is_some())
         );
         assert_eq!(catalog.get_ingest_batch(batch).unwrap().state, "failed");
 
         fs::remove_dir_all(&base).ok();
         fs::remove_dir_all(&card).ok();
+    }
+
+    #[test]
+    fn unreadable_card_marks_the_batch_failed() {
+        let base = scratch("unplugged");
+        let dest = base.join("Photos");
+        let catalog = Catalog::open(&base.join("catalog.sqlite")).unwrap();
+        let batch = new_batch(&catalog, &dest, None);
+        let p = IngestCopyPayload {
+            batch_id: batch,
+            source_root: base.join("gone").to_string_lossy().into_owned(),
+            dest_dir_template: dest.join("{yyyy}").to_string_lossy().into_owned(),
+            filename_template: "{seq}".into(),
+            backup_dir: None,
+            session: "shoot".into(),
+            start_seq: 1,
+        };
+        assert!(run_ingest_copy(&catalog, &p, fixed_metadata, &|_, _| {}).is_err());
+        assert_eq!(catalog.get_ingest_batch(batch).unwrap().state, "failed");
+        fs::remove_dir_all(&base).ok();
+    }
+
+    #[test]
+    fn plan_ingest_validates_rules_and_builds_the_batch() {
+        let plan = plan_ingest(&IngestPlanRequest {
+            volume_uuid: Some("UUID"),
+            volume_label: Some("CARD"),
+            source_root: Path::new("/media/card"),
+            dest_dir_template: "  ~/Photos/{yyyy}/{mm}-{dd}  ",
+            filename_template: "{session}_{seq:4}",
+            backup_dir: Some("  /mnt/backup  "),
+            session: "shoot",
+            start_seq: 1,
+        })
+        .unwrap();
+        assert_eq!(plan.batch.volume_label.as_deref(), Some("CARD"));
+        assert_eq!(plan.batch.dest_dir, "~/Photos");
+        assert_eq!(plan.batch.backup_dir.as_deref(), Some("/mnt/backup"));
+        assert_eq!(plan.payload.filename_template, "{session}_{seq:4}");
+        assert_eq!(plan.payload.backup_dir.as_deref(), Some("/mnt/backup"));
+
+        assert!(matches!(
+            plan_ingest(&IngestPlanRequest {
+                dest_dir_template: "{nope}",
+                ..plan_request_defaults()
+            })
+            .unwrap_err(),
+            NamingError::UnknownVariable(_)
+        ));
+        assert!(matches!(
+            plan_ingest(&IngestPlanRequest {
+                dest_dir_template: "   ",
+                ..plan_request_defaults()
+            })
+            .unwrap_err(),
+            NamingError::EmptyName
+        ));
+    }
+
+    fn plan_request_defaults<'a>() -> IngestPlanRequest<'a> {
+        IngestPlanRequest {
+            volume_uuid: None,
+            volume_label: None,
+            source_root: Path::new("/media/card"),
+            dest_dir_template: "~/Photos/{yyyy}",
+            filename_template: "{seq}",
+            backup_dir: None,
+            session: "shoot",
+            start_seq: 1,
+        }
     }
 }

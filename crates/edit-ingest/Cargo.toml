@@ -18,3 +18,5 @@ blake3.workspace = true
 
 [target.'cfg(target_os = "linux")'.dependencies]
 udev.workspace = true
+# renameat2(RENAME_NOREPLACE) for the no-clobber atomic rename.
+libc = "0.2"
