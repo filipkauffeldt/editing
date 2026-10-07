@@ -1,0 +1,24 @@
+[workspace]
+members = ["crates/app"]
+resolver = "2"
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.95"
+license = "Apache-2.0"
+
+[workspace.dependencies]
+# The x11 and wayland features select gpui's Linux windowing backends;
+# font-kit enables the freetype/fontconfig text stack, runtime_shaders compiles
+# Metal shaders at runtime on macOS.
+gpui_platform = { package = "gpui-pre-platform", version = "=0.3.8", features = [
+    "font-kit",
+    "x11",
+    "wayland",
+    "runtime_shaders",
+] }
+# gpui-kit is the renamed longbridge/gpui-component repo. It wires gpui,
+# gpui-base, gpui-component and default assets together, and pins gpui-pre
+# 0.3.8 exactly (a crates.io snapshot of zed@279fe07).
+gpui-kit = "=0.7.1"
