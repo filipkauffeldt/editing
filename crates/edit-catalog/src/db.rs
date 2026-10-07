@@ -19,10 +19,16 @@ struct Migration {
     sql: &'static str,
 }
 
-const MIGRATIONS: &[Migration] = &[Migration {
-    version: 1,
-    sql: include_str!("migrations/001_initial_schema.sql"),
-}];
+const MIGRATIONS: &[Migration] = &[
+    Migration {
+        version: 1,
+        sql: include_str!("migrations/001_initial_schema.sql"),
+    },
+    Migration {
+        version: 2,
+        sql: include_str!("migrations/002_ingest_files.sql"),
+    },
+];
 
 /// Seconds since the Unix epoch, for `*_at` columns.
 pub fn now_unix() -> i64 {
@@ -185,6 +191,7 @@ pub fn expected_tables() -> &'static [&'static str] {
         "send_recipes",
         "code_replacements",
         "ingest_batches",
+        "ingest_files",
         "presets",
         "settings",
         "schema_migrations",
@@ -228,7 +235,7 @@ pub mod tests {
                 for expected in expected_tables() {
                     assert!(names.iter().any(|n| n == expected), "missing {expected}");
                 }
-                assert_eq!(applied_versions(conn)?, vec![1]);
+                assert_eq!(applied_versions(conn)?, vec![1, 2]);
                 Ok(())
             })
             .unwrap();
@@ -260,7 +267,7 @@ pub mod tests {
                     |row| row.get(0),
                 )?;
                 assert_eq!(value, "1");
-                assert_eq!(applied_versions(conn)?, vec![1]);
+                assert_eq!(applied_versions(conn)?, vec![1, 2]);
                 Ok(())
             })
             .unwrap();

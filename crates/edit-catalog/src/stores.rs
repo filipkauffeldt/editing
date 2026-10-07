@@ -188,6 +188,24 @@ fn row_batch(row: &Row) -> rusqlite::Result<IngestBatch> {
     })
 }
 
+fn row_ingest_file(row: &Row) -> rusqlite::Result<IngestFile> {
+    Ok(IngestFile {
+        id: row.get(0)?,
+        batch_id: row.get(1)?,
+        original_name: row.get(2)?,
+        taken_at: row.get(3)?,
+        bytes: row.get(4)?,
+        source_path: row.get(5)?,
+        dest_path: row.get(6)?,
+        backup_path: row.get(7)?,
+        blake3: row.get(8)?,
+        photo_id: row.get(9)?,
+        state: row.get(10)?,
+        error: row.get(11)?,
+        created_at: row.get(12)?,
+    })
+}
+
 fn not_found(what: &str, id: i64) -> Error {
     Error::NotFound(format!("{what} {id}"))
 }
@@ -861,6 +879,156 @@ impl Catalog {
         })
     }
 
+    /// Open an ingest batch with its volume, session and backup context.
+    pub fn create_ingest_batch(&self, batch: &NewIngestBatch) -> Result<i64> {
+        Self::check_ingest_batch_state(&batch.state)?;
+        self.with_conn(|conn| {
+            conn.execute(
+                "INSERT INTO ingest_batches
+                   (volume_uuid, volume_label, session_name, dest_dir, backup_dir, template_id, state, started_at)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+                params![
+                    batch.volume_uuid,
+                    batch.volume_label,
+                    batch.session_name,
+                    batch.dest_dir,
+                    batch.backup_dir,
+                    batch.template_id,
+                    batch.state,
+                    now_unix()
+                ],
+            )?;
+            Ok(conn.last_insert_rowid())
+        })
+    }
+
+    // ---- ingest files ----
+
+    /// States an ingest file may hold (plan section 2.8's per-file states).
+    const INGEST_FILE_STATES: &[&str] = &[
+        "queued",
+        "copying",
+        "verifying",
+        "backup",
+        "renaming",
+        "cataloged",
+        "duplicate",
+        "failed",
+    ];
+
+    fn check_ingest_file_state(state: &str) -> Result<()> {
+        if Self::INGEST_FILE_STATES.contains(&state) {
+            Ok(())
+        } else {
+            Err(Error::InvalidValue(format!(
+                "unknown ingest file state: {state}"
+            )))
+        }
+    }
+
+    /// Record one file entering the pipeline (state `queued` normally).
+    pub fn record_ingest_file(&self, file: &NewIngestFile) -> Result<i64> {
+        Self::check_ingest_file_state(&file.state)?;
+        self.with_conn(|conn| {
+            conn.execute(
+                "INSERT INTO ingest_files
+                   (batch_id, original_name, taken_at, bytes, source_path, state, created_at)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+                params![
+                    file.batch_id,
+                    file.original_name,
+                    file.taken_at,
+                    file.bytes,
+                    file.source_path,
+                    file.state,
+                    now_unix()
+                ],
+            )?;
+            Ok(conn.last_insert_rowid())
+        })
+    }
+
+    /// Move one ingest file to a new state, without touching the verification
+    /// fields. Used for the copy/verify/backup/rename progress steps and for
+    /// terminal `duplicate`/`failed` markings.
+    pub fn set_ingest_file_state(&self, id: i64, state: &str, error: Option<&str>) -> Result<()> {
+        Self::check_ingest_file_state(state)?;
+        self.with_conn(|conn| {
+            let n = conn.execute(
+                "UPDATE ingest_files SET state = ?1, error = ?2 WHERE id = ?3",
+                params![state, error, id],
+            )?;
+            if n == 0 {
+                return Err(not_found("ingest_file", id));
+            }
+            Ok(())
+        })
+    }
+
+    /// Mark a file cataloged, recording the verified hash, the landed paths,
+    /// and the inserted photo row.
+    pub fn complete_ingest_file(
+        &self,
+        id: i64,
+        dest_path: &str,
+        backup_path: Option<&str>,
+        blake3: &str,
+        photo_id: Option<i64>,
+    ) -> Result<()> {
+        self.with_conn(|conn| {
+            let n = conn.execute(
+                "UPDATE ingest_files
+                    SET state = 'cataloged', dest_path = ?1, backup_path = ?2,
+                        blake3 = ?3, photo_id = ?4, error = NULL
+                  WHERE id = ?5",
+                params![dest_path, backup_path, blake3, photo_id, id],
+            )?;
+            if n == 0 {
+                return Err(not_found("ingest_file", id));
+            }
+            Ok(())
+        })
+    }
+
+    /// Duplicate lookup on (original name, EXIF capture time, size) over
+    /// files already cataloged by ingest. `taken_at` matches with `IS`, so a
+    /// missing capture time matches a missing capture time.
+    pub fn find_duplicate_ingest_file(
+        &self,
+        original_name: &str,
+        taken_at: Option<i64>,
+        bytes: i64,
+    ) -> Result<Option<IngestFile>> {
+        self.with_conn(|conn| {
+            Ok(conn
+                .query_row(
+                    "SELECT id, batch_id, original_name, taken_at, bytes, source_path,
+                            dest_path, backup_path, blake3, photo_id, state, error, created_at
+                       FROM ingest_files
+                      WHERE original_name = ?1 AND taken_at IS ?2 AND bytes = ?3
+                        AND state = 'cataloged'
+                      ORDER BY id LIMIT 1",
+                    params![original_name, taken_at, bytes],
+                    row_ingest_file,
+                )
+                .optional()?)
+        })
+    }
+
+    /// All files of one batch in insert order (the dialog's table order).
+    pub fn list_ingest_files(&self, batch_id: i64) -> Result<Vec<IngestFile>> {
+        self.with_conn(|conn| {
+            let mut stmt = conn.prepare(
+                "SELECT id, batch_id, original_name, taken_at, bytes, source_path,
+                        dest_path, backup_path, blake3, photo_id, state, error, created_at
+                   FROM ingest_files WHERE batch_id = ?1 ORDER BY id",
+            )?;
+            Ok(stmt
+                .query_map([batch_id], row_ingest_file)?
+                .collect::<rusqlite::Result<_>>()?)
+        })
+    }
+
     // ---- settings ----
 
     pub fn set_setting(&self, key: &str, value: &str) -> Result<()> {
@@ -1026,6 +1194,105 @@ mod tests {
         assert_eq!(db.get_setting("missing").unwrap(), None);
 
         assert!(db.get_root(999_999).is_err());
+        std::fs::remove_file(path).ok();
+    }
+
+    #[test]
+    fn ingest_files_record_progress_and_dedupe() {
+        let path = scratch_db("ingest-files");
+        let db = Catalog::open(&path).unwrap();
+        let root = db.insert_root("/photos", "folder").unwrap();
+        let batch = db
+            .create_ingest_batch(&NewIngestBatch {
+                volume_uuid: Some("UUID-1".into()),
+                volume_label: Some("EOS_DIGITAL".into()),
+                session_name: Some("shoot".into()),
+                dest_dir: "/photos/2026/10-07".into(),
+                backup_dir: Some("/backup".into()),
+                template_id: None,
+                state: "running".into(),
+            })
+            .unwrap();
+        let row = db.get_ingest_batch(batch).unwrap();
+        assert_eq!(row.volume_label.as_deref(), Some("EOS_DIGITAL"));
+        assert_eq!(row.backup_dir.as_deref(), Some("/backup"));
+
+        let file = db
+            .record_ingest_file(&NewIngestFile {
+                batch_id: batch,
+                original_name: "DSC01234.NEF".into(),
+                taken_at: Some(1_700_000_000),
+                bytes: 1024,
+                source_path: "/media/card/DCIM/DSC01234.NEF".into(),
+                state: "queued".into(),
+            })
+            .unwrap();
+
+        // No duplicate before the file is cataloged.
+        assert!(
+            db.find_duplicate_ingest_file("DSC01234.NEF", Some(1_700_000_000), 1024)
+                .unwrap()
+                .is_none()
+        );
+
+        db.set_ingest_file_state(file, "copying", None).unwrap();
+        db.set_ingest_file_state(file, "verifying", None).unwrap();
+        let photo = db.insert_photo(&photo_fixture(root, 1234)).unwrap();
+        db.complete_ingest_file(
+            file,
+            "/photos/2026/10-07/shoot_0001.NEF",
+            Some("/backup/2026/10-07/shoot_0001.NEF"),
+            "ab12",
+            Some(photo),
+        )
+        .unwrap();
+
+        let rows = db.list_ingest_files(batch).unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].state, "cataloged");
+        assert_eq!(rows[0].blake3.as_deref(), Some("ab12"));
+        assert_eq!(rows[0].photo_id, Some(photo));
+        assert_eq!(
+            rows[0].dest_path.as_deref(),
+            Some("/photos/2026/10-07/shoot_0001.NEF")
+        );
+
+        // Now the same triple is a duplicate...
+        let dup = db
+            .find_duplicate_ingest_file("DSC01234.NEF", Some(1_700_000_000), 1024)
+            .unwrap()
+            .expect("duplicate");
+        assert_eq!(dup.id, file);
+        // ...but a different size, time, or name is not.
+        assert!(
+            db.find_duplicate_ingest_file("DSC01234.NEF", Some(1_700_000_000), 2048)
+                .unwrap()
+                .is_none()
+        );
+        assert!(
+            db.find_duplicate_ingest_file("DSC01234.NEF", Some(1), 1024)
+                .unwrap()
+                .is_none()
+        );
+        assert!(
+            db.find_duplicate_ingest_file("OTHER.NEF", Some(1_700_000_000), 1024)
+                .unwrap()
+                .is_none()
+        );
+
+        // Unknown states are rejected.
+        assert!(db.set_ingest_file_state(file, "bogus", None).is_err());
+        assert!(
+            db.record_ingest_file(&NewIngestFile {
+                batch_id: batch,
+                original_name: "X".into(),
+                taken_at: None,
+                bytes: 1,
+                source_path: "/x".into(),
+                state: "bogus".into(),
+            })
+            .is_err()
+        );
         std::fs::remove_file(path).ok();
     }
 

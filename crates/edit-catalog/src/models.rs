@@ -202,3 +202,48 @@ pub struct IngestBatch {
     pub started_at: i64,
     pub finished_at: Option<i64>,
 }
+
+/// Parameters for opening an ingest batch: the volume it came from, the
+/// destination and backup folders, and the selected IPTC template.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct NewIngestBatch {
+    pub volume_uuid: Option<String>,
+    pub volume_label: Option<String>,
+    pub session_name: Option<String>,
+    pub dest_dir: String,
+    pub backup_dir: Option<String>,
+    pub template_id: Option<i64>,
+    pub state: String,
+}
+
+/// One file's ingest history row: the durable record of a copy, its
+/// verification hash, and the Lightroom-style duplicate key.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct IngestFile {
+    pub id: i64,
+    pub batch_id: i64,
+    pub original_name: String,
+    pub taken_at: Option<i64>,
+    pub bytes: i64,
+    pub source_path: String,
+    pub dest_path: Option<String>,
+    pub backup_path: Option<String>,
+    pub blake3: Option<String>,
+    pub photo_id: Option<i64>,
+    pub state: String,
+    pub error: Option<String>,
+    pub created_at: i64,
+}
+
+/// Parameters for recording a file as it enters the ingest pipeline. The
+/// verification fields fill in later through
+/// [`crate::stores::Catalog::complete_ingest_file`].
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct NewIngestFile {
+    pub batch_id: i64,
+    pub original_name: String,
+    pub taken_at: Option<i64>,
+    pub bytes: i64,
+    pub source_path: String,
+    pub state: String,
+}
