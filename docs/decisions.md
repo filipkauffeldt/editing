@@ -15,7 +15,7 @@ Statuses:
 | # | Decision | Choice |
 |---|---|---|
 | 1 | License | Open source (Apache-2.0) |
-| 2 | UI framework | GPUI (base) + gpui-component, with gpui-base as the behavior layer (pin git revisions, expect churn) |
+| 2 | UI framework | ~~GPUI (base) + gpui-component, with gpui-base as the behavior layer (pin git revisions, expect churn)~~ Superseded by the A1 pin rows below: pinned as crates.io snapshots (`gpui-pre`, `gpui-pre-platform`, `gpui-kit`) |
 | 3 | Render engine | LightCraft lower crates — `develop`, `pipeline`, `raw`, `codecs`, optional `preview` — linked in-process, git-pinned to a revision. No subprocess render engine |
 | 4 | Edit model | LightCraft `DevelopSettings` for preview and export (single model; own tone math retired) |
 | 5 | Raw handling | `lightcraft-raw` decode where supported; embedded camera preview otherwise; no fallback engine |
@@ -45,4 +45,4 @@ Statuses:
 |---|---|---|---|
 | 2026-10 | A1 | GPUI pin | `gpui-pre` / `gpui-pre-platform` `=0.3.8` from crates.io, a snapshot of zed@`279fe07` (2026-10-04). Consumed from crates.io, not the zed git repo; this is the distribution path gpui-kit releases carry |
 | 2026-10 | A1 | gpui-component pin | `gpui-kit` `=0.7.1` from crates.io (the longbridge/gpui-component repo was renamed to longbridge/gpui-kit; `gpui-kit` wires gpui + gpui-base + gpui-component + default assets) |
-| 2026-10 | A1 | Workspace MSRV | `rust-version = "1.95"`; build toolchain is stable 1.98.1, the toolchain gpui's pinned zed revision requires |
+| 2026-10 | A1 | Workspace MSRV | Workspace `rust-version` floor is `1.95`; the toolchain actually used to build is stable 1.98.1, which gpui-pre 0.3.8 (zed@279fe07) requires. CI builds with 1.98.1. An MSRV check job may come later |

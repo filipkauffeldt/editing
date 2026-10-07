@@ -25,7 +25,7 @@ Open source. Linux first, cross-platform (Windows, macOS) after.
 | Decision | Choice |
 |---|---|
 | License | Open source |
-| UI framework | GPUI (base) + gpui-component, with gpui-base as the behavior layer (pin git revisions, expect churn) |
+| UI framework | GPUI (base) + gpui-component, with gpui-base as the behavior layer (pinned as crates.io snapshots: `gpui-pre`, `gpui-pre-platform`, `gpui-kit`; expect churn) |
 | Render engine | LightCraft lower crates — `develop`, `pipeline`, `raw`, `codecs`, optional `preview` — linked in-process, git-pinned to a revision. No subprocess render engine |
 | Edit model | LightCraft `DevelopSettings` for preview and export (single model; own tone math retired) |
 | Raw handling | `lightcraft-raw` decode where supported; embedded camera preview otherwise; no fallback engine |
@@ -227,7 +227,7 @@ render path.
 
 | Concern | Choice |
 |---|---|
-| UI | gpui + gpui-base + gpui-component (git-pinned to a matching zed revision) |
+| UI | gpui + gpui-base + gpui-component (`gpui-pre` / `gpui-pre-platform` crates.io snapshots + `gpui-kit`, exact pins) |
 | Render engine | lightcraft-develop + lightcraft-pipeline + lightcraft-raw + lightcraft-codecs (git-pinned, in-process CPU reference) |
 | Retouch & selections | photocraft-algo (Mosaic, Gaussian, wand/matting) + own `edit-retouch` shape model |
 | Face detection | libfacedetection-rust (BSD-3) or tract + YuNet — picked in R0; SCRFD/ort escalation path |
