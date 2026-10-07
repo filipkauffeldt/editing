@@ -604,6 +604,9 @@ pub fn run_catalog_scan(
                 kind: kind_str.to_string(),
                 bytes: entry.bytes as i64,
                 mtime: entry.mtime,
+                // A scan has no separate card name; the on-disk name is it.
+                original_name: Some(entry.base_name.clone()),
+                taken_at: None,
             }) {
                 Ok(photo_id) => {
                     inserted.push((entry, photo_id));

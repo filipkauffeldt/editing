@@ -13,6 +13,7 @@ pub mod error;
 pub mod faces;
 pub mod geometry;
 pub mod ids;
+pub mod ingest;
 pub mod render;
 pub mod retouch;
 pub mod traits;
@@ -22,6 +23,7 @@ pub use error::{Error, Result};
 pub use faces::FaceBox;
 pub use geometry::{Point, Rect};
 pub use ids::{ItemId, PhotoId};
+pub use ingest::IngestFileState;
 pub use render::{Crop, Frame, OutputColor, PreviewFrame, RenderRequest, RenderSize};
 pub use retouch::{MaskPlane, RetouchOp, RetouchRecipe};
 

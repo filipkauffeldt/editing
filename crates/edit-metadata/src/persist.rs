@@ -106,6 +106,8 @@ mod tests {
                 kind: "raw".into(),
                 bytes: 1024,
                 mtime: 1_700_000_000,
+                original_name: None,
+                taken_at: None,
             })
             .unwrap();
         catalog

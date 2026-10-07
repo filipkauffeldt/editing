@@ -24,3 +24,9 @@ CREATE TABLE ingest_files (
 
 CREATE INDEX idx_ingest_files_dedupe ON ingest_files(original_name, taken_at, bytes);
 CREATE INDEX idx_ingest_files_batch ON ingest_files(batch_id);
+
+-- The photo row also carries the original (card) name and capture time, so
+-- the duplicate check can see files cataloged outside the ingest history
+-- (and survives if ingest history is ever pruned).
+ALTER TABLE photos ADD COLUMN original_name TEXT;
+CREATE INDEX idx_photos_dedupe ON photos(original_name, taken_at, bytes);
