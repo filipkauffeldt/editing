@@ -799,7 +799,22 @@ impl Catalog {
 
     // ---- IPTC templates ----
 
+    /// Scopes a template row may hold (plan section 2.8 + M3): a browsed
+    /// set available everywhere, or one snapshot scoped to a single ingest.
+    const TEMPLATE_SCOPES: &[&str] = &["global", "ingest"];
+
+    fn check_template_scope(scope: &str) -> Result<()> {
+        if Self::TEMPLATE_SCOPES.contains(&scope) {
+            Ok(())
+        } else {
+            Err(Error::InvalidValue(format!(
+                "unknown template scope: {scope}"
+            )))
+        }
+    }
+
     pub fn insert_iptc_template(&self, name: &str, fields_json: &str, scope: &str) -> Result<i64> {
+        Self::check_template_scope(scope)?;
         self.with_conn(|conn| {
             conn.execute(
                 "INSERT INTO iptc_templates (name, fields_json, scope, updated_at)
@@ -807,6 +822,39 @@ impl Catalog {
                 params![name, fields_json, scope, now_unix()],
             )?;
             Ok(conn.last_insert_rowid())
+        })
+    }
+
+    /// Rewrite a template row in place; the id stays so enqueued jobs and
+    /// `ingest_batches.template_id` references keep pointing at it.
+    pub fn update_iptc_template(
+        &self,
+        id: i64,
+        name: &str,
+        fields_json: &str,
+        scope: &str,
+    ) -> Result<()> {
+        Self::check_template_scope(scope)?;
+        self.with_conn(|conn| {
+            let n = conn.execute(
+                "UPDATE iptc_templates SET name = ?1, fields_json = ?2, scope = ?3, updated_at = ?4
+                 WHERE id = ?5",
+                params![name, fields_json, scope, now_unix(), id],
+            )?;
+            if n == 0 {
+                return Err(not_found("iptc_template", id));
+            }
+            Ok(())
+        })
+    }
+
+    pub fn delete_iptc_template(&self, id: i64) -> Result<()> {
+        self.with_conn(|conn| {
+            let n = conn.execute("DELETE FROM iptc_templates WHERE id = ?1", [id])?;
+            if n == 0 {
+                return Err(not_found("iptc_template", id));
+            }
+            Ok(())
         })
     }
 
@@ -1200,6 +1248,23 @@ mod tests {
             .unwrap();
         assert_eq!(db.get_iptc_template(template).unwrap().scope, "ingest");
         assert_eq!(db.list_iptc_templates().unwrap().len(), 1);
+        db.update_iptc_template(template, "sports", r#"{"credit":"y"}"#, "global")
+            .unwrap();
+        assert_eq!(
+            (
+                db.get_iptc_template(template).unwrap().name.as_str(),
+                db.get_iptc_template(template).unwrap().scope.as_str()
+            ),
+            ("sports", "global")
+        );
+        let edit2 = db.insert_iptc_template("b", "{}", "global").unwrap();
+        db.delete_iptc_template(edit2).unwrap();
+        assert!(db.get_iptc_template(edit2).is_err());
+        assert!(db.insert_iptc_template("c", "{}", "session").is_err());
+        assert!(
+            db.update_iptc_template(999_999, "c", "{}", "global")
+                .is_err()
+        );
 
         let batch = db.insert_ingest_batch("/photos/2026", "running").unwrap();
         db.finish_ingest_batch(batch, "done").unwrap();
