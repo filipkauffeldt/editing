@@ -311,28 +311,41 @@ re-reads the card for the backup.
 
 ### 2.1 Window shell
 
-One window. Four regions.
+One window. The single view layout follows this sketch:
 
 ```
-┌ TitleBar: editing          [Open Folder] [Ingest] [Send] ──────────────┐
-├ Sidebar ──────┬ Contact sheet / Single view ─────────────┬ Panel ──────┤
-│ Sessions      │  ┌──────┐ ┌──────┐ ┌──────┐ ┌──────┐    │ Develop    │
-│  2026-10-07   │  │ ▣ ★  │ │ ▣    │ │ ▣ ✓  │ │ ▣ !  │    │ Crop       │
-│  2026-10-06   │  └──────┘ └──────┘ └──────┘ └──────┘    │ Retouch    │
-│ Filters       │  ┌──────┐ ┌──────┐ ┌──────┐ ┌──────┐    │ Metadata   │
-│  ★ >= 3       │  │ ▣    │ │ ▣    │ │ ▣    │ │ ▣    │    │            │
-│  Unuploaded   │  └──────┘ └──────┘ └──────┘ └──────┘    │            │
-├───────────────┴─────────────────────────────────────────┴────────────┤
-│ StatusBar: 1 selected · 12 queued · 3 uploaded · FTP idle · 42 items  │
-└────────────────────────────────────────────────────────────────────────┘
+┌ TitleBar: editing            [Open Folder] [Ingest] [Send] ───────────────┐
+├ Status strip: upload state · edit state · template changes ────────────────┤
+├ Metadata editor ──┬ Photo canvas ─────────────────────────┬ Develop ───────┤
+│ Caption           │                                       │ Presets        │
+│ Keywords          │                 photo                 │ Exposure       │
+│ Headline          │                                       │ White balance  │
+│ Byline            │                                       │ Tone curve     │
+│ ...               │                                       │ Crop · Retouch │
+├───────────────────┴───────────────────────────────────────┴────────────────┤
+│ Film strip  [▣][▣][▣][▣][▣][▣][▣][▣][▣][▣][▣][▣]                           │
+└────────────────────────────────────────────────────────────────────────────┘
 ```
+
+The shell is shared by the contact sheet and the single view. The center swaps
+between the grid and the photo. The right panel and the film strip collapse in
+contact sheet mode. The left metadata editor stays in both modes.
+
+- Top status strip: upload state of the current item, edit dirty state, and a
+  marker when ingest or a template changed metadata.
+- Left: metadata editor for the current item.
+- Center: photo canvas, crop canvas, or retouch canvas.
+- Right: Presets list at the top, then the develop panel with LR-style sliders
+  and tone curve. Crop and Retouch swap into this column.
+- Bottom: film strip of the current item list with badge overlays.
 
 Component mapping, from `PLAN.md`:
 
 | Surface | Component |
 |---|---|
-| Window shell | `Root`, `TitleBar`, `Sidebar`, `StatusBar` |
+| Window shell | `Root`, `TitleBar`, status strip |
 | Contact sheet | custom grid over `uniform_list` with gpui-base virtualization |
+| Film strip | horizontal `List` of thumbnail cells with badge overlays |
 | Single view, crop, retouch | `canvas()` + `paint_image` / `paint_path` overlays |
 | Template editor, recipes | `Form`, `Input`, `Textarea`, `Select`, `Combobox` |
 | Ingest dialog | `Dialog`, per-card `Progress`, file `Table` |
@@ -340,20 +353,27 @@ Component mapping, from `PLAN.md`:
 
 ### 2.2 Contact sheet
 
+- Lives in the center region. Header carries the session picker, filter
+  controls, and sort order.
 - Virtualized rows of cells. Cell shows thumbnail, rating stars, upload badge,
   ingest badge, filename on hover.
 - Selection with arrows, Shift+arrows for ranges, Ctrl+A for all, mouse click
   and drag.
-- Filter bar: rating, color label, upload state, file kind.
+- Filter controls: rating, color label, upload state, file kind.
 - Sort: capture time, filename, ingest order.
 - Live updates while ingest runs. A new file appears with an amber badge that
   turns green after thumbnails and metadata land.
 
 ### 2.3 Single view
 
-- Fit, 100%, and zoom states. Scroll to zoom, drag to pan, `0` resets to fit.
+- Center canvas: fit, 100%, and zoom states. Scroll to zoom, drag to pan, `Z`
+  resets to fit.
 - Left and Right walk the item list. The view preloads the proxy for neighbors.
-- The right panel shows Develop, Crop, Retouch, and Metadata tabs.
+- Left panel edits metadata for the current item through the same `EditSession`.
+- Right column: Presets, then develop sliders and tone curve. Crop and Retouch
+  replace the column content while their mode is active.
+- Bottom film strip: thumbnails of the item list, current item outlined, badge
+  overlays, click to navigate, scrolls with the selection.
 - All slider changes write to the edit buffer, then debounce to the catalog.
 
 ### 2.4 Crop mode
@@ -376,7 +396,9 @@ Component mapping, from `PLAN.md`:
 
 ### 2.6 Metadata
 
-- Template editor: multi-column form, one row per IPTC field.
+- Left panel edits the current item: multi-column form, one row per IPTC field.
+- The template editor opens from the panel as a `Dialog` and applies a template
+  to the selection.
 - Phase 1 fields: caption, keywords, headline, byline and title, credit,
   source, copyright, instructions, edit status, rights.
 - Phase 2 fields: location, contact, categories, custom fields.
@@ -400,15 +422,16 @@ Component mapping, from `PLAN.md`:
 - Recipe form: file format, quality, resize long edge, output color, filename
   rule, FTP profile, remote directory.
 - `Alt+S` sends the current item with the active recipe, then advances.
-- Status bar shows the upload queue. Per-photo badges: amber queued, blue
+- Status strip shows the upload queue. Per-photo badges: amber queued, blue
   uploading, green done, red failed. A failed item offers retry with resume.
 
 ### 2.9 State model
 
 - `AppState` root entity: roots, current root, item list, selection set,
   current item, job registry, transfer registry.
-- One view entity per surface: `ContactSheet`, `SingleView`, `IngestDialog`,
-  `TemplateEditor`, `RetouchPanel`, `SendPanel`, `StatusBar`.
+- One view entity per surface: `ContactSheet`, `SingleView`, `MetadataEditor`,
+  `DevelopPanel`, `RetouchPanel`, `FilmStrip`, `IngestDialog`,
+  `TemplateEditor`, `SendPanel`, `StatusStrip`.
 - One `EditSession` for the current item: `DevelopSettings`, `Crop`, retouch
   recipes, dirty flag. Commits to the catalog on debounce and on navigation.
 - Job progress events update views through the flume drain loop.
