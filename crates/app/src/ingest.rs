@@ -1,16 +1,18 @@
-//! Ingest dialog shell (B3) and the shared [`AppState`].
+//! Ingest dialog (B3 shell + C2 live state) and the shared [`AppState`].
 //!
 //! Scope: volume list driven by `edit-ingest` detection events, destination
 //! inputs as plain text, an IPTC template selector stub, and a live file table
-//! with a per-file state column. No copying, backup, rename, or template
-//! application — the copy pipeline lands in C2 and template application in D3.
-//!
-//! The dialog is an inline panel built from gpui-component `DialogTitle`,
-//! `Progress`, `Input`, and `Button` parts and rendered as an entity-driven
-//! overlay, so insert/remove events refresh it while it is open. A full modal
-//! `window.open_dialog` overlay arrives with the C2 pipeline.
+//! with a per-file state column. C2 adds the **Start ingest** action: it opens
+//! an `ingest_batches` row, enqueues one durable `ingest_copy` job per card
+//! (multi-card parallel), and reflects the worker's per-file progress, live
+//! file states and duplicates through the shared job-event drain.
 
-use edit_ingest::Volume;
+use std::collections::HashMap;
+use std::sync::Arc;
+
+use edit_catalog::models::{IngestFile, NewIngestBatch};
+use edit_catalog::{Catalog, JobEvent, JobEventKind, JobId, JobKind};
+use edit_ingest::{IngestCopyPayload, Volume, static_prefix, validate};
 use gpui_kit::component::button::Button;
 use gpui_kit::component::dialog::DialogTitle;
 use gpui_kit::component::input::{Input, InputState};
@@ -23,9 +25,9 @@ actions!(ingest, [OpenIngest]);
 
 /// Per-file ingest state shown in the live file table.
 ///
-/// Produced by the C2 copy pipeline; the B3 shell only renders the column.
+/// Written by the C2 copy pipeline through the `ingest_files.state` column;
+/// [`IngestFileState::from_db`] maps it back for rendering.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-#[allow(dead_code, reason = "states are produced by the C2 copy pipeline")]
 pub enum IngestFileState {
     Queued,
     Copying,
@@ -33,7 +35,24 @@ pub enum IngestFileState {
     Renaming,
     Backup,
     Cataloged,
+    Duplicate,
     Failed,
+}
+
+impl IngestFileState {
+    /// Map an `ingest_files.state` string to the display state.
+    pub fn from_db(state: &str) -> Self {
+        match state {
+            "copying" => Self::Copying,
+            "verifying" => Self::Verifying,
+            "renaming" => Self::Renaming,
+            "backup" => Self::Backup,
+            "cataloged" => Self::Cataloged,
+            "duplicate" => Self::Duplicate,
+            "failed" => Self::Failed,
+            _ => Self::Queued,
+        }
+    }
 }
 
 impl std::fmt::Display for IngestFileState {
@@ -45,13 +64,14 @@ impl std::fmt::Display for IngestFileState {
             Self::Renaming => "renaming",
             Self::Backup => "backup",
             Self::Cataloged => "cataloged",
+            Self::Duplicate => "duplicate",
             Self::Failed => "failed",
         };
         f.write_str(text)
     }
 }
 
-/// One row of the live file table. Empty in B3; C2 fills it per copied file.
+/// One row of the live file table, built from an `ingest_files` row.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct IngestFileRow {
     pub name: String,
@@ -59,15 +79,55 @@ pub struct IngestFileRow {
     pub state: IngestFileState,
 }
 
-/// Shared application state (plan section 2.10): currently detected volumes,
-/// whether the ingest dialog is open, and the stub file rows.
-///
-/// Volume detection events replace the whole list; [`IngestDialog`] reads this
-/// entity in `render`, so insert/remove refreshes the open dialog.
+impl IngestFileRow {
+    /// Snapshot one durable ingest-history row for the dialog.
+    pub fn from_db(file: &IngestFile) -> Self {
+        Self {
+            name: file.original_name.clone(),
+            bytes: file.bytes.max(0) as u64,
+            state: IngestFileState::from_db(&file.state),
+        }
+    }
+}
+
+/// Lifecycle of one card's ingest batch, for the per-card progress bar.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BatchState {
+    Running,
+    Done,
+    Failed,
+}
+
+/// Per-card progress shown next to a detected volume.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct IngestBatchProgress {
+    pub batch_id: i64,
+    pub volume_identity: String,
+    pub label: String,
+    pub done: usize,
+    pub total: usize,
+    pub state: BatchState,
+}
+
+impl IngestBatchProgress {
+    /// Percentage for the per-card progress bar (0 with no files planned yet).
+    pub fn percent(&self) -> f32 {
+        if self.total == 0 {
+            0.0
+        } else {
+            (self.done as f32 / self.total as f32) * 100.0
+        }
+    }
+}
+
+/// Shared application state (plan section 2.10): detected volumes, the ingest
+/// dialog visibility, per-card batch progress, and the live file rows.
 pub struct AppState {
     volumes: Vec<Volume>,
     ingest_open: bool,
-    files: Vec<IngestFileRow>,
+    batches: Vec<IngestBatchProgress>,
+    files_by_batch: HashMap<i64, Vec<IngestFileRow>>,
+    job_batches: HashMap<JobId, i64>,
     /// IPTC template selector stub: `None` until M3/D3 populate templates.
     pub iptc_template: Option<String>,
 }
@@ -77,10 +137,13 @@ impl AppState {
         Self {
             volumes: Vec::new(),
             ingest_open: false,
-            files: Vec::new(),
+            batches: Vec::new(),
+            files_by_batch: HashMap::new(),
+            job_batches: HashMap::new(),
             iptc_template: None,
         }
     }
+
     pub fn volumes(&self) -> &[Volume] {
         &self.volumes
     }
@@ -89,8 +152,22 @@ impl AppState {
         self.ingest_open
     }
 
-    pub fn files(&self) -> &[IngestFileRow] {
-        &self.files
+    /// All live file rows, batches in registration order.
+    pub fn files(&self) -> Vec<IngestFileRow> {
+        let mut rows: Vec<IngestFileRow> = Vec::new();
+        for batch in &self.batches {
+            if let Some(files) = self.files_by_batch.get(&batch.batch_id) {
+                rows.extend(files.iter().cloned());
+            }
+        }
+        rows
+    }
+
+    /// Progress of the batch for one card, if it is ingesting.
+    pub fn batch_for_volume(&self, identity: &str) -> Option<&IngestBatchProgress> {
+        self.batches
+            .iter()
+            .find(|batch| batch.volume_identity == identity)
     }
 
     /// Replace the volume list from a detection event. Volumes are keyed by
@@ -108,11 +185,97 @@ impl AppState {
             cx.notify();
         }
     }
+
+    /// Remember the batch a queued `ingest_copy` job belongs to, so progress
+    /// events can be routed to the right card.
+    pub fn register_batch(
+        &mut self,
+        batch_id: i64,
+        job_id: JobId,
+        volume_identity: String,
+        label: String,
+        cx: &mut Context<Self>,
+    ) {
+        self.job_batches.insert(job_id, batch_id);
+        self.batches.push(IngestBatchProgress {
+            batch_id,
+            volume_identity,
+            label,
+            done: 0,
+            total: 0,
+            state: BatchState::Running,
+        });
+        cx.notify();
+    }
+
+    /// The batch a job id belongs to, if it is an ingest job.
+    pub fn batch_for_job(&self, job_id: JobId) -> Option<i64> {
+        self.job_batches.get(&job_id).copied()
+    }
+
+    pub fn set_progress(
+        &mut self,
+        batch_id: i64,
+        done: usize,
+        total: usize,
+        cx: &mut Context<Self>,
+    ) {
+        if let Some(batch) = self.batches.iter_mut().find(|b| b.batch_id == batch_id) {
+            batch.done = done;
+            batch.total = total;
+            cx.notify();
+        }
+    }
+
+    pub fn finish_batch(&mut self, batch_id: i64, failed: bool, cx: &mut Context<Self>) {
+        if let Some(batch) = self.batches.iter_mut().find(|b| b.batch_id == batch_id) {
+            batch.state = if failed {
+                BatchState::Failed
+            } else {
+                BatchState::Done
+            };
+            if failed {
+                batch.total = batch.total.max(batch.done);
+            }
+            cx.notify();
+        }
+    }
+
+    pub fn set_files(&mut self, batch_id: i64, rows: Vec<IngestFileRow>, cx: &mut Context<Self>) {
+        self.files_by_batch.insert(batch_id, rows);
+        cx.notify();
+    }
 }
 
 impl Default for AppState {
     fn default() -> Self {
         Self::new()
+    }
+}
+
+/// Apply one durable job event to the ingest UI: per-card progress and the
+/// live file table are re-read from `ingest_files`, so the dialog shows the
+/// durable worker state even after a crash-resume.
+pub fn apply_ingest_event(
+    state: &mut AppState,
+    catalog: &Catalog,
+    event: &JobEvent,
+    cx: &mut Context<AppState>,
+) {
+    let Some(batch_id) = state.batch_for_job(event.id) else {
+        return;
+    };
+    match &event.kind {
+        JobEventKind::Started { .. } => {}
+        JobEventKind::Progress { done, total } => {
+            state.set_progress(batch_id, *done as usize, *total as usize, cx);
+        }
+        JobEventKind::Succeeded => state.finish_batch(batch_id, false, cx),
+        JobEventKind::Failed { .. } => state.finish_batch(batch_id, true, cx),
+    }
+    if let Ok(files) = catalog.list_ingest_files(batch_id) {
+        let rows: Vec<IngestFileRow> = files.iter().map(IngestFileRow::from_db).collect();
+        state.set_files(batch_id, rows, cx);
     }
 }
 
@@ -132,31 +295,36 @@ pub fn format_bytes(bytes: u64) -> String {
     }
 }
 
-/// Ingest dialog shell (plan section 2.8): card list with per-card progress,
+/// Ingest dialog (plan section 2.8): card list with per-card progress,
 /// destination folder + filename rule inputs, backup destination input, IPTC
-/// template selector stub, and the live file table.
+/// template selector stub, the live file table, and the Start action.
 pub struct IngestDialog {
     state: Entity<AppState>,
+    catalog: Arc<Catalog>,
     /// Volume identity of the selected card, if any.
     pub selected: Option<String>,
     pub dest_dir: Entity<InputState>,
     pub file_rule: Entity<InputState>,
     pub backup_dir: Entity<InputState>,
+    status: Option<String>,
 }
 
 impl IngestDialog {
     pub fn new(
         state: Entity<AppState>,
+        catalog: Arc<Catalog>,
         dest_dir: Entity<InputState>,
         file_rule: Entity<InputState>,
         backup_dir: Entity<InputState>,
     ) -> Self {
         Self {
             state,
+            catalog,
             selected: None,
             dest_dir,
             file_rule,
             backup_dir,
+            status: None,
         }
     }
 
@@ -166,9 +334,119 @@ impl IngestDialog {
         });
     }
 
+    /// Open an ingest batch for the selected card and queue its copy job.
+    ///
+    /// Enumeration, copying and dedupe all run inside the `ingest_copy` job,
+    /// so this never blocks the UI thread.
+    fn start(&mut self, cx: &mut Context<Self>) {
+        let Some(identity) = self.selected.clone() else {
+            self.status = Some("Select a card first.".to_string());
+            cx.notify();
+            return;
+        };
+        let dest = self.dest_dir.read(cx).value().to_string();
+        let file_rule = self.file_rule.read(cx).value().to_string();
+        let backup = self.backup_dir.read(cx).value().to_string();
+        if dest.trim().is_empty() {
+            self.status = Some("Destination folder is empty.".to_string());
+            cx.notify();
+            return;
+        }
+        if let Err(error) = validate(dest.trim()).and_then(|_| validate(file_rule.trim())) {
+            self.status = Some(format!("Bad naming rule: {error}"));
+            cx.notify();
+            return;
+        }
+
+        let volume = {
+            let state = self.state.read(cx);
+            match state.volumes().iter().find(|v| v.identity == identity) {
+                Some(volume) => volume.clone(),
+                None => {
+                    self.status = Some("That card is gone.".to_string());
+                    cx.notify();
+                    return;
+                }
+            }
+        };
+
+        let backup_dir = {
+            let trimmed = backup.trim();
+            (!trimmed.is_empty()).then(|| trimmed.to_string())
+        };
+        let session = volume.display_name();
+        let batch = NewIngestBatch {
+            volume_uuid: volume.fs_uuid.clone(),
+            volume_label: volume.label.clone(),
+            session_name: Some(session.clone()),
+            dest_dir: static_prefix(dest.trim()),
+            backup_dir: backup_dir.clone(),
+            template_id: None,
+            state: "running".to_string(),
+        };
+        let batch_id = match self.catalog.create_ingest_batch(&batch) {
+            Ok(id) => id,
+            Err(error) => {
+                self.status = Some(format!("Could not open batch: {error}"));
+                cx.notify();
+                return;
+            }
+        };
+        let payload = IngestCopyPayload {
+            batch_id,
+            source_root: volume.mount_point.to_string_lossy().into_owned(),
+            dest_dir_template: dest.trim().to_string(),
+            filename_template: file_rule.trim().to_string(),
+            backup_dir,
+            session: session.clone(),
+            start_seq: 1,
+        };
+        let encoded = match serde_json::to_string(&payload) {
+            Ok(encoded) => encoded,
+            Err(error) => {
+                self.status = Some(format!("Could not encode ingest job: {error}"));
+                cx.notify();
+                return;
+            }
+        };
+        match self.catalog.enqueue_job(JobKind::IngestCopy, &encoded) {
+            Ok(job_id) => {
+                self.state.update(cx, |state, cx| {
+                    state.register_batch(batch_id, job_id, identity, session.clone(), cx);
+                });
+                self.status = Some(format!("Ingesting {session}…"));
+            }
+            Err(error) => {
+                self.status = Some(format!("Could not queue ingest: {error}"));
+            }
+        }
+        cx.notify();
+    }
+
     fn render_cards(&self, cx: &mut Context<Self>) -> impl IntoElement {
         let volumes = self.state.read(cx).volumes().to_vec();
         let selected = self.selected.clone();
+        let progress: Vec<(String, Option<(f32, String)>)> = volumes
+            .iter()
+            .map(|volume| {
+                let batch = self
+                    .state
+                    .read(cx)
+                    .batch_for_volume(&volume.identity)
+                    .cloned();
+                let info = batch.map(|batch| {
+                    let text = match batch.state {
+                        BatchState::Running => {
+                            format!("ingesting {}/{}", batch.done, batch.total)
+                        }
+                        BatchState::Done => format!("done · {} files", batch.total),
+                        BatchState::Failed => format!("failed · {} files", batch.total),
+                    };
+                    (batch.percent(), text)
+                });
+                (volume.identity.clone(), info)
+            })
+            .collect();
         v_flex().gap_2().children(volumes.into_iter().map(|volume| {
             let identity = volume.identity.clone();
             let is_selected = selected.as_deref() == Some(identity.as_str());
@@ -179,6 +457,20 @@ impl IngestDialog {
                 format_bytes(volume.free_bytes),
                 format_bytes(volume.capacity_bytes),
             );
+            let batch_info = progress
+                .iter()
+                .find(|(id, _)| id == &identity)
+                .and_then(|(_, info)| info.clone());
+            let (percent, progress_text) = match batch_info {
+                Some((percent, text)) => (percent, text),
+                None => (
+                    volume.used_percent(),
+                    format!(
+                        "{} used",
+                        format_bytes(volume.capacity_bytes - volume.free_bytes)
+                    ),
+                ),
+            };
             let progress_id = format!("card-progress-{}", volume.identity);
             let row_id = format!("card-row-{}", volume.identity);
             let identity_for_click = identity.clone();
@@ -201,7 +493,8 @@ impl IngestDialog {
                         .child(div().font_semibold().child(label))
                         .child(div().text_sm().child(detail)),
                 )
-                .child(Progress::new(progress_id).value(volume.used_percent()))
+                .child(Progress::new(progress_id).value(percent))
+                .child(div().text_xs().child(progress_text))
         }))
     }
 
@@ -230,14 +523,14 @@ impl IngestDialog {
     }
 
     fn render_file_table(&self, cx: &mut Context<Self>) -> impl IntoElement {
-        let files = self.state.read(cx).files().to_vec();
+        let files = self.state.read(cx).files();
         v_flex()
             .gap_1()
             .child(
                 div()
                     .text_sm()
                     .font_semibold()
-                    .child("Files (copy pipeline lands in C2)".to_string()),
+                    .child("Files (medium: original name · bytes · state)".to_string()),
             )
             .child(
                 h_flex()
@@ -262,7 +555,7 @@ impl IngestDialog {
                 table.child(
                     div()
                         .text_sm()
-                        .child("No files yet — plug in a card and start ingest in C2.".to_string()),
+                        .child("No files yet — start an ingest to fill the table.".to_string()),
                 )
             })
     }
@@ -279,6 +572,9 @@ impl Render for IngestDialog {
             self.selected = None;
         }
         let volume_count = volumes.len();
+        let dest = self.dest_dir.read(cx).value().to_string();
+        let ready = self.selected.is_some() && !dest.trim().is_empty();
+        let status = self.status.clone();
         div()
             .id("ingest-dialog")
             .w_full()
@@ -300,7 +596,7 @@ impl Render for IngestDialog {
                     .child(self.render_cards(cx))
                     .child(self.render_field("Destination folder", &self.dest_dir, "ingest-dest"))
                     .child(self.render_field(
-                        "Filename rule (plain text; rule engine is C2)",
+                        "Filename rule (variables: {session}, {seq:4}, {filename}, {ext}, {yyyy}…)",
                         &self.file_rule,
                         "ingest-rule",
                     ))
@@ -311,6 +607,9 @@ impl Render for IngestDialog {
                     ))
                     .child(self.render_template_stub(cx))
                     .child(self.render_file_table(cx))
+                    .when_some(status, |panel, status| {
+                        panel.child(div().text_sm().child(status))
+                    })
                     .child(
                         h_flex()
                             .w_full()
@@ -318,8 +617,13 @@ impl Render for IngestDialog {
                             .gap_2()
                             .child(
                                 Button::new("ingest-start")
-                                    .label("Start ingest (C2)")
-                                    .disabled(true),
+                                    .label("Start ingest")
+                                    .disabled(!ready)
+                                    .on_click(cx.listener(
+                                        |this, _event: &ClickEvent, _window, cx| {
+                                            this.start(cx);
+                                        },
+                                    )),
                             )
                             .child(Button::new("ingest-close").label("Close").on_click(
                                 cx.listener(|this, _event: &ClickEvent, _window, cx| {
@@ -336,7 +640,8 @@ mod tests {
     // NOTE: import items explicitly, never `super::*` — the `gpui_kit::*`
     // glob re-exported above includes GPUI's `test` macro, which would shadow
     // the built-in `#[test]` attribute inside this module.
-    use super::{IngestFileState, format_bytes};
+    use super::{BatchState, IngestFileRow, IngestFileState, format_bytes};
+    use edit_catalog::models::IngestFile;
 
     #[test]
     fn byte_counts_format_with_binary_units() {
@@ -350,6 +655,50 @@ mod tests {
     fn file_states_render_expected_labels() {
         assert_eq!(IngestFileState::Copying.to_string(), "copying");
         assert_eq!(IngestFileState::Cataloged.to_string(), "cataloged");
+        assert_eq!(IngestFileState::Duplicate.to_string(), "duplicate");
         assert_eq!(IngestFileState::Failed.to_string(), "failed");
+    }
+
+    #[test]
+    fn db_states_map_to_display_states() {
+        assert_eq!(IngestFileState::from_db("queued"), IngestFileState::Queued);
+        assert_eq!(IngestFileState::from_db("backup"), IngestFileState::Backup);
+        assert_eq!(
+            IngestFileState::from_db("duplicate"),
+            IngestFileState::Duplicate
+        );
+        // Unknown states degrade to queued instead of panicking.
+        assert_eq!(
+            IngestFileState::from_db("nonsense"),
+            IngestFileState::Queued
+        );
+    }
+
+    #[test]
+    fn file_rows_snapshot_history() {
+        let row = IngestFileRow::from_db(&IngestFile {
+            id: 1,
+            batch_id: 2,
+            original_name: "DSC0001.NEF".into(),
+            taken_at: Some(1),
+            bytes: 2048,
+            source_path: "/card/DCIM/DSC0001.NEF".into(),
+            dest_path: None,
+            backup_path: None,
+            blake3: None,
+            photo_id: None,
+            state: "duplicate".into(),
+            error: None,
+            created_at: 0,
+        });
+        assert_eq!(row.name, "DSC0001.NEF");
+        assert_eq!(row.bytes, 2048);
+        assert_eq!(row.state, IngestFileState::Duplicate);
+    }
+
+    #[test]
+    fn batch_state_labels_are_distinct() {
+        assert_ne!(BatchState::Running, BatchState::Done);
+        assert_ne!(BatchState::Done, BatchState::Failed);
     }
 }
