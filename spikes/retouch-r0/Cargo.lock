@@ -1116,7 +1116,6 @@ dependencies = [
  "photocraft-color",
  "photocraft-geom",
  "photocraft-raster",
- "serde_json",
  "tract-onnx",
 ]
 
