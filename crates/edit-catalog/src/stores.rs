@@ -335,6 +335,24 @@ impl Catalog {
         })
     }
 
+    /// Fill one side of an existing pair item: a rescan completing a
+    /// half-pair (RAW arrived first, JPEG later, or vice versa) lands here
+    /// instead of inserting a second row. No migration: plain `UPDATE`.
+    pub fn set_item_side(&self, id: i64, photo_id: i64, raw: bool) -> Result<()> {
+        self.with_conn(|conn| {
+            let sql = if raw {
+                "UPDATE items SET raw_photo_id = ?1 WHERE id = ?2"
+            } else {
+                "UPDATE items SET jpeg_photo_id = ?1 WHERE id = ?2"
+            };
+            let n = conn.execute(sql, params![photo_id, id])?;
+            if n == 0 {
+                return Err(not_found("item", id));
+            }
+            Ok(())
+        })
+    }
+
     // ---- edits ----
 
     pub fn upsert_edit(
@@ -1008,6 +1026,46 @@ mod tests {
         assert_eq!(db.get_setting("missing").unwrap(), None);
 
         assert!(db.get_root(999_999).is_err());
+        std::fs::remove_file(path).ok();
+    }
+
+    #[test]
+    fn set_item_side_completes_a_half_pair() {
+        let path = scratch_db("item-side");
+        let db = Catalog::open(&path).unwrap();
+        let root = db.insert_root("/photos", "folder").unwrap();
+        let raw = db.insert_photo(&photo_fixture(root, 1)).unwrap();
+        let item = db
+            .insert_item("/photos", "DSC00001", Some(raw), None)
+            .unwrap();
+        assert_eq!(db.get_item(item).unwrap().jpeg_photo_id, None);
+
+        let jpeg = db
+            .insert_photo(&NewPhoto {
+                path: "/photos/DSC00001.JPG".into(),
+                ext: "JPG".into(),
+                kind: "jpeg".into(),
+                ..photo_fixture(root, 1)
+            })
+            .unwrap();
+        db.set_item_side(item, jpeg, false).unwrap();
+        let completed = db.get_item(item).unwrap();
+        assert_eq!(completed.raw_photo_id, Some(raw));
+        assert_eq!(completed.jpeg_photo_id, Some(jpeg));
+
+        assert!(db.set_item_side(999_999, jpeg, false).is_err());
+        std::fs::remove_file(path).ok();
+    }
+
+    #[test]
+    fn unique_violations_are_detected() {
+        let path = scratch_db("unique-violation");
+        let db = Catalog::open(&path).unwrap();
+        let root = db.insert_root("/photos", "folder").unwrap();
+        db.insert_photo(&photo_fixture(root, 1)).unwrap();
+        let dup = db.insert_photo(&photo_fixture(root, 1)).unwrap_err();
+        assert!(dup.is_unique_violation());
+        assert!(!Error::NotFound("x".into()).is_unique_violation());
         std::fs::remove_file(path).ok();
     }
 }
