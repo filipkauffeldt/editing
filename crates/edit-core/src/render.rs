@@ -47,12 +47,13 @@ impl Default for Crop {
     }
 }
 
-/// Aspect-ratio presets offered by the crop UI.
+/// Aspect-ratio presets offered by the crop UI (plan section 2.5).
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub enum Aspect {
     Original,
     Square,
     ThreeTwo,
+    TwoThree,
     FourThree,
     SixteenNine,
 }
@@ -109,12 +110,19 @@ impl Frame {
                 "frame dimensions must be nonzero".into(),
             ));
         }
-        if self.stride < self.width * 4 {
+        let min_stride = self
+            .width
+            .checked_mul(4)
+            .ok_or_else(|| Error::InvalidInput("frame width overflows stride".into()))?;
+        if self.stride < min_stride {
             return Err(Error::InvalidInput(
                 "frame stride is smaller than width * 4".into(),
             ));
         }
-        if self.pixels.len() < self.stride as usize * self.height as usize {
+        let min_len = (self.stride as usize)
+            .checked_mul(self.height as usize)
+            .ok_or_else(|| Error::InvalidInput("frame buffer size overflows".into()))?;
+        if self.pixels.len() < min_len {
             return Err(Error::InvalidInput(
                 "frame buffer is smaller than stride * height".into(),
             ));

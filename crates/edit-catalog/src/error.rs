@@ -15,9 +15,6 @@ pub enum Error {
     /// The catalog mutex was poisoned by a panicking thread.
     #[error("catalog lock poisoned")]
     LockPoisoned,
-    /// A progress subscriber went away; the job result is still durable.
-    #[error("progress channel disconnected")]
-    ProgressDisconnected,
 }
 
 /// Convenience alias for catalog operations.
