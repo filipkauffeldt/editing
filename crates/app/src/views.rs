@@ -35,8 +35,14 @@ use crate::browse::{
     ThumbPayload, ThumbState, UploadBadge, ZoomMode, ZoomState, apply_filter_sort, canonical_root,
     list_browse_items, pair_key, plan_template_apply, run_catalog_scan, template_apply_payloads,
 };
+use crate::develop::{DevelopSession, SliderId};
 use crate::preview::BrowsePreviewProvider;
 use edit_metadata::{MetadataWritePayload, TemplateFields};
+use edit_core::{CancelToken, DevelopSettings, RenderSize};
+use edit_render::RenderService;
+use gpui_kit::component::slider::{
+    Slider as DevelopSliderElement, SliderEvent, SliderState, SliderValue,
+};
 
 /// Cells per contact-sheet row over `uniform_list`.
 pub const GRID_COLS: usize = 4;
@@ -122,12 +128,32 @@ pub struct Browser {
     thumbs: HashMap<i64, Arc<RenderImage>>,
     thumb_order: VecDeque<i64>,
     thumb_pending: HashSet<i64>,
-    /// Thumb job id → photo path, resolved from the job payload on
+    /// Queue thumb job id → photo path, resolved from the job payload on
     /// `Started` so progress/completion can mark the right cell.
     thumb_jobs: HashMap<JobId, String>,
     /// `metadata_write` job id → item id, resolved from the payload so
     /// per-item badges flip on the right row even across restarts.
     meta_jobs: HashMap<JobId, i64>,
+    develop: DevelopSession,
+    develop_sliders: Vec<(SliderId, Entity<SliderState>)>,
+    /// Cooperative cancellation for develop renders: a new request cancels
+    /// the prior one's mid-flight stages.
+    develop_token: CancelToken,
+    /// Last develop render request, for tests and the UI status line.
+    develop_render: Option<RenderSize>,
+    /// The resolved develop output, swapped with the store on completion
+    /// (plan section 1.5). DisplaySrgb path — the canvas paints it.
+    develop_image: Option<Arc<RenderImage>>,
+    develop_image_item: Option<i64>,
+    /// Item whose develop render is in flight, so repeated paint frames do
+    /// not re-enqueue the same request.
+    develop_pending: Option<i64>,
+    /// Whether the develop buffer holds unsaved slider changes.
+    develop_dirty: bool,
+    /// Diagnostics for the develop panel status line.
+    develop_status: String,
+    /// The resolved rendered develop output through `render_path`.
+    renderer: Arc<RenderService>,
     scan_jobs: Vec<JobId>,
     /// Status strip line for template applies (plan section 2.1:
     /// "template changes" marker).
@@ -146,6 +172,42 @@ impl Browser {
         cx: &mut Context<Self>,
     ) -> Self {
         let focus = cx.focus_handle();
+        let develop_sliders: Vec<(SliderId, Entity<SliderState>)> = SliderId::ALL
+            .iter()
+            .map(|id| {
+                // Widget ranges come from LightCraft's own control table, so
+                // the panel can never disagree with the edit model.
+                let control = match id.spec() {
+                    Some(spec) => cx.new(|_| {
+                        SliderState::new()
+                            .min(spec.min as f32)
+                            .max(spec.max as f32)
+                            .step(spec.step as f32)
+                    }),
+                    None => cx.new(|_| SliderState::new()),
+                };
+                (*id, control)
+            })
+            .collect();
+        for (id, control) in &develop_sliders {
+            let id: SliderId = *id;
+            cx.subscribe(control, move |this, _, event: &SliderEvent, cx| {
+                let value = match event {
+                    SliderEvent::Change(value) | SliderEvent::Release(value) => Some(*value),
+                }
+                .and_then(|value| match value {
+                    SliderValue::Single(v) => Some(v),
+                    _ => None,
+                });
+                match (event, value) {
+                    (SliderEvent::Change(_), Some(v)) => this.on_develop_change(id, v, cx),
+                    (SliderEvent::Release(_), Some(v)) => this.on_develop_release(id, v, cx),
+                    _ => {}
+                }
+                cx.notify();
+            })
+            .detach();
+        }
         cx.bind_keys([
             KeyBinding::new("right", NextItem, None),
             KeyBinding::new("left", PrevItem, None),
@@ -186,6 +248,16 @@ impl Browser {
             thumb_pending: HashSet::new(),
             thumb_jobs: HashMap::new(),
             meta_jobs: HashMap::new(),
+            develop: DevelopSession::new(DevelopSettings::default()),
+            develop_sliders,
+            develop_token: CancelToken::new(),
+            develop_render: None,
+            develop_image: None,
+            develop_image_item: None,
+            develop_pending: None,
+            develop_dirty: false,
+            develop_status: "Ready".to_string(),
+            renderer: Arc::new(RenderService::new()),
             scan_jobs: Vec::new(),
             template_status: String::new(),
             drag_from: None,
@@ -583,6 +655,8 @@ impl Browser {
         if len == 0 {
             return;
         }
+        // An outgoing item commits its edit buffer before the cursor moves.
+        self.persist_current_edit(cx);
         self.selection.move_cursor(delta, extend, len);
         self.current = self.selection.cursor;
         self.zoom.reset();
@@ -595,6 +669,8 @@ impl Browser {
         if self.rows.is_empty() {
             return;
         }
+        // An outgoing item commits its edit buffer before the cursor moves.
+        self.persist_current_edit(cx);
         self.selection.select_single(index, self.rows.len());
         self.current = self.selection.cursor;
         self.zoom.reset();
@@ -688,6 +764,219 @@ impl Browser {
         self.thumb_pending.remove(&item_id);
     }
 
+    /// Read the current item's edit row into the develop session. A photo
+    /// with no row yet seeds its raw buffer with the source's as-shot white
+    /// point, so the first slider drag persists settings that re-render
+    /// identically after a restart.
+    fn load_current_edit(&mut self) {
+        let Some(row) = self.current_item() else {
+            return;
+        };
+        let row_buffer = self
+            .catalog
+            .get_edit(row.item_id)
+            .ok()
+            .flatten()
+            .and_then(|edit| serde_json::from_str::<DevelopSettings>(&edit.develop_json).ok());
+        let buffer = match row_buffer {
+            Some(buffer) => buffer,
+            None => match RenderService::source_facts(Path::new(&row.display_path)) {
+                Some(facts) if facts.raw => {
+                    DevelopSettings::for_raw(facts.as_shot_temp, facts.as_shot_tint)
+                }
+                _ => DevelopSettings::default(),
+            },
+        };
+        self.develop.load_edit(buffer);
+    }
+
+    /// The develop panel (plan sections 2.1 and 2.3): Presets placeholder on
+    /// top, then the six LR-style tone sliders driving `DevelopSettings`
+    /// through the render service.
+    fn render_develop_panel(&mut self) -> impl IntoElement {
+        let status = self.develop_status.clone();
+        v_flex()
+            .w(px(220.0))
+            .h_full()
+            .px_2()
+            .py_1()
+            .gap_2()
+            .bg(rgb(0x181818))
+            .child(div().text_sm().child("Develop (M2)".to_string()))
+            .child(
+                div()
+                    .text_xs()
+                    .text_color(rgb(0x888888))
+                    .child("Presets land in D2.".to_string()),
+            )
+            .children(self.render_develop_rows())
+            .child(div().text_xs().text_color(rgb(0x888888)).child(status))
+    }
+
+    /// One row per slider: label, then the slider (which dispatches actions
+    /// from its own listeners against the browser entity).
+    fn render_develop_rows(&mut self) -> Vec<impl IntoElement> {
+        let mut rows = Vec::with_capacity(SliderId::ALL.len());
+        for (id, control) in &self.develop_sliders {
+            let id = *id;
+            let spec = match id.spec() {
+                Some(spec) => spec,
+                None => continue,
+            };
+            let name = spec.label.to_owned();
+            rows.push(
+                h_flex()
+                    .w_full()
+                    .items_center()
+                    .gap_2()
+                    .child(
+                        div()
+                            .text_xs()
+                            .text_color(rgb(0xCCCCCC))
+                            .w(px(64.0))
+                            .child(name),
+                    )
+                    .child(
+                        div()
+                            .id(("develop-slider", control.entity_id().as_u64()))
+                            .flex_1()
+                            .h(px(20.0))
+                            .child(DevelopSliderElement::new(control)),
+                    ),
+            );
+        }
+        rows
+    }
+
+    /// Sync the edit buffer's slider values into the widget states. A live
+    /// drag on one slider keeps its thumb where the gesture put it; the rest
+    /// track the buffer.
+    fn sync_sliders(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        for (id, control) in &self.develop_sliders {
+            let session_value = self.develop.slider_value(*id) as f32;
+            let matches_slider = matches!(control.read(cx).value(), SliderValue::Single(v) if (v - session_value).abs() < 1e-3);
+            let dragging_this = self.develop.dragging == Some(*id);
+            if !matches_slider && !dragging_this {
+                control.update(cx, |control, cx| {
+                    control.set_value(session_value, window, cx);
+                });
+            }
+        }
+    }
+
+    /// Subscribe-backed live slider change (`SliderEvent::Change`): write the
+    /// change to the edit buffer, then render the downscaled proxy live.
+    pub fn on_develop_change(&mut self, id: SliderId, value: f32, cx: &mut Context<Self>) {
+        self.develop.set_slider(id, value as f64);
+        self.develop_dirty = true;
+        self.schedule_develop_render(
+            RenderSize::Proxy(edit_render::PROXY_DRAG_LONG_EDGE as u16),
+            cx,
+        );
+    }
+
+    /// Drag released (`SliderEvent::Release`): final value in the buffer, the
+    /// full proxy renders in the background, and the edit persists.
+    pub fn on_develop_release(&mut self, id: SliderId, value: f32, cx: &mut Context<Self>) {
+        self.develop.end_drag(id, value as f64);
+        self.develop_dirty = true;
+        self.schedule_develop_render(RenderSize::Full, cx);
+        self.persist_current_edit(cx);
+    }
+
+    /// One develop render on the background executor; a newer request cancels
+    /// this one's mid-flight stages through the token.
+    fn schedule_develop_render(&mut self, size: RenderSize, cx: &mut Context<Self>) {
+        let Some(item) = self.current_item() else {
+            return;
+        };
+        let token = CancelToken::new();
+        self.develop_token.cancel();
+        self.develop_token = token.clone();
+        self.develop_render = Some(size);
+        self.develop_pending = Some(item.item_id);
+        let renderer = Arc::clone(&self.renderer);
+        let path = item.display_path.clone();
+        let develop = self.develop.buffer().clone();
+
+        cx.spawn(async move |this, cx| {
+            let frame = cx
+                .background_executor()
+                .spawn(async move {
+                    renderer.render_path(Path::new(&path), size, &develop, None, &token)
+                })
+                .await;
+            this.update(cx, |this, cx| {
+                match frame {
+                    Ok(frame) => this.insert_develop_frame(item.item_id, frame, cx),
+                    // A newer request owns the pending slot; leave it.
+                    Err(edit_core::Error::Cancelled) => {}
+                    Err(e) => {
+                        this.develop_status = format!("Render failed: {e}");
+                        this.develop_pending = None;
+                    }
+                }
+                cx.notify();
+            })
+            .ok();
+        })
+        .detach();
+    }
+
+    /// Insert the resolved develop output (already BGRA) and repaint.
+    pub fn insert_develop_frame(
+        &mut self,
+        item_id: i64,
+        frame: edit_core::Frame,
+        cx: &mut Context<Self>,
+    ) {
+        if let Some(rgba) = image::RgbaImage::from_raw(frame.width, frame.height, frame.pixels) {
+            self.develop_image = Some(Arc::new(RenderImage::new([image::Frame::new(rgba)])));
+            self.develop_image_item = Some(item_id);
+            self.develop_pending = None;
+            self.develop_status = "Ready".to_string();
+            cx.notify();
+        }
+    }
+
+    /// Best-effort edit persistence (catalog row + `crs:` sidecar; B2's
+    /// `persist_edit` never fails the edit on sidecar I/O).
+    fn persist_current_edit(&mut self, cx: &mut Context<Self>) {
+        if !self.develop_dirty {
+            return;
+        }
+        let Some(item) = self.current_item() else {
+            return;
+        };
+        self.develop_dirty = false;
+        let catalog = Arc::clone(&self.catalog);
+        let develop = self.develop.buffer().clone();
+        let sidecar = PathBuf::from(item.display_path.clone()).with_extension("xmp");
+        cx.spawn(async move |_this, cx| {
+            let outcome = cx
+                .background_executor()
+                .spawn(async move {
+                    let json = serde_json::to_string(&develop).unwrap_or_else(|_| "{}".to_string());
+                    edit_metadata::persist_edit(&catalog, item.item_id, &json, None, &sidecar)
+                })
+                .await;
+            if let Ok(outcome) = outcome {
+                let status = match outcome {
+                    edit_metadata::PersistOutcome::Written => "Edit saved".to_string(),
+                    edit_metadata::PersistOutcome::SidecarSkipped(reason) => {
+                        format!("Edit saved (sidecar skipped: {reason})")
+                    }
+                };
+                _this
+                    .update(cx, |this, cx| {
+                        this.develop_status = status;
+                        cx.notify();
+                    })
+                    .ok();
+            }
+        })
+        .detach();
+    }
     fn set_rating(&mut self, rating: i64, cx: &mut Context<Self>) {
         let rating = rating.clamp(0, 5);
         let current = match self.rows.get(self.current) {
@@ -875,11 +1164,25 @@ impl Browser {
         };
         if let Some(row) = item.as_ref() {
             self.request_thumb(cx, row.item_id, row.display_path.clone());
+            // Kick a full-proxy develop render for a photo with no resolved
+            // art yet (navigation kept the art per item id).
+            if self.develop_image_item != Some(row.item_id)
+                && self.develop_pending != Some(row.item_id)
+            {
+                self.develop_image = None;
+                self.develop_image_item = None;
+                self.develop_pending = Some(row.item_id);
+                self.load_current_edit();
+                self.schedule_develop_render(RenderSize::Full, cx);
+            }
         }
-        let image = item
-            .as_ref()
-            .and_then(|row| self.thumbs.get(&row.item_id))
-            .map(Arc::clone);
+        let image = item.as_ref().and_then(|row| {
+            self.develop_image
+                .as_ref()
+                .filter(|_| self.develop_image_item == Some(row.item_id))
+                .map(Arc::clone)
+                .or_else(|| self.thumbs.get(&row.item_id).map(Arc::clone))
+        });
         let zoom = self.zoom;
         let fit_cell = Rc::clone(&self.fit_scale);
         let title = item
@@ -1095,7 +1398,8 @@ impl Browser {
 }
 
 impl Render for Browser {
-    fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+    fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        self.sync_sliders(window, cx);
         let center: AnyElement = match self.mode {
             Mode::Grid => self.render_grid(cx).into_any_element(),
             Mode::Single => self.render_single(cx).into_any_element(),
@@ -1103,20 +1407,7 @@ impl Render for Browser {
         // Right column collapses in grid mode (plan section 2.1).
         let right: AnyElement = match self.mode {
             Mode::Grid => div().into_any_element(),
-            Mode::Single => v_flex()
-                .w(px(200.0))
-                .h_full()
-                .px_2()
-                .py_1()
-                .bg(rgb(0x181818))
-                .child(div().text_sm().child("Develop (M2)".to_string()))
-                .child(
-                    div()
-                        .text_xs()
-                        .text_color(rgb(0x888888))
-                        .child("Presets and sliders appear in M2.".to_string()),
-                )
-                .into_any_element(),
+            Mode::Single => self.render_develop_panel().into_any_element(),
         };
         v_flex()
             .size_full()
