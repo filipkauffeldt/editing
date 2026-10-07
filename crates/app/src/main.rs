@@ -1,86 +1,70 @@
 mod ingest;
 
-use gpui_kit::component::button::Button;
+use std::path::PathBuf;
+use std::sync::Arc;
+
+use edit_catalog::{Catalog, JobKind};
 use gpui_kit::component::input::InputState;
-use gpui_kit::component::{TitleBar, h_flex, status_bar::StatusBar, v_flex};
+use gpui_kit::component::{TitleBar, v_flex};
 use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::*;
 use ingest::{AppState, IngestDialog, OpenIngest};
 
-struct WorkspaceShell {
+use app::browse::CatalogScanPayload;
+use app::views::{Browser, browse_job_handler};
+
+fn catalog_path() -> PathBuf {
+    let base = std::env::var_os("EDITING_CATALOG")
+        .map(PathBuf::from)
+        .or_else(|| {
+            std::env::var_os("HOME")
+                .map(|home| PathBuf::from(home).join(".local/share/editing/catalog.sqlite"))
+        });
+    base.unwrap_or_else(|| PathBuf::from("editing-catalog.sqlite"))
+}
+
+/// Window root: the browse browser owns the chrome (title + status bar) and
+/// the ingest dialog overlays it when opened. The shell adds the shared
+/// `Workspace` key context so `i` opens ingest wherever focus is inside the
+/// browser tree, but not while typing in the dialog inputs.
+struct BrowserShell {
+    browser: Entity<Browser>,
     state: Entity<AppState>,
     dialog: Entity<IngestDialog>,
     focus_handle: FocusHandle,
 }
 
-impl WorkspaceShell {
-    fn new(state: Entity<AppState>, dialog: Entity<IngestDialog>, cx: &mut Context<Self>) -> Self {
+impl BrowserShell {
+    fn new(
+        browser: Entity<Browser>,
+        state: Entity<AppState>,
+        dialog: Entity<IngestDialog>,
+        cx: &mut Context<Self>,
+    ) -> Self {
         Self {
+            browser,
             state,
             dialog,
             focus_handle: cx.focus_handle(),
         }
     }
-
-    fn open_ingest(&mut self, cx: &mut Context<Self>) {
-        self.state.update(cx, |state, cx| {
-            state.set_ingest_open(true, cx);
-        });
-        cx.notify();
-    }
 }
 
-impl Focusable for WorkspaceShell {
+impl Focusable for BrowserShell {
     fn focus_handle(&self, _cx: &App) -> FocusHandle {
         self.focus_handle.clone()
     }
 }
 
-impl Render for WorkspaceShell {
+impl Render for BrowserShell {
     fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
-        let volume_count = self.state.read(cx).volumes().len();
         let dialog_open = self.state.read(cx).is_ingest_open();
         let dialog = self.dialog.clone();
         v_flex()
             .size_full()
             .key_context("Workspace")
             .track_focus(&self.focus_handle)
-            .child(
-                TitleBar::new().child(
-                    h_flex()
-                        .w_full()
-                        .pr_2()
-                        .justify_between()
-                        .child("editing")
-                        .child(
-                            h_flex()
-                                .gap_2()
-                                .child(Button::new("title-ingest").label("Ingest").on_click(
-                                    cx.listener(|this, _event: &ClickEvent, _window, cx| {
-                                        this.open_ingest(cx);
-                                    }),
-                                ))
-                                .child("No photos open"),
-                        ),
-                ),
-            )
-            .child(
-                div()
-                    .id("workspace")
-                    .flex_1()
-                    .size_full()
-                    .items_center()
-                    .justify_center()
-                    .child("Workspace"),
-            )
-            .child(StatusBar::new().left("Ready").right(format!(
-                "{volume_count} {}",
-                if volume_count == 1 {
-                    "volume"
-                } else {
-                    "volumes"
-                }
-            )))
+            .child(self.browser.clone())
             .when(dialog_open, |root| {
                 root.child(
                     div()
@@ -93,38 +77,68 @@ impl Render for WorkspaceShell {
 }
 
 fn main() {
-    let app = gpui_kit::application().with_assets(gpui_kit::assets::Assets);
+    let catalog = Arc::new(Catalog::open(&catalog_path()).expect("open catalog"));
+    catalog.recover_running().expect("recover running jobs");
 
+    let worker_catalog = Arc::clone(&catalog);
+    let handler: edit_catalog::JobHandler =
+        Arc::new(move |job, tx| browse_job_handler(worker_catalog.clone(), job, tx));
+    let pool = edit_catalog::spawn_workers(&catalog, 2, handler).expect("spawn workers");
+    let events = pool.events().clone();
+    // The pool owns the worker threads; leak it so background jobs keep
+    // draining for the life of the window.
+    std::mem::forget(pool);
+
+    // Open the demo folder from argv[1] through the real job path when given.
+    let pending_folder: Option<PathBuf> = std::env::args().nth(1).map(PathBuf::from);
+
+    let app = gpui_kit::application().with_assets(gpui_kit::assets::Assets);
     app.run(move |cx| {
         gpui_kit::init(cx);
 
+        // Keyboard shortcut target: focus lands in browse views too, so the
+        // ingest shortcut is gated on `Workspace && !Input` to leave typing
+        // in the dialog inputs alone.
         cx.bind_keys([KeyBinding::new(
             "i",
             OpenIngest,
             Some("Workspace && !Input"),
         )]);
 
-        let window_options = TitleBar::window_options();
+        if let Some(folder) = pending_folder.clone() {
+            let payload = serde_json::to_string(&CatalogScanPayload {
+                root: folder.to_string_lossy().into_owned(),
+            })
+            .unwrap_or_else(|_| "{}".to_string());
+            catalog.enqueue_job(JobKind::CatalogScan, &payload).ok();
+        }
 
-        let (window_handle, shell) = gpui_kit::open_window(window_options, cx, |window, cx| {
-            let state = cx.new(|_| AppState::new());
-            let dest_dir = cx.new(|cx| {
-                InputState::new(window, cx)
-                    .placeholder("~/Photos")
-                    .default_value("~/Photos/{yyyy}/{mm}-{dd}")
-            });
-            let file_rule = cx.new(|cx| {
-                InputState::new(window, cx)
-                    .placeholder("{session}_{seq:4}")
-                    .default_value("{session}_{seq:4}")
-            });
-            let backup_dir =
-                cx.new(|cx| InputState::new(window, cx).placeholder("/mnt/backup (optional)"));
-            let dialog =
-                cx.new(|_| IngestDialog::new(state.clone(), dest_dir, file_rule, backup_dir));
-            cx.new(|cx| WorkspaceShell::new(state.clone(), dialog, cx))
-        })
-        .expect("Failed to open window");
+        let window_options = TitleBar::window_options();
+        let (window_handle, shell) =
+            gpui_kit::open_window(window_options, cx, |window, cx| {
+                let browser_catalog = Arc::clone(&catalog);
+                let events = events.clone();
+                let browser = cx.new(|cx| Browser::new(browser_catalog, events, cx));
+                browser.update(cx, |browser, cx| browser.start_event_drain(cx));
+                // Ingest dialog state + inputs.
+                let state = cx.new(|_| AppState::new());
+                let dest_dir = cx.new(|cx| {
+                    InputState::new(window, cx)
+                        .placeholder("~/Photos")
+                        .default_value("~/Photos/{yyyy}/{mm}-{dd}")
+                });
+                let file_rule = cx.new(|cx| {
+                    InputState::new(window, cx)
+                        .placeholder("{session}_{seq:4}")
+                        .default_value("{session}_{seq:4}")
+                });
+                let backup_dir =
+                    cx.new(|cx| InputState::new(window, cx).placeholder("/mnt/backup (optional)"));
+                let dialog =
+                    cx.new(|_| IngestDialog::new(state.clone(), dest_dir, file_rule, backup_dir));
+                cx.new(|cx| BrowserShell::new(browser, state, dialog, cx))
+            })
+            .expect("Failed to open window");
 
         // Keyboard shortcut target: focus the shell so `i` dispatches.
         let focus_handle = shell.read(cx).focus_handle.clone();
@@ -132,11 +146,12 @@ fn main() {
             window.focus(&focus_handle, cx);
         });
 
-        // Global `i` shortcut opens the ingest dialog.
-        let shortcut_shell = shell.clone();
+        // Global shortcut handler: the action can come from anywhere in the
+        // shell focus tree, so act on the shared ingest state directly.
+        let shortcut_state = shell.read(cx).state.clone();
         cx.on_action(move |_action: &OpenIngest, cx: &mut App| {
-            shortcut_shell.update(cx, |shell, cx| {
-                shell.open_ingest(cx);
+            shortcut_state.update(cx, |state, cx| {
+                state.set_ingest_open(true, cx);
             });
         });
 
