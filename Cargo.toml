@@ -1,0 +1,28 @@
+[workspace]
+members = ["crates/app"]
+resolver = "2"
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.95"
+license = "Apache-2.0"
+
+[workspace.dependencies]
+# gpui and its platform facade come from Zed's published "gpui-pre" snapshots,
+# which are exact snapshots of Zed's crates at a specific zed revision.
+# gpui-pre 0.3.8 == zed@279fe07 (2026-10-04), which pins rust-toolchain 1.98.1.
+# Consumed from crates.io rather than the zed git repository: gpui-component
+# (gpui-kit) releases carry these exact snapshot pins, and the snapshot crates
+# are the supported distribution path for applications.
+gpui = { package = "gpui-pre", version = "=0.3.8" }
+gpui_platform = { package = "gpui-pre-platform", version = "=0.3.8", features = [
+    "font-kit",
+    "x11",
+    "wayland",
+    "runtime_shaders",
+] }
+# gpui-kit is the renamed gpui-component repo (longbridge/gpui-component). It is
+# the one dependency that wires gpui, gpui-base, gpui-component and default
+# assets together, and pins gpui-pre 0.3.8 exactly.
+gpui-kit = "=0.7.1"
