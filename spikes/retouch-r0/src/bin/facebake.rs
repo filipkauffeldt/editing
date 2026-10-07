@@ -1,4 +1,4 @@
-//! T3: face-detector bake-off on 10-20 real crowd photos.
+//! T3: face-detector bake-off on 20 real crowd photos.
 //!
 //! Usage: facebake <gt.txt> --images <dir> [--yunet <model.onnx>]
 //!
