@@ -204,15 +204,27 @@ pub fn pair_entries(entries: Vec<FileEntry>) -> Vec<PairGroup> {
 
 // ---- browse item snapshot (what the views render) ----
 
-/// Upload badge states (plan section 2.2). B1 never writes transfers, so the
-/// scan path leaves this at `None`; later stages fill it from the transfers
-/// store per item.
+/// Per-photo upload badge states (plan section 2.2). C3 writes metadata
+/// jobs, not transfers; the scan path leaves both at `None`.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub enum UploadBadge {
     #[default]
     None,
     Queued,
     Uploading,
+    Done,
+    Failed,
+}
+
+/// Per-item IPTC template apply state (plan sections 2.1, 2.7): the
+/// status strip's "template changes" marker, rendered on cells like the
+/// upload badge. `metadata_write` jobs (plan section 1.2) drive it.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub enum MetaBadge {
+    #[default]
+    None,
+    Queued,
+    Writing,
     Done,
     Failed,
 }
@@ -239,6 +251,7 @@ pub struct BrowseItem {
     pub rating: i64,
     pub thumb: ThumbState,
     pub upload: UploadBadge,
+    pub meta: MetaBadge,
     pub ingest_fresh: bool,
 }
 
@@ -720,6 +733,7 @@ pub fn list_browse_items(
             rating,
             thumb: ThumbState::Queued,
             upload: UploadBadge::None,
+            meta: MetaBadge::None,
             ingest_fresh: false,
         });
     }
@@ -727,19 +741,44 @@ pub fn list_browse_items(
     Ok(items)
 }
 
+/// Filesystem paths of every photo side of one item (plan section 1.3:
+/// "A paired RAW+JPEG item stamps both files"). Falls back to the display
+/// path for an item row the catalog has not paired yet (item_id -1).
+pub fn item_photo_paths(
+    catalog: &edit_catalog::Catalog,
+    item: &BrowseItem,
+) -> Vec<String> {
+    if item.item_id >= 0
+        && let Ok(item_row) = catalog.get_item(item.item_id)
+    {
+        let sides = [item_row.raw_photo_id, item_row.jpeg_photo_id];
+        let paths: Vec<String> = sides
+            .into_iter()
+            .flatten()
+            .filter_map(|photo_id| {
+                catalog.get_photo(photo_id).ok().map(|photo| photo.path)
+            })
+            .collect();
+        if !paths.is_empty() {
+            return paths;
+        }
+    }
+    vec![item.display_path.clone()]
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use std::io::Write;
 
-    fn scratch_dir(name: &str) -> PathBuf {
+    pub(crate) fn scratch_dir(name: &str) -> PathBuf {
         let dir =
             std::env::temp_dir().join(format!("edit-browse-test-{}-{}", std::process::id(), name));
         std::fs::create_dir_all(&dir).unwrap();
         dir
     }
 
-    fn touch(dir: &Path, name: &str) -> PathBuf {
+    pub(crate) fn touch(dir: &Path, name: &str) -> PathBuf {
         let path = dir.join(name);
         if let Some(parent) = path.parent() {
             std::fs::create_dir_all(parent).unwrap();
@@ -954,6 +993,7 @@ mod tests {
                 has_jpeg: false,
                 rating: 5,
                 thumb: ThumbState::Ready,
+                meta: MetaBadge::None,
                 upload: UploadBadge::None,
                 ingest_fresh: false,
             },
@@ -966,6 +1006,7 @@ mod tests {
                 has_jpeg: true,
                 rating: 1,
                 thumb: ThumbState::Queued,
+                meta: MetaBadge::None,
                 upload: UploadBadge::None,
                 ingest_fresh: true,
             },
@@ -978,6 +1019,7 @@ mod tests {
                 has_jpeg: true,
                 rating: 3,
                 thumb: ThumbState::Running,
+                meta: MetaBadge::None,
                 upload: UploadBadge::Queued,
                 ingest_fresh: false,
             },
@@ -1094,6 +1136,42 @@ mod tests {
         let text = String::from_utf8(w).unwrap();
         assert!(text.contains("WALK_A"));
         assert!(text.contains("WALK_B"));
+        std::fs::remove_dir_all(&dir).ok();
+    }
+}
+
+#[cfg(test)]
+mod meta_paths_tests {
+    use super::*;
+    use super::tests::{scratch_dir, touch};
+
+    #[test]
+    fn item_photo_paths_covers_both_sides_of_a_pair() {
+        let dir = scratch_dir("item-paths");
+        touch(&dir, "P.NEF");
+        touch(&dir, "p.JPG");
+        let db_path = dir.join("catalog.sqlite");
+        let catalog = edit_catalog::Catalog::open(&db_path).unwrap();
+        let summary = run_catalog_scan(&catalog, &dir, &|_, _| {}).unwrap();
+        let items = list_browse_items(&catalog, summary.root_id).unwrap();
+        assert_eq!(items.len(), 1);
+        let paths = item_photo_paths(&catalog, &items[0]);
+        assert_eq!(paths.len(), 2, "pair is stamped on both files: {paths:?}");
+        // And an unpaired display row still has at least one path.
+        let lone = BrowseItem {
+            item_id: -1,
+            dir: dir.to_string_lossy().into(),
+            base_name: "Q".into(),
+            display_path: "/missing/Q.JPG".into(),
+            has_raw: true,
+            has_jpeg: true,
+            rating: 0,
+            thumb: ThumbState::Queued,
+            upload: UploadBadge::None,
+            meta: MetaBadge::None,
+            ingest_fresh: false,
+        };
+        assert_eq!(item_photo_paths(&catalog, &lone), vec!["/missing/Q.JPG"]);
         std::fs::remove_dir_all(&dir).ok();
     }
 }
