@@ -149,10 +149,12 @@ Reasons:
    draining CPU cost on bursts of 40).
 3. **License:** BSD-3-Clause (verified in `rust/`), no redistribution terms to
    worry about. YuNet is also clean (Apache-2.0), so this is not decisive.
-4. **Recall:** on the crowd case the two are within noise on small faces; the
-   model choice is not the lever — the plan's ROI-first cropping + tiling is.
-   libfd's permissive default needs a raised threshold or the toggleable-box UI
-   will flood.
+4. **Recall:** at matched false positives (~400) YuNet keeps 18.0 % overall
+   recall where libfd holds 12.8 %, and YuNet is stronger on medium faces
+   (54 % vs 44 %). The pick trades that recall for size, speed and the
+   embedded model — the plan's ROI-first cropping + tiling is the bigger
+   lever for small-face crowd recall either way. libfd's permissive default
+   (0.2) needs a raised threshold or the toggleable-box UI will flood.
 
 When to switch to YuNet (already fully implemented in `src/yunet.rs`): if we
 want the **5 landmarks** for rotated face ellipses (libfd has none → falls back
