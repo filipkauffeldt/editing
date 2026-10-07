@@ -23,7 +23,8 @@ sysinfo = { version = "0.36" }
 edit-core = { path = "crates/edit-core" }
 edit-catalog = { path = "crates/edit-catalog" }
 edit-ingest = { path = "crates/edit-ingest" }
-# Linux-only hotplug/labels via libudev (Windows/macOS volume code lands in M7).
+# Linux-only hotplug/labels via libudev (Windows/macOS volume code comes in
+# a later cross-platform milestone).
 udev = { version = "0.9" }
 # The x11 and wayland features select gpui's Linux windowing backends;
 # font-kit enables the freetype/fontconfig text stack, runtime_shaders compiles

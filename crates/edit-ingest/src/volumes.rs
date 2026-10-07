@@ -150,7 +150,13 @@ pub enum VolumeEvent {
 /// The udev join matches on the device node (`Disk::name` on Linux is the
 /// `/dev/…` node, which is also the udev `DEVNAME`). Unmatched disks keep
 /// `label`/`fs_uuid` as `None` and fall back to mount-point identity.
+///
+/// Collision rule: two rows with the same identity (e.g. a cloned card imaged
+/// with the same filesystem UUID) collapse to one volume — first row wins.
+/// Identity is stable, not unique, so C2 must still treat the mount point as
+/// the copy source.
 pub fn snapshot(disks: &[DiskInfo], udev_entries: &[UdevEntry]) -> Vec<Volume> {
+    let mut seen: Vec<String> = Vec::new();
     disks
         .iter()
         .map(|disk| {
@@ -171,6 +177,13 @@ pub fn snapshot(disks: &[DiskInfo], udev_entries: &[UdevEntry]) -> Vec<Volume> {
                 removable: disk.removable,
                 read_only: disk.read_only,
             }
+        })
+        .filter(|volume| {
+            if seen.contains(&volume.identity) {
+                return false;
+            }
+            seen.push(volume.identity.clone());
+            true
         })
         .collect()
 }
@@ -193,13 +206,22 @@ pub fn diff(old: &[Volume], new: &[Volume]) -> Vec<VolumeEvent> {
     events
 }
 
-/// Poll once: read disks from `source` and enrich via udev (Linux only).
-pub fn poll_once(source: &impl DiskSource) -> Vec<Volume> {
-    snapshot(&source.disks(), &enumerate_udev())
+/// Poll once: read disks from `source` and join with `udev_entries`.
+///
+/// Udev entries are a parameter (rather than read inside) so tests never touch
+/// hardware; production callers pass [`enumerate_udev()`].
+pub fn poll_once(source: &impl DiskSource, udev_entries: &[UdevEntry]) -> Vec<Volume> {
+    snapshot(&source.disks(), udev_entries)
 }
 
 /// Current udev block-device rows on Linux; empty elsewhere (Windows/macOS
-/// volume code lands in M7).
+/// volume code comes in a later milestone).
+///
+/// This enumerates the whole `block` subsystem while the hotplug monitor only
+/// watches the `partition` devtype. The mismatch is deliberate: enumeration is
+/// a superset, so a partition event always finds its entry on rescan, and the
+/// [`POLL_INTERVAL`] tick covers anything the monitor misses (at most one
+/// tick late).
 #[cfg(target_os = "linux")]
 pub fn enumerate_udev() -> Vec<UdevEntry> {
     let mut enumerator = match udev::Enumerator::new() {
@@ -232,7 +254,7 @@ pub fn enumerate_udev() -> Vec<UdevEntry> {
 }
 
 /// Current udev block-device rows on Linux; empty elsewhere (Windows/macOS
-/// volume code lands in M7).
+/// volume code comes in a later milestone).
 #[cfg(not(target_os = "linux"))]
 pub fn enumerate_udev() -> Vec<UdevEntry> {
     Vec::new()
@@ -267,10 +289,23 @@ pub fn spawn_udev_ping(ping: flume::Sender<()>) -> Option<std::thread::JoinHandl
 }
 
 /// Spawn the Linux udev hotplug watcher (see the Linux variant). Off Linux
-/// there is no watcher yet (M7), so this returns `None`.
+/// there is no watcher yet (cross-platform bring-up is a later milestone), so
+/// this returns `None`.
 #[cfg(not(target_os = "linux"))]
 pub fn spawn_udev_ping(_ping: flume::Sender<()>) -> Option<std::thread::JoinHandle<()>> {
     None
+}
+
+/// Wait for the next poll tick, waking early on a udev hotplug ping.
+///
+/// A disconnected ping channel (no udev thread off Linux, or a dead watcher)
+/// must sleep the full interval: `recv_timeout` on a disconnected channel
+/// returns immediately, and spinning on it would pin a CPU polling forever.
+fn wait_for_next_tick(ping: &flume::Receiver<()>, interval: Duration) {
+    match ping.recv_timeout(interval) {
+        Ok(()) | Err(flume::RecvTimeoutError::Timeout) => {}
+        Err(flume::RecvTimeoutError::Disconnected) => std::thread::sleep(interval),
+    }
 }
 
 /// Blocking watch loop for a background thread: poll every [`POLL_INTERVAL`],
@@ -282,16 +317,14 @@ pub fn watch_loop(source: impl DiskSource, changed: flume::Sender<Vec<Volume>>) 
 
     let mut last: Vec<Volume> = Vec::new();
     loop {
-        let current = poll_once(&source);
+        let current = poll_once(&source, &enumerate_udev());
         if current != last {
             last = current.clone();
             if changed.send(current).is_err() {
                 break;
             }
         }
-        // Wait for the next tick, waking early on hotplug. A disconnected
-        // ping channel just means the udev thread died; keep polling.
-        let _ = ping_rx.recv_timeout(POLL_INTERVAL);
+        wait_for_next_tick(&ping_rx, POLL_INTERVAL);
     }
 }
 
@@ -458,10 +491,50 @@ mod tests {
     }
 
     #[test]
-    fn poll_once_uses_injected_source() {
+    fn poll_once_uses_injected_source_without_touching_hardware() {
         let source = FakeSource(vec![disk("/dev/sdb1", "/media/card")]);
-        let volumes = poll_once(&source);
+        // Empty udev rows: no ID_FS_* enrichment, no hardware access.
+        let volumes = poll_once(&source, &[]);
         assert_eq!(volumes.len(), 1);
         assert_eq!(volumes[0].device, "/dev/sdb1");
+        assert_eq!(volumes[0].identity, "mount:/media/card");
+    }
+
+    #[test]
+    fn duplicate_uuid_collapses_to_first_row() {
+        let volumes = snapshot(
+            &[
+                disk("/dev/sdb1", "/media/card-a"),
+                disk("/dev/sdc1", "/media/card-b"),
+            ],
+            &[
+                udev_entry("/dev/sdb1", Some("CLONE"), Some("SAME-UUID")),
+                udev_entry("/dev/sdc1", Some("CLONE"), Some("SAME-UUID")),
+            ],
+        );
+        assert_eq!(volumes.len(), 1);
+        assert_eq!(volumes[0].identity, "uuid:SAME-UUID");
+        assert_eq!(volumes[0].device, "/dev/sdb1");
+    }
+
+    #[test]
+    fn wait_returns_early_on_ping_and_sleeps_when_disconnected() {
+        let (ping_tx, ping_rx) = flume::bounded::<()>(1);
+        ping_tx.send(()).expect("test ping sends");
+        let start = std::time::Instant::now();
+        wait_for_next_tick(&ping_rx, Duration::from_secs(60));
+        assert!(
+            start.elapsed() < Duration::from_secs(5),
+            "ping should wake the wait immediately"
+        );
+
+        drop(ping_tx);
+        let interval = Duration::from_millis(100);
+        let start = std::time::Instant::now();
+        wait_for_next_tick(&ping_rx, interval);
+        assert!(
+            start.elapsed() >= interval,
+            "disconnected channel must sleep the full interval, not spin"
+        );
     }
 }
