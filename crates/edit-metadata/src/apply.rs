@@ -3,11 +3,18 @@
 //!
 //! Job grain is one item: the payload carries the item id (for badges),
 //! every file path of the item (a RAW+JPEG pair is stamped on both sides),
-//! the batch sequence number, and the raw `fields_json` of the template
-//! row, so variables expand inside the worker against each photo's real
-//! capture metadata — read from the same file that gets written.
+//! the batch sequence number, the enqueue wall clock, and the raw
+//! `fields_json` of the template row, so variables expand inside the
+//! worker against each photo's real capture metadata — read from the same
+//! file that gets written.
+//!
+//! Raw sides are never rewritten in place: the metadata-storage decision
+//! is XMP sidecar always for raws. The worker routes a raw path to its
+//! `<stem>.xmp` sidecar and writes XMP-only tags there, creating a
+//! minimal XMP packet first when the sidecar does not exist yet. Plain
+//! stills (JPEG masters) keep Photo-Mechanic-style in-place IIM+XMP.
 
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 use edit_catalog::db::now_unix;
 use edit_catalog::{ClaimedJob, JobEvent, JobEventKind};
@@ -16,6 +23,23 @@ use flume::Sender;
 use crate::read_photo_metadata;
 use crate::template::{TemplateFields, TemplateVars, expand};
 use crate::writer::Writer;
+
+/// Raw extensions stamped through the XMP sidecar instead of in place
+/// (kept in sync with the browser's raw list, `app/src/browse.rs`).
+const RAW_EXTS: &[&str] = &[
+    "NEF", "NRW", "ARW", "SRF", "SR2", "CR2", "CR3", "RAF", "ORF", "RW2", "DNG", "PEF",
+];
+
+/// Minimal XMP packet a first template write can start from: the
+/// resident exiftool appends the proper namespaces onto it.
+const IPTC_SIDECAR_STUB: &str = r#"<?xpacket begin="" id="W5M0MpCehiHzreSzNTczkc9d"?>
+<x:xmpmeta xmlns:x="adobe:ns:meta/">
+ <rdf:RDF xmlns:rdf="http://www.w3.org/1999/02/22-rdf-syntax-ns#">
+  <rdf:Description rdf:about=""/>
+ </rdf:RDF>
+</x:xmpmeta>
+<?xpacket end="w"?>
+"#;
 
 /// Payload of a `metadata_write` job.
 #[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
@@ -27,8 +51,47 @@ pub struct MetadataWritePayload {
     pub paths: Vec<String>,
     /// 1-based batch sequence for `{seq}`.
     pub sequence: u64,
+    /// Enqueue wall clock: the fallback `{date}` has one value for the
+    /// apply batch, so a crash-resumed run expands like the original.
+    #[serde(default)]
+    pub captured_at: i64,
     /// The template row's `fields_json` verbatim.
     pub fields_json: String,
+}
+
+/// True when `path` is a raw file (sidecar-stamped, never in place).
+pub fn is_raw(path: &Path) -> bool {
+    let ext = path
+        .extension()
+        .and_then(|e| e.to_str())
+        .map(|e| e.to_ascii_uppercase());
+    match ext {
+        Some(ext) => RAW_EXTS.contains(&ext.as_str()),
+        None => false,
+    }
+}
+
+/// The XMP sidecar a raw would be stamped into (`<stem>.xmp`, the
+/// preferred lookup in crate::photo).
+fn sidecar_for(path: &Path) -> Option<PathBuf> {
+    let mut sidecar = path.to_owned();
+    sidecar.set_extension("xmp");
+    Some(sidecar)
+}
+
+/// Ensure the sidecar exists (creating the minimal packet when it does
+/// not) and return its path. `sidecar_for` never returns `None` for a
+/// real path (set_extension always keeps a name), so the error arm is
+/// handled even if it becomes unreachable for exotic inputs.
+fn ready_sidecar(path: &Path) -> Result<PathBuf, String> {
+    let Some(sidecar) = sidecar_for(path) else {
+        return Err(format!("{path:?} has no sidecar name"));
+    };
+    if !sidecar.exists() {
+        std::fs::write(&sidecar, IPTC_SIDECAR_STUB)
+            .map_err(|e| format!("sidecar {}: {e}", sidecar.display()))?;
+    }
+    Ok(sidecar)
 }
 
 /// Expand `fields` for one photo from its own capture metadata.
@@ -101,25 +164,38 @@ pub fn run_metadata_write(
         return Err("template has no fields to write".into());
     }
 
-    let now = now_unix();
+    let now = if payload.captured_at > 0 {
+        payload.captured_at
+    } else {
+        now_unix()
+    };
     let total = payload.paths.len();
     let mut failed: Vec<String> = Vec::new();
     for (done, path_str) in payload.paths.iter().enumerate() {
         let path = Path::new(path_str);
         let vars = vars_for(path, payload.sequence, now);
-        let tags = fields.to_tags(&vars);
-        if tags.is_empty() {
-            failed.push(format!(
-                "{}: every field expanded empty; nothing written",
-                path_str
-            ));
-            continue;
-        }
-        let tag_refs: Vec<(&str, &str)> =
-            tags.iter().map(|(n, v)| (n.as_str(), v.as_str())).collect();
-        if let Err(e) = writer.write_tags(path, &tag_refs) {
-            failed.push(format!("{}: {e}", path_str));
-            continue;
+        // Decision (metadata storage): XMP sidecar always for raws — the
+        // raw container itself is never rewritten in place. Plain stills
+        // keep Photo-Mechanic-style in-place IIM+XMP.
+        let raw = is_raw(path);
+        let tags = if raw {
+            fields.to_xmp_tags(&vars)
+        } else {
+            fields.to_tags(&vars)
+        };
+        let outcome = if tags.is_empty() {
+            Err("every field expanded empty; nothing written".to_owned())
+        } else if raw {
+            ready_sidecar(path).and_then(|sidecar| write_tags(writer, &sidecar, tags))
+        } else {
+            write_tags(writer, path, tags)
+        };
+        match outcome {
+            Ok(()) => {}
+            Err(e) => {
+                failed.push(format!("{}: {e}", path_str));
+                continue;
+            }
         }
         tx.send(JobEvent {
             id: job.id,
@@ -136,6 +212,21 @@ pub fn run_metadata_write(
     } else {
         Err(failed.join("; "))
     }
+}
+
+/// Map the owning pairs to write_tags' borrowed form; empty pairs are a
+/// diagnostic (nothing to write, most often all variables unavailable).
+fn write_tags(writer: &Writer, path: &Path, tags: Vec<(String, String)>) -> Result<(), String> {
+    if tags.is_empty() {
+        return Err(format!(
+            "{}: every field expanded empty; nothing written",
+            path.display()
+        ));
+    }
+    let tag_refs: Vec<(&str, &str)> = tags.iter().map(|(n, v)| (n.as_str(), v.as_str())).collect();
+    writer
+        .write_tags(path, &tag_refs)
+        .map_err(|e| e.to_string())
 }
 
 #[cfg(test)]
@@ -175,29 +266,38 @@ mod tests {
     #[test]
     fn run_metadata_write_expands_and_sends_progress_per_path() {
         use crate::writer::{ScriptStep, ScriptTransport};
-        use flume::unbounded;
+        use tempfile::TempDir;
+
+        let dir = TempDir::new().unwrap();
+        // The pair lives in one session folder; variables that come from
+        // the path (`{session}`, `{base}`) match it.
+        let pair_dir = dir.path().join("2026 run");
+        std::fs::create_dir_all(&pair_dir).unwrap();
+        let jpeg = pair_dir.join("A1.JPG");
+        let raw = pair_dir.join("A2.NEF");
+        std::fs::write(&jpeg, b"jpeg bytes").unwrap();
+        std::fs::write(&raw, b"raw bytes").unwrap();
 
         let fields = serde_json::json!({"credit": "{session}", "keywords": "swim; {base}"});
         let payload = serde_json::json!({
             "item_id": 5,
-            "paths": ["/photos/2026 run/A1.JPG", "/photos/2026 run/A2.NEF"],
+            "paths": [jpeg.to_string_lossy(), raw.to_string_lossy()],
             "sequence": 1,
+            "captured_at": 1_791_374_400,
             "fields_json": fields.to_string(),
         });
-        // Bytes and paths depend on the fixture EXIF, so the transport
-        // skips exact-arg assertions; the exiftool integration test
-        // (`tests/apply_exiftool.rs`) covers the real tag set.
-        let writer = Writer::with_transport(ScriptTransport::new(vec![
-            ScriptStep {
-                want_args: None,
-                reply: Ok("    1 image files updated\n".into()),
-            },
-            ScriptStep {
-                want_args: None,
-                reply: Ok("    1 image files updated\n".into()),
-            },
-        ]));
-        let (tx, rx) = unbounded();
+        // The A2 side is a raw: the write must target the sidecar, which
+        // starts from the stub packet. Capture the args to verify.
+        let captured = std::sync::Arc::new(std::sync::Mutex::new(Vec::<Vec<String>>::new()));
+        struct Cap(std::sync::Arc<std::sync::Mutex<Vec<Vec<String>>>>);
+        impl crate::Transport for Cap {
+            fn execute(&mut self, args: &[String]) -> crate::Result<String> {
+                self.0.lock().unwrap().push(args.to_vec());
+                Ok("    1 image files updated\n".into())
+            }
+        }
+        let writer = Writer::with_transport(Cap(std::sync::Arc::clone(&captured)));
+        let (tx, rx) = flume::unbounded();
         let job = ClaimedJob {
             id: edit_catalog::JobId(11),
             kind: edit_catalog::JobKind::MetadataWrite,
@@ -205,6 +305,28 @@ mod tests {
             attempts: 1,
         };
         run_metadata_write(&job, &writer, &tx).unwrap();
+
+        let blocks = captured.lock().unwrap().clone();
+        assert_eq!(blocks.len(), 2);
+        assert_eq!(
+            blocks[0].last().unwrap(),
+            &jpeg.to_string_lossy().to_string()
+        );
+        let sidecar_arg = blocks[1].last().unwrap();
+        assert_eq!(
+            sidecar_arg,
+            &pair_dir.join("A2.xmp").to_string_lossy().to_string(),
+            "raw side writes the sidecar, not the raw"
+        );
+        // Only XMP tags reach the sidecar.
+        assert!(
+            blocks[1].iter().all(|arg| !arg.starts_with("-IPTC:")),
+            "sidecar write carries XMP only: {blocks:?}"
+        );
+        // The stub packet exists for exiftool to expand.
+        assert!(sidecar_arg.ends_with(".xmp"));
+        let stub = std::fs::read_to_string(pair_dir.join("A2.xmp")).unwrap();
+        assert!(stub.contains("<x:xmpmeta"), "{stub}");
 
         let done: Vec<u64> = rx
             .drain()
@@ -224,8 +346,9 @@ mod tests {
         let fields = serde_json::json!({"credit": "{camera}"});
         let payload = serde_json::json!({
             "item_id": 5,
-            "paths": ["/photo-scratch/NO_CAMERA.NEF"],
+            "paths": ["/photo-scratch/NO_CAMERA.JPG"],
             "sequence": 1,
+            "captured_at": 1_791_374_400,
             "fields_json": fields.to_string(),
         });
         let writer = Writer::with_transport(ScriptTransport::new(vec![]));
@@ -248,6 +371,7 @@ mod tests {
             "item_id": 5,
             "paths": ["/p/A1.NEF"],
             "sequence": 1,
+            "captured_at": 0,
             "fields_json": "{}",
         });
         let writer = Writer::with_transport(ScriptTransport::new(vec![]));

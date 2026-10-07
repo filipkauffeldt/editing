@@ -255,13 +255,28 @@ impl TemplateFields {
         tags
     }
 
+    /// XMP-only half of [`Self::to_tags`], for `.xmp` sidecar targets
+    /// (raw files are stamped in a sidecar per the metadata-storage
+    /// decision: XMP sidecar always for raws). IIM tags have no meaning
+    /// in an XMP packet and are dropped; the IIM-only `EditStatus` and
+    /// the IIM-only dialect pairs lose their IIM copy and keep the XMP
+    /// side (or nothing, for `edit_status`).
+    pub fn to_xmp_tags(&self, vars: &TemplateVars) -> Vec<(String, String)> {
+        self.to_tags(vars)
+            .into_iter()
+            .filter(|(name, _)| name.starts_with("XMP-"))
+            .collect()
+    }
+
     fn keywords_list(&self, vars: &TemplateVars) -> Vec<String> {
         let Some(raw) = &self.keywords else {
             return vec![];
         };
         let expanded = expand(raw, vars);
+        // Semicolons only: a comma is ordinary text (`Smith, John`), so
+        // splitting on it would chop names apart.
         expanded
-            .split([';', ','])
+            .split(';')
             .map(str::trim)
             .filter(|kw| !kw.is_empty())
             .map(str::to_owned)
@@ -383,10 +398,8 @@ mod tests {
                 ("XMP-xmpRights:UsageTerms".into(), "free use".into()),
                 ("XMP-dc:Subject".into(), "ice".into()),
                 ("IPTC:Keywords".into(), "ice".into()),
-                ("XMP-dc:Subject".into(), "2026-10-07 run".into()),
-                ("IPTC:Keywords".into(), "2026-10-07 run".into()),
-                ("XMP-dc:Subject".into(), "water".into()),
-                ("IPTC:Keywords".into(), "water".into()),
+                ("XMP-dc:Subject".into(), "2026-10-07 run, water".into()),
+                ("IPTC:Keywords".into(), "2026-10-07 run, water".into()),
             ]
         );
     }
@@ -396,7 +409,7 @@ mod tests {
         let f = TemplateFields {
             caption: Some("{camera}".into()),
             byline: Some(" ".into()),
-            keywords: Some(" ; , ".into()),
+            keywords: Some(" ; ".into()),
             ..Default::default()
         };
         let no_cam = TemplateVars {
@@ -404,6 +417,35 @@ mod tests {
             ..vars()
         };
         assert!(f.to_tags(&no_cam).is_empty());
+    }
+
+    #[test]
+    fn commas_are_ordinary_keyword_text() {
+        let f = TemplateFields {
+            keywords: Some("Smith, John; ice".into()),
+            ..Default::default()
+        };
+        let pairs: Vec<String> = f.keywords_list(&vars()).into_iter().collect();
+        assert_eq!(pairs, vec!["Smith, John", "ice"]);
+    }
+
+    #[test]
+    fn xmp_only_tags_drop_the_iim_dialect() {
+        let f = TemplateFields {
+            caption: Some("cap".into()),
+            credit: Some("SHL".into()),
+            edit_status: Some("New".into()),
+            keywords: Some("ice".into()),
+            ..Default::default()
+        };
+        assert_eq!(
+            f.to_xmp_tags(&vars()),
+            vec![
+                ("XMP-dc:Description".into(), "cap".into()),
+                ("XMP-photoshop:Credit".into(), "SHL".into()),
+                ("XMP-dc:Subject".into(), "ice".into()),
+            ]
+        );
     }
 
     #[test]

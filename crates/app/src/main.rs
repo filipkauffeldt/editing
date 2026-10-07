@@ -112,14 +112,13 @@ fn main() {
     // serializes through the transport mutex. Missing binary: template
     // jobs report the failure on their durable rows (degrade gracefully).
     let writer = Writer::find_binary().and_then(|bin| Writer::resident(&bin).ok());
-    let handler: edit_catalog::JobHandler =
-        Arc::new(move |job, tx| match job.kind {
-            JobKind::MetadataWrite => match &writer {
-                Some(writer) => edit_metadata::run_metadata_write(job, writer, tx),
-                None => Err("exiftool unavailable (install libimage-exiftool-perl)".into()),
-            },
-            _ => handle_job(worker_catalog.clone(), job, tx),
-        });
+    let handler: edit_catalog::JobHandler = Arc::new(move |job, tx| match job.kind {
+        JobKind::MetadataWrite => match &writer {
+            Some(writer) => edit_metadata::run_metadata_write(job, writer, tx),
+            None => Err("exiftool unavailable (install libimage-exiftool-perl)".into()),
+        },
+        _ => handle_job(worker_catalog.clone(), job, tx),
+    });
     let pool =
         edit_catalog::spawn_workers(&catalog, WORKER_THREADS, handler).expect("spawn workers");
     let events = pool.events().clone();

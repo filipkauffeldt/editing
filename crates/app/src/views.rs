@@ -402,6 +402,7 @@ impl Browser {
                 item_id: item.item_id,
                 paths,
                 sequence: (offset + 1) as u64,
+                captured_at: edit_catalog::db::now_unix(),
                 fields_json: serde_json::to_string(&fields).unwrap_or_else(|_| "{}".to_string()),
             })
             .unwrap_or_else(|_| "{}".to_string());
