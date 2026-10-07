@@ -195,7 +195,7 @@ fn row_job(row: &Row) -> rusqlite::Result<Job> {
 
 // ---- free functions over one connection (shared by Catalog + workers) ----
 
-fn enqueue(conn: &Connection, kind: JobKind, payload_json: &str) -> Result<JobId> {
+pub(crate) fn enqueue(conn: &Connection, kind: JobKind, payload_json: &str) -> Result<JobId> {
     let now = now_unix();
     conn.execute(
         "INSERT INTO jobs (kind, payload_json, state, created_at, updated_at)

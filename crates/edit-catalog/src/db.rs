@@ -28,6 +28,10 @@ const MIGRATIONS: &[Migration] = &[
         version: 2,
         sql: include_str!("migrations/002_ingest_files.sql"),
     },
+    Migration {
+        version: 3,
+        sql: include_str!("migrations/003_template_name_unique.sql"),
+    },
 ];
 
 /// Seconds since the Unix epoch, for `*_at` columns.
@@ -235,7 +239,7 @@ pub mod tests {
                 for expected in expected_tables() {
                     assert!(names.iter().any(|n| n == expected), "missing {expected}");
                 }
-                assert_eq!(applied_versions(conn)?, vec![1, 2]);
+                assert_eq!(applied_versions(conn)?, vec![1, 2, 3]);
                 Ok(())
             })
             .unwrap();
@@ -267,7 +271,7 @@ pub mod tests {
                     |row| row.get(0),
                 )?;
                 assert_eq!(value, "1");
-                assert_eq!(applied_versions(conn)?, vec![1, 2]);
+                assert_eq!(applied_versions(conn)?, vec![1, 2, 3]);
                 Ok(())
             })
             .unwrap();

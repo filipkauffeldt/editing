@@ -825,6 +825,25 @@ impl Catalog {
         })
     }
 
+    /// Enqueue a whole batch in one transaction (apply-to-selection): the
+    /// UI hands the payloads over on a background thread and the durable
+    /// rows land as one atomic write. Returns the job ids in payload order.
+    pub fn enqueue_jobs_batch(
+        &self,
+        kind: crate::jobs::JobKind,
+        payloads: &[String],
+    ) -> Result<Vec<crate::jobs::JobId>> {
+        self.with_conn(|conn| {
+            let tx = conn.unchecked_transaction()?;
+            let mut ids = Vec::with_capacity(payloads.len());
+            for payload in payloads {
+                ids.push(crate::jobs::enqueue(&tx, kind, payload)?);
+            }
+            tx.commit()?;
+            Ok(ids)
+        })
+    }
+
     /// Rewrite a template row in place; the id stays so enqueued jobs and
     /// `ingest_batches.template_id` references keep pointing at it.
     pub fn update_iptc_template(
@@ -1265,6 +1284,12 @@ mod tests {
             db.update_iptc_template(999_999, "c", "{}", "global")
                 .is_err()
         );
+        // Names are unique (migration 003): a second row with the same
+        // name is a unique violation, so the picker can never be ambiguous.
+        let dup = db
+            .insert_iptc_template("sports", "{}", "global")
+            .unwrap_err();
+        assert!(dup.is_unique_violation(), "{dup}");
 
         let batch = db.insert_ingest_batch("/photos/2026", "running").unwrap();
         db.finish_ingest_batch(batch, "done").unwrap();
@@ -1371,6 +1396,18 @@ mod tests {
         db.set_setting("theme", "dark").unwrap();
         assert_eq!(db.get_setting("theme").unwrap().as_deref(), Some("dark"));
         assert_eq!(db.get_setting("missing").unwrap(), None);
+
+        // Batched enqueue lands N durable rows in payload order.
+        let payloads = vec![r#"{"n":0}"#.to_owned(), r#"{"n":1}"#.to_owned()];
+        let ids = db
+            .enqueue_jobs_batch(crate::JobKind::MetadataWrite, &payloads)
+            .unwrap();
+        assert_eq!(ids.len(), 2);
+        for (offset, id) in ids.iter().enumerate() {
+            let job = db.job(*id).unwrap();
+            assert_eq!(job.state, crate::JobState::Queued);
+            assert_eq!(job.payload_json, payloads[offset].as_str());
+        }
 
         assert!(db.get_root(999_999).is_err());
         std::fs::remove_file(path).ok();
