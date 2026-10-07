@@ -1,0 +1,16 @@
+[package]
+name = "edit-ingest"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+description = "Volume detection for ingest. Copy pipeline, naming rules and backup land in C2."
+
+[dependencies]
+serde.workspace = true
+thiserror.workspace = true
+flume.workspace = true
+sysinfo.workspace = true
+
+[target.'cfg(target_os = "linux")'.dependencies]
+udev.workspace = true
