@@ -1,17 +1,35 @@
-//! Volume detection for ingest.
+//! Volume detection and the verified ingest copy pipeline.
 //!
-//! Linux-first per PLAN.md. The baseline polls [`sysinfo`] disks every
-//! [`POLL_INTERVAL`]; on Linux a udev monitor on the `block` subsystem wakes
-//! the poll loop early and enriches volumes with `ID_FS_LABEL` / `ID_FS_UUID`.
-//! Windows (`GetVolumeInformationW`) and macOS (DiskArbitration) volume code
-//! comes in a later cross-platform milestone.
+//! [`volumes`] polls mounted cards (sysinfo plus Linux udev enrichment).
+//! [`naming`] renders Photo-Mechanic-style folder/filename rules, [`copy`]
+//! copies to a temp name, verifies with BLAKE3, fans out one backup, and
+//! atomically renames into place, and [`ingest`] runs the durable copy job
+//! (duplicate checks, catalog inserts, thumbnail jobs).
+//!
+//! Linux-first per PLAN.md. Windows (`GetVolumeInformationW`) and macOS
+//! (DiskArbitration) volume code comes in a later cross-platform milestone.
 //!
 //! Identity rule: a volume is keyed by its **filesystem UUID**, never by its
 //! label — labels collide (`EOS_DIGITAL` is every Canon card). Volumes without
 //! a UUID fall back to their mount point.
 
+pub mod copy;
+pub mod ingest;
+pub mod naming;
 pub mod volumes;
 
+pub use copy::{
+    CopyError, CopyOutcome, CopyRequest, CopyStage, copy_verified, copy_verified_with, hash_file,
+    unique_path,
+};
+pub use ingest::{
+    CardFile, IngestCopyPayload, IngestError, IngestSummary, enumerate_card, plan_card,
+    run_ingest_copy,
+};
+pub use naming::{
+    NamingContext, NamingError, expand_tilde, render_dir, render_filename, static_prefix, validate,
+    with_original_extension,
+};
 pub use volumes::{
     DiskInfo, DiskSource, POLL_INTERVAL, SysinfoSource, UdevEntry, Volume, VolumeEvent, diff,
     enumerate_udev, poll_once, snapshot, spawn_udev_ping, watch_loop,

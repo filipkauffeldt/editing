@@ -4,13 +4,17 @@ version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
-description = "Volume detection for ingest. Copy pipeline, naming rules and backup land in C2."
+description = "Volume detection and the verified ingest copy pipeline (naming rules, backup, duplicate checks)."
 
 [dependencies]
+edit-core.workspace = true
+edit-catalog.workspace = true
 serde.workspace = true
+serde_json.workspace = true
 thiserror.workspace = true
 flume.workspace = true
 sysinfo.workspace = true
+blake3.workspace = true
 
 [target.'cfg(target_os = "linux")'.dependencies]
 udev.workspace = true
