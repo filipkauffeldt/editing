@@ -1,5 +1,5 @@
 [workspace]
-members = ["crates/app", "crates/edit-core"]
+members = ["crates/app", "crates/edit-core", "crates/edit-catalog"]
 resolver = "2"
 
 [workspace.package]
@@ -17,6 +17,10 @@ lightcraft-develop = { git = "https://github.com/storytold/lightcraft", rev = "f
 serde = { version = "1", features = ["derive"] }
 serde_json = { version = "1" }
 thiserror = { version = "2" }
+rusqlite = { version = "0.32", features = ["bundled"] }
+flume = { version = "0.11" }
+edit-core = { path = "crates/edit-core" }
+edit-catalog = { path = "crates/edit-catalog" }
 # The x11 and wayland features select gpui's Linux windowing backends;
 # font-kit enables the freetype/fontconfig text stack, runtime_shaders compiles
 # Metal shaders at runtime on macOS.
