@@ -4,9 +4,25 @@
 //! of it. The catalog scan runs as a durable `catalog_scan` job and thumb
 //! work as `thumb` jobs (plan section 1.2); workers report over flume and
 //! [`Browser::on_job_event`] applies them to the visible rows.
+//!
+//! Keyboard map (plan section 2.11, M1 subset):
+//!
+//! | Keys | Action |
+//! |---|---|
+//! | `Left` / `Right` (`Up` / `Down` by row) | walk items |
+//! | `Shift` + arrows | extend the selection range |
+//! | `Ctrl+A` | select all |
+//! | `G` | toggle contact sheet and single view |
+//! | `Z` | fit to window |
+//! | `Shift+Z` | 100% zoom |
+//! | Scroll | zoom (from fit it starts a free scale) |
+//! | Drag | pan while zoomed |
+//! | `0`–`5` | rating |
 
-use std::collections::HashMap;
-use std::path::PathBuf;
+use std::cell::Cell;
+use std::collections::{BTreeSet, HashMap, HashSet, VecDeque};
+use std::path::{Path, PathBuf};
+use std::rc::Rc;
 use std::sync::Arc;
 
 use edit_catalog::{Catalog, JobEvent, JobEventKind, JobId, JobKind};
@@ -15,12 +31,39 @@ use gpui_kit::*;
 
 use crate::browse::{
     BrowseFilter, BrowseItem, CatalogScanPayload, SelectionModel, SortOrder, ThumbPayload,
-    ThumbState, UploadBadge, ZoomState, apply_filter_sort, list_browse_items, run_catalog_scan,
+    ThumbState, UploadBadge, ZoomMode, ZoomState, apply_filter_sort, canonical_root,
+    list_browse_items, pair_key, run_catalog_scan,
 };
 use crate::preview::BrowsePreviewProvider;
 
 /// Cells per contact-sheet row over `uniform_list`.
 pub const GRID_COLS: usize = 4;
+/// Downscaled thumbnails kept per item (long edge, pixels).
+pub const THUMB_LONG_EDGE: u32 = 320;
+/// Bounded decoded-thumbnail cache: the grid and strip share it, so a
+/// 10k-photo folder cannot grow the UI process without limit.
+pub const THUMB_CACHE_CAP: usize = 256;
+/// New background decodes kicked off per frame at most.
+const THUMB_REQUEST_BUDGET: usize = 24;
+
+/// Painted offset of a frame's top-left within a viewport: centered on the
+/// `scale`d size, shifted by the pan (fractional frame widths/heights).
+/// Extracted from the single-view canvas so the zoom-applied-to-paint math
+/// has a regression test (review blocking item 4).
+fn paint_origin(
+    frame_w: f32,
+    frame_h: f32,
+    vw: f32,
+    vh: f32,
+    scale: f32,
+    zoom: ZoomState,
+) -> (f32, f32) {
+    let dw = frame_w * scale;
+    let dh = frame_h * scale;
+    let ox = (vw - dw) / 2.0 + dw * zoom.pan_x;
+    let oy = (vh - dh) / 2.0 + dh * zoom.pan_y;
+    (ox, oy)
+}
 
 gpui_kit::actions!(
     browser,
@@ -29,6 +72,10 @@ gpui_kit::actions!(
         PrevItem,
         NextRow,
         PrevRow,
+        ExtendNext,
+        ExtendPrev,
+        ExtendNextRow,
+        ExtendPrevRow,
         ToggleView,
         FitView,
         HundredView,
@@ -65,10 +112,23 @@ pub struct Browser {
     root_label: String,
     root_id: Option<i64>,
     scan_status: String,
-    thumb_images: HashMap<i64, Arc<RenderImage>>,
+    /// Display table: filtered/sorted snapshots. Rebuilt on data changes
+    /// only, so per-frame rendering clones [`Arc`]s instead of items.
+    rows: Arc<Vec<BrowseItem>>,
+    /// Bounded decoded thumbnails shared by the grid, single view, and
+    /// strip; filled on background threads, never on the UI thread.
+    thumbs: HashMap<i64, Arc<RenderImage>>,
+    thumb_order: VecDeque<i64>,
+    thumb_pending: HashSet<i64>,
+    /// Thumb job id → photo path, resolved from the job payload on
+    /// `Started` so progress/completion can mark the right cell.
     thumb_jobs: HashMap<JobId, String>,
     scan_jobs: Vec<JobId>,
     drag_from: Option<Point<Pixels>>,
+    strip_scroll: ScrollHandle,
+    /// Fit scale painted by the last canvas frame; scroll-zoom reads it to
+    /// enter a free scale from Fit. UI-thread only, hence `Rc`.
+    fit_scale: Rc<Cell<f32>>,
 }
 
 impl Browser {
@@ -83,10 +143,13 @@ impl Browser {
             KeyBinding::new("left", PrevItem, None),
             KeyBinding::new("down", NextRow, None),
             KeyBinding::new("up", PrevRow, None),
-            KeyBinding::new("shift-right", NextItem, None),
-            KeyBinding::new("shift-left", PrevItem, None),
+            KeyBinding::new("shift-right", ExtendNext, None),
+            KeyBinding::new("shift-left", ExtendPrev, None),
+            KeyBinding::new("shift-down", ExtendNextRow, None),
+            KeyBinding::new("shift-up", ExtendPrevRow, None),
             KeyBinding::new("g", ToggleView, None),
             KeyBinding::new("z", FitView, None),
+            KeyBinding::new("shift-z", HundredView, None),
             KeyBinding::new("ctrl-a", SelectAllItems, None),
             KeyBinding::new("0", Rate0, None),
             KeyBinding::new("1", Rate1, None),
@@ -109,11 +172,39 @@ impl Browser {
             root_label: "No folder open".to_string(),
             root_id: None,
             scan_status: "Ready".to_string(),
-            thumb_images: HashMap::new(),
+            rows: Arc::new(Vec::new()),
+            thumbs: HashMap::new(),
+            thumb_order: VecDeque::new(),
+            thumb_pending: HashSet::new(),
             thumb_jobs: HashMap::new(),
             scan_jobs: Vec::new(),
             drag_from: None,
+            strip_scroll: ScrollHandle::new(),
+            fit_scale: Rc::new(Cell::new(1.0)),
         }
+    }
+
+    /// Catalog root currently shown, if a scan has landed one.
+    pub fn root_id(&self) -> Option<i64> {
+        self.root_id
+    }
+
+    /// Number of display rows after filter/sort.
+    pub fn row_count(&self) -> usize {
+        self.rows.len()
+    }
+
+    /// Thumbnail state of one display item, for tests and badges.
+    pub fn thumb_state_for(&self, item_id: i64) -> Option<ThumbState> {
+        self.rows
+            .iter()
+            .find(|row| row.item_id == item_id)
+            .map(|row| row.thumb)
+    }
+
+    /// Most recently enqueued scan job, for tests.
+    pub fn last_scan_job(&self) -> Option<JobId> {
+        self.scan_jobs.last().copied()
     }
 
     /// Start the flume drain loop: background threads never touch entities.
@@ -137,32 +228,42 @@ impl Browser {
 
     /// Pick a folder: enqueue a `catalog_scan` job and show live progress.
     /// Workers do the catalog writes; progress events refresh the rows.
+    /// The path is canonicalized first, so `photos` and `photos/` share one
+    /// root row instead of two competing roots.
     pub fn open_folder(&mut self, path: PathBuf, cx: &mut Context<Self>) {
+        let canon = canonical_root(&path);
+        let label = canon.to_string_lossy().into_owned();
         let payload = serde_json::to_string(&CatalogScanPayload {
-            root: path.to_string_lossy().into_owned(),
+            root: label.clone(),
         })
         .unwrap_or_else(|_| "{}".to_string());
         match self.catalog.enqueue_job(JobKind::CatalogScan, &payload) {
             Ok(id) => {
                 self.scan_jobs.push(id);
-                self.root_label = path.to_string_lossy().into_owned();
-                self.scan_status = format!("Scan queued: {}", self.root_label);
+                self.root_label = label.clone();
+                self.scan_status = format!("Scan queued: {label}");
+                // The root row may already exist from an earlier open.
+                self.resolve_scan_root(id);
+                self.refresh_items();
             }
             Err(e) => self.scan_status = format!("Scan failed to queue: {e}"),
         }
         cx.notify();
     }
 
-    /// Synchronous scan used by headless flows and tests: runs the same
-    /// catalog writes the `catalog_scan` worker would, without job events.
-    pub fn scan_folder_sync(catalog: &Catalog, path: &std::path::Path) -> Vec<String> {
-        let summary = run_catalog_scan(catalog, path, &|_, _| {}).unwrap_or_default();
-        catalog
-            .list_photos_by_root(summary.root_id)
-            .unwrap_or_default()
-            .into_iter()
-            .map(|photo| photo.path)
-            .collect()
+    /// Point `root_id` at the root a scan job is filling (roots appear when
+    /// the worker runs, so this runs on every scan event, not just enqueue).
+    fn resolve_scan_root(&mut self, job_id: JobId) {
+        if let Ok(job) = self.catalog.job(job_id)
+            && let Ok(payload) = serde_json::from_str::<CatalogScanPayload>(&job.payload_json)
+        {
+            let root = canonical_root(Path::new(&payload.root))
+                .to_string_lossy()
+                .into_owned();
+            if let Ok(Some(row)) = self.catalog.get_root_by_path(&root) {
+                self.root_id = Some(row.id);
+            }
+        }
     }
 
     fn refresh_items(&mut self) {
@@ -191,17 +292,45 @@ impl Browser {
             }
         }
         self.sort.apply(&mut self.items);
-        self.selection.clamp(self.visible().len());
-        self.current = self.current.min(self.visible().len().saturating_sub(1));
+        self.rebuild_rows();
+    }
+
+    /// Rebuild the display table from the store, then clamp the focus.
+    fn rebuild_rows(&mut self) {
+        let rows: Vec<BrowseItem> = apply_filter_sort(&self.items, &self.filter, self.sort)
+            .into_iter()
+            .cloned()
+            .collect();
+        self.rows = Arc::new(rows);
+        self.clamp_to_visible();
+    }
+
+    /// Clamp cursor, anchor, and current item to the visible table.
+    fn clamp_to_visible(&mut self) {
+        let len = self.rows.len();
+        self.selection.clamp(len);
+        self.current = self.current.min(len.saturating_sub(1));
+    }
+
+    /// Replace the header filter and refocus the view on what remains.
+    pub fn set_filter(&mut self, filter: BrowseFilter) {
+        self.filter = filter;
+        self.rebuild_rows();
+    }
+
+    /// Replace the header sort order and refocus the view on what remains.
+    pub fn set_sort(&mut self, sort: SortOrder) {
+        self.sort = sort;
+        self.rebuild_rows();
     }
 
     /// Display rows after filter/sort.
     pub fn visible(&self) -> Vec<&BrowseItem> {
-        apply_filter_sort(&self.items, &self.filter, self.sort)
+        self.rows.iter().collect()
     }
 
     fn current_item(&self) -> Option<BrowseItem> {
-        self.visible().get(self.current).map(|item| (*item).clone())
+        self.rows.get(self.current).cloned()
     }
 
     /// Apply one worker event to the visible rows.
@@ -209,24 +338,27 @@ impl Browser {
         match &event.kind {
             JobEventKind::Started { .. } => {
                 if self.scan_jobs.contains(&event.id) {
+                    self.resolve_scan_root(event.id);
                     self.scan_status = "Scanning folder…".to_string();
-                } else if let Some(path) = self.thumb_jobs.get(&event.id).cloned() {
+                } else if let Some(path) = self.thumb_path_for(event.id) {
                     self.mark_thumb(&path, ThumbState::Running);
                 }
             }
             JobEventKind::Progress { done, total } => {
                 if self.scan_jobs.contains(&event.id) {
+                    self.resolve_scan_root(event.id);
                     self.scan_status = format!("Scanning: {done}/{total}");
                     self.refresh_items();
                 }
             }
             JobEventKind::Succeeded => {
                 if self.scan_jobs.contains(&event.id) {
+                    self.resolve_scan_root(event.id);
                     self.scan_status = "Scan complete".to_string();
                     self.refresh_items();
                 } else if let Some(path) = self.thumb_jobs.remove(&event.id) {
                     self.mark_thumb(&path, ThumbState::Ready);
-                    self.refresh_items();
+                    self.rebuild_rows();
                 }
             }
             JobEventKind::Failed { error } => {
@@ -234,89 +366,164 @@ impl Browser {
                     self.scan_status = format!("Scan failed: {error}");
                 } else if let Some(path) = self.thumb_jobs.remove(&event.id) {
                     self.mark_thumb(&path, ThumbState::Failed);
+                    self.rebuild_rows();
                 }
             }
         }
     }
 
+    /// Photo path for a thumb job: remembered, or resolved from the durable
+    /// job payload (the worker claims before its `Started` event lands, so
+    /// the row is always readable here).
+    fn thumb_path_for(&mut self, id: JobId) -> Option<String> {
+        if let Some(path) = self.thumb_jobs.get(&id) {
+            return Some(path.clone());
+        }
+        let job = self.catalog.job(id).ok()?;
+        let payload: ThumbPayload = serde_json::from_str(&job.payload_json).ok()?;
+        self.thumb_jobs.insert(id, payload.path.clone());
+        Some(payload.path)
+    }
+
     fn mark_thumb(&mut self, path: &str, state: ThumbState) {
+        let mut hit = false;
         for item in &mut self.items {
             if item.display_path == path {
                 item.thumb = state;
                 item.ingest_fresh = false;
+                hit = true;
             }
+        }
+        // The display table is a separate snapshot; refresh it so the cell
+        // repaints on the same event (tests read it back immediately).
+        if hit {
+            self.rebuild_rows();
         }
     }
 
     fn walk(&mut self, delta: isize, extend: bool, cx: &mut Context<Self>) {
-        let len = self.visible().len();
+        let len = self.rows.len();
         if len == 0 {
             return;
         }
         self.selection.move_cursor(delta, extend, len);
         self.current = self.selection.cursor;
         self.zoom.reset();
-        self.preload_neighbors();
+        self.preload_neighbors(cx);
+        self.strip_scroll.scroll_to_item(self.current);
         cx.notify();
     }
 
     fn goto(&mut self, index: usize, cx: &mut Context<Self>) {
-        let len = self.visible().len();
-        if len == 0 {
+        if self.rows.is_empty() {
             return;
         }
-        self.selection.select_single(index, len);
+        self.selection.select_single(index, self.rows.len());
         self.current = self.selection.cursor;
         self.zoom.reset();
-        self.preload_neighbors();
+        self.preload_neighbors(cx);
+        self.strip_scroll.scroll_to_item(self.current);
         cx.notify();
     }
 
-    /// Decode neighbor proxies so Left/Right never waits on disk.
-    fn preload_neighbors(&mut self) {
-        let neighbors: Vec<BrowseItem> = self
-            .visible()
-            .into_iter()
-            .cloned()
-            .enumerate()
-            .filter(|(index, _)| {
-                *index == self.current.saturating_add(1)
-                    || *index == self.current.saturating_add(2)
-                    || Some(*index) == self.current.checked_sub(1)
-                    || Some(*index) == self.current.checked_sub(2)
-            })
-            .map(|(_, item)| item)
-            .collect();
-        for item in &neighbors {
-            self.cached_image(item);
+    fn goto_item(&mut self, item_id: i64, cx: &mut Context<Self>) {
+        if let Some(index) = self.rows.iter().position(|row| row.item_id == item_id) {
+            self.goto(index, cx);
         }
     }
 
-    fn cached_image(&mut self, item: &BrowseItem) -> Option<Arc<RenderImage>> {
-        if let Some(hit) = self.thumb_images.get(&item.item_id) {
-            return Some(Arc::clone(hit));
+    /// Queue neighbor proxies on the background executor so Left/Right
+    /// never waits on disk (and never blocks the UI thread decoding).
+    fn preload_neighbors(&mut self, cx: &mut Context<Self>) {
+        let rows = Arc::clone(&self.rows);
+        for offset in 1..=2 {
+            for neighbor in [
+                self.current.checked_add(offset),
+                self.current.checked_sub(offset),
+            ]
+            .into_iter()
+            .flatten()
+            {
+                if let Some(item) = rows.get(neighbor) {
+                    self.request_thumb(cx, item.item_id, item.display_path.clone());
+                }
+            }
         }
-        let bytes =
-            BrowsePreviewProvider::thumbnail_bytes(PathBuf::from(&item.display_path).as_path())?;
-        let decoded = image::load_from_memory(&bytes).ok()?.to_rgba8();
-        let frame = image::Frame::new(decoded);
-        let image = Arc::new(RenderImage::new([frame]));
-        self.thumb_images.insert(item.item_id, Arc::clone(&image));
-        Some(image)
+    }
+
+    /// Queue a downscaled decode for one item unless cached or already
+    /// queued. Reads and decodes off-thread; the entity inserts the frame
+    /// and re-renders on completion.
+    fn request_thumb(&mut self, cx: &mut Context<Self>, item_id: i64, path: String) {
+        if self.thumbs.contains_key(&item_id) || !self.thumb_pending.insert(item_id) {
+            return;
+        }
+        cx.spawn(async move |this, cx| {
+            let rgba = cx
+                .background_executor()
+                .spawn(async move {
+                    let bytes = BrowsePreviewProvider::thumbnail_bytes(Path::new(&path))?;
+                    let decoded = image::load_from_memory(&bytes).ok()?;
+                    Some(
+                        decoded
+                            .thumbnail(THUMB_LONG_EDGE, THUMB_LONG_EDGE)
+                            .to_rgba8(),
+                    )
+                })
+                .await;
+            if let Some(rgba) = rgba {
+                this.update(cx, |this, cx| {
+                    this.insert_thumb(item_id, rgba);
+                    cx.notify();
+                })
+                .ok();
+            } else {
+                this.update(cx, |this, cx| {
+                    this.thumb_pending.remove(&item_id);
+                    cx.notify();
+                })
+                .ok();
+            }
+        })
+        .detach();
+    }
+
+    /// Insert a decoded frame, evicting the oldest entries past the cap.
+    /// Stored BGRA, matching what `paint_image` expects.
+    fn insert_thumb(&mut self, item_id: i64, mut rgba: image::RgbaImage) {
+        for px in rgba.as_chunks_mut::<4>().0 {
+            px.swap(0, 2);
+        }
+        if !self.thumbs.contains_key(&item_id)
+            && self.thumbs.len() >= THUMB_CACHE_CAP
+            && let Some(old) = self.thumb_order.pop_front()
+        {
+            self.thumbs.remove(&old);
+        }
+        if let Some(pos) = self.thumb_order.iter().position(|id| *id == item_id) {
+            self.thumb_order.remove(pos);
+        }
+        self.thumb_order.push_back(item_id);
+        self.thumbs.insert(
+            item_id,
+            Arc::new(RenderImage::new([image::Frame::new(rgba)])),
+        );
+        self.thumb_pending.remove(&item_id);
     }
 
     fn set_rating(&mut self, rating: i64, cx: &mut Context<Self>) {
         let rating = rating.clamp(0, 5);
-        let current = match self.visible().get(self.current) {
-            Some(item) => (*item).clone(),
+        let current = match self.rows.get(self.current) {
+            Some(item) => item.clone(),
             None => return,
         };
+        let want = pair_key(&current.dir, &current.base_name);
         // Ratings fan out to every photo in the pair cell.
         if let Some(root_id) = self.root_id
             && let Ok(photos) = self.catalog.list_photos_by_root(root_id)
         {
             for photo in photos {
-                if photo.dir == current.dir && photo.base_name == current.base_name {
+                if pair_key(&photo.dir, &photo.base_name) == want {
                     self.catalog.set_photo_rating(photo.id, rating).ok();
                 }
             }
@@ -324,11 +531,13 @@ impl Browser {
         if let Some(item) = self.items.iter_mut().find(|i| i.item_id == current.item_id) {
             item.rating = rating;
         }
+        // A rating can filter its own cell out; refocus after rebuild.
+        self.rebuild_rows();
         cx.notify();
     }
 
     fn render_header(&mut self, _cx: &mut Context<Self>) -> impl IntoElement {
-        let count = self.visible().len();
+        let count = self.rows.len();
         let status = self.scan_status.clone();
         let root = self.root_label.clone();
         let mode_label = match self.mode {
@@ -358,86 +567,115 @@ impl Browser {
         }
     }
 
-    fn render_grid(&mut self, _cx: &mut Context<Self>) -> impl IntoElement {
-        // Snapshot everything the 'static row closure needs: rows with their
-        // global display indices, plus selection/current for outlines.
-        let flat: Vec<(BrowseItem, usize)> = self
-            .visible()
-            .into_iter()
-            .cloned()
-            .enumerate()
-            .map(|(index, item)| (item, index))
-            .collect();
-        let selected: std::collections::BTreeSet<usize> = self.selection.selected.clone();
+    /// Badge line for a cell: rating stars, thumb state, upload state, and
+    /// the amber "new" marker while ingest is still landing.
+    fn cell_badges(item: &BrowseItem) -> String {
+        let stars = "★".repeat(item.rating.clamp(0, 5) as usize);
+        let thumb = match item.thumb {
+            ThumbState::Queued => "queued",
+            ThumbState::Running => "…",
+            ThumbState::Ready => "ready",
+            ThumbState::Failed => "failed",
+        };
+        let upload = match item.upload {
+            UploadBadge::None => String::new(),
+            UploadBadge::Queued => " ● queued".to_string(),
+            UploadBadge::Uploading => " ● uploading".to_string(),
+            UploadBadge::Done => " ● done".to_string(),
+            UploadBadge::Failed => " ● failed".to_string(),
+        };
+        let fresh = if item.ingest_fresh { " ◌ new" } else { "" };
+        format!("{stars} {} · {thumb}{upload}{fresh}", item.base_name)
+    }
+
+    fn render_grid(&mut self, cx: &mut Context<Self>) -> impl IntoElement {
+        // Cheap per-frame snapshots: the row table and thumb cache travel
+        // by Arc; selection is a small index set. No item is cloned here.
+        let rows = Arc::clone(&self.rows);
+        let selected: Arc<BTreeSet<usize>> = Arc::new(self.selection.selected.clone());
         let current = self.current;
-        let rows: Vec<Vec<(BrowseItem, usize)>> =
-            flat.chunks(GRID_COLS).map(|chunk| chunk.to_vec()).collect();
-        let row_count = rows.len();
-        let rows = Arc::new(rows);
-        let selected = Arc::new(selected);
+        // Queue decodes for the first cells still missing art (bounded per
+        // frame); completed frames arrive via insert_thumb + notify.
+        let mut budget = THUMB_REQUEST_BUDGET;
+        for row in rows.iter() {
+            if budget == 0 {
+                break;
+            }
+            if !self.thumbs.contains_key(&row.item_id) && !self.thumb_pending.contains(&row.item_id)
+            {
+                self.request_thumb(cx, row.item_id, row.display_path.clone());
+                budget -= 1;
+            }
+        }
+        let thumbs: Arc<HashMap<i64, Arc<RenderImage>>> = Arc::new(
+            self.thumbs
+                .iter()
+                .map(|(id, art)| (*id, Arc::clone(art)))
+                .collect(),
+        );
+        let row_count = rows.len().div_ceil(GRID_COLS);
+        // The row closure is 'static, so cell clicks update through an
+        // owned entity handle instead of a borrowed context.
+        let entity = cx.entity();
         div().size_full().overflow_hidden().child(uniform_list(
             "contact-sheet",
             row_count,
             move |range, _window, _cx| {
                 let mut cells = Vec::new();
                 for row in range {
-                    if let Some(chunk) = rows.get(row) {
-                        let mut row_el = h_flex().w_full().justify_start();
-                        for (item, index) in chunk.clone() {
-                            let border = if index == current {
-                                rgb(0x4C9AFF)
-                            } else if selected.contains(&index) {
-                                rgb(0x8A8A8A)
-                            } else {
-                                rgb(0x2A2A2A)
-                            };
-                            let stars = "★".repeat(item.rating.clamp(0, 5) as usize);
-                            let thumb_label = match item.thumb {
-                                ThumbState::Queued => "queued",
-                                ThumbState::Running => "…",
-                                ThumbState::Ready => "ready",
-                                ThumbState::Failed => "failed",
-                            };
-                            let thumb: AnyElement = if item.has_jpeg {
-                                img(PathBuf::from(item.display_path.clone()))
-                                    .w_full()
-                                    .h(px(96.0))
-                                    .into_any_element()
-                            } else {
-                                div()
-                                    .w_full()
-                                    .h(px(96.0))
-                                    .flex()
-                                    .items_center()
-                                    .justify_center()
-                                    .bg(rgb(0x111111))
-                                    .text_color(rgb(0x999999))
-                                    .text_sm()
-                                    .child(item.label())
-                                    .into_any_element()
-                            };
-                            row_el = row_el.child(
-                                div()
-                                    .id(("grid-cell", index))
-                                    .w(px(180.0))
-                                    .h(px(150.0))
-                                    .m_1()
-                                    .p_1()
-                                    .border_2()
-                                    .border_color(border)
-                                    .rounded_md()
-                                    .bg(rgb(0x1E1E1E))
-                                    .child(thumb)
-                                    .child(div().text_xs().text_color(rgb(0xCCCCCC)).child(
-                                        format!(
-                                            "{stars} {} · {thumb_label}",
-                                            item.base_name.clone()
-                                        ),
-                                    )),
-                            );
-                        }
-                        cells.push(row_el);
+                    let span = row * GRID_COLS..((row + 1) * GRID_COLS).min(rows.len());
+                    if span.is_empty() {
+                        continue;
                     }
+                    let mut row_el = h_flex().w_full().justify_start();
+                    for index in span {
+                        let item = &rows[index];
+                        let border = if index == current {
+                            rgb(0x4C9AFF)
+                        } else if selected.contains(&index) {
+                            rgb(0x8A8A8A)
+                        } else {
+                            rgb(0x2A2A2A)
+                        };
+                        let art: AnyElement = match thumbs.get(&item.item_id) {
+                            Some(art) => {
+                                img(Arc::clone(art)).w_full().h(px(96.0)).into_any_element()
+                            }
+                            None => div()
+                                .w_full()
+                                .h(px(96.0))
+                                .flex()
+                                .items_center()
+                                .justify_center()
+                                .bg(rgb(0x111111))
+                                .text_color(rgb(0x999999))
+                                .text_sm()
+                                .child(item.label())
+                                .into_any_element(),
+                        };
+                        let item_id = item.item_id;
+                        let badges = Self::cell_badges(item);
+                        let entity = entity.clone();
+                        row_el = row_el.child(
+                            div()
+                                .id(("grid-cell", index))
+                                .w(px(180.0))
+                                .h(px(150.0))
+                                .m_1()
+                                .p_1()
+                                .border_2()
+                                .border_color(border)
+                                .rounded_md()
+                                .bg(rgb(0x1E1E1E))
+                                .cursor_pointer()
+                                .on_click(move |_, _, cx| {
+                                    entity.update(cx, |this, cx| this.goto_item(item_id, cx));
+                                })
+                                .child(art)
+                                .child(div().text_xs().text_color(rgb(0xCCCCCC)).child(badges)),
+                        );
+                    }
+                    cells.push(row_el);
                 }
                 cells
             },
@@ -447,11 +685,19 @@ impl Browser {
     fn render_single(&mut self, cx: &mut Context<Self>) -> impl IntoElement {
         let item = self.current_item();
         let zoom_label = match self.zoom.mode {
-            crate::browse::ZoomMode::Fit => "fit".to_string(),
-            crate::browse::ZoomMode::Hundred => "100%".to_string(),
-            crate::browse::ZoomMode::Scale(s) => format!("{:.0}%", s * 100.0),
+            ZoomMode::Fit => "fit".to_string(),
+            ZoomMode::Hundred => "100%".to_string(),
+            ZoomMode::Scale(s) => format!("{:.0}%", s * 100.0),
         };
-        let image = item.as_ref().and_then(|row| self.cached_image(row));
+        if let Some(row) = item.as_ref() {
+            self.request_thumb(cx, row.item_id, row.display_path.clone());
+        }
+        let image = item
+            .as_ref()
+            .and_then(|row| self.thumbs.get(&row.item_id))
+            .map(Arc::clone);
+        let zoom = self.zoom;
+        let fit_cell = Rc::clone(&self.fit_scale);
         let title = item
             .as_ref()
             .map(|row| row.label())
@@ -482,12 +728,15 @@ impl Browser {
                                 if w > 0.0 && h > 0.0 {
                                     let bw: f32 = bounds.size.width.into();
                                     let bh: f32 = bounds.size.height.into();
-                                    let scale = (bw / w).min(bh / h).max(0.01);
+                                    let fit = (bw / w).min(bh / h).max(0.01);
+                                    fit_cell.set(fit);
+                                    let scale = zoom.scale_in(w, h, bw, bh);
+                                    let (ox, oy) = paint_origin(w, h, bw, bh, scale, zoom);
                                     let dw = px(w * scale);
                                     let dh = px(h * scale);
                                     let origin = point(
-                                        bounds.origin.x + (bounds.size.width - dw) / 2.0,
-                                        bounds.origin.y + (bounds.size.height - dh) / 2.0,
+                                        bounds.origin.x + ox.into(),
+                                        bounds.origin.y + oy.into(),
                                     );
                                     let image_bounds = Bounds::new(origin, gpui_kit::size(dw, dh));
                                     let _ = window.paint_image(
@@ -507,10 +756,11 @@ impl Browser {
                             ScrollDelta::Pixels(p) => p.y.into(),
                             ScrollDelta::Lines(p) => p.y * 20.0,
                         };
+                        let fit = this.fit_scale.get();
                         if dy < 0.0 {
-                            this.zoom.scroll_zoom(1.1);
+                            this.zoom.scroll_zoom(1.1, fit);
                         } else if dy > 0.0 {
-                            this.zoom.scroll_zoom(1.0 / 1.1);
+                            this.zoom.scroll_zoom(1.0 / 1.1, fit);
                         }
                         cx.notify();
                     }))
@@ -524,7 +774,7 @@ impl Browser {
                         if let Some(from) = this.drag_from {
                             let dx_pixels: f32 = (event.position.x - from.x).into();
                             let dy_pixels: f32 = (event.position.y - from.y).into();
-                            this.zoom.enter_free(1.0);
+                            this.zoom.enter_free(this.fit_scale.get());
                             this.zoom.drag_pan(dx_pixels / 200.0, dy_pixels / 200.0);
                             this.drag_from = Some(event.position);
                             cx.notify();
@@ -540,12 +790,29 @@ impl Browser {
             .child(self.render_strip(cx))
     }
 
+    /// Bottom film strip (plan section 2.3): thumbnails with badge
+    /// overlays, the current item outlined, click to navigate. A scroll
+    /// handle keeps the current cell in view on walk/goto.
     fn render_strip(&mut self, cx: &mut Context<Self>) -> impl IntoElement {
         let current = self.current;
-        let cells: Vec<_> = self
-            .visible()
-            .into_iter()
-            .cloned()
+        let rows = Arc::clone(&self.rows);
+        let mut budget = THUMB_REQUEST_BUDGET;
+        for (index, row) in rows.iter().enumerate() {
+            if budget == 0 {
+                break;
+            }
+            // Warm the neighborhood of the current cell first.
+            if index.abs_diff(current) > 12 {
+                continue;
+            }
+            if !self.thumbs.contains_key(&row.item_id) && !self.thumb_pending.contains(&row.item_id)
+            {
+                self.request_thumb(cx, row.item_id, row.display_path.clone());
+                budget -= 1;
+            }
+        }
+        let cells: Vec<_> = rows
+            .iter()
             .enumerate()
             .map(|(index, item)| {
                 let outline = if index == current {
@@ -553,10 +820,24 @@ impl Browser {
                 } else {
                     rgb(0x2A2A2A)
                 };
-                let path = item.display_path.clone();
-                let cell_id = item.item_id as usize;
+                let item_id = item.item_id;
+                let badges = Self::cell_badges(item);
+                let art: AnyElement = match self.thumbs.get(&item_id) {
+                    Some(art) => img(Arc::clone(art)).w_full().h(px(44.0)).into_any_element(),
+                    None => div()
+                        .w_full()
+                        .h(px(44.0))
+                        .flex()
+                        .items_center()
+                        .justify_center()
+                        .bg(rgb(0x111111))
+                        .text_xs()
+                        .text_color(rgb(0x999999))
+                        .child(item.base_name.clone())
+                        .into_any_element(),
+                };
                 div()
-                    .id(("strip", cell_id))
+                    .id(("strip", index))
                     .w(px(96.0))
                     .h(px(72.0))
                     .m(px(2.0))
@@ -564,31 +845,22 @@ impl Browser {
                     .border_color(outline)
                     .rounded_sm()
                     .bg(rgb(0x1A1A1A))
-                    .flex()
-                    .items_center()
-                    .justify_center()
-                    .text_xs()
-                    .text_color(rgb(0xAAAAAA))
                     .cursor_pointer()
                     .on_click(cx.listener(move |this, _: &ClickEvent, _, cx| {
-                        let pos = this
-                            .visible()
-                            .iter()
-                            .position(|row| row.display_path == path);
-                        if let Some(pos) = pos {
-                            this.goto(pos, cx);
-                        }
+                        this.goto_item(item_id, cx);
                     }))
-                    .child(item.base_name.clone())
+                    .child(art)
+                    .child(div().text_xs().text_color(rgb(0xAAAAAA)).child(badges))
             })
             .collect();
         div()
             .id("film-strip")
             .w_full()
-            .h(px(84.0))
+            .h(px(96.0))
             .flex()
             .flex_row()
             .overflow_x_scroll()
+            .track_scroll(&self.strip_scroll)
             .bg(rgb(0x141414))
             .children(cells)
     }
@@ -667,6 +939,14 @@ impl Render for Browser {
                     .on_action(cx.listener(|this, _: &PrevRow, _, cx| {
                         this.walk(-(GRID_COLS as isize), false, cx);
                     }))
+                    .on_action(cx.listener(|this, _: &ExtendNext, _, cx| this.walk(1, true, cx)))
+                    .on_action(cx.listener(|this, _: &ExtendPrev, _, cx| this.walk(-1, true, cx)))
+                    .on_action(cx.listener(|this, _: &ExtendNextRow, _, cx| {
+                        this.walk(GRID_COLS as isize, true, cx);
+                    }))
+                    .on_action(cx.listener(|this, _: &ExtendPrevRow, _, cx| {
+                        this.walk(-(GRID_COLS as isize), true, cx);
+                    }))
                     .on_action(cx.listener(|this, _: &ToggleView, _, cx| {
                         this.mode = match this.mode {
                             Mode::Grid => Mode::Single,
@@ -683,7 +963,8 @@ impl Render for Browser {
                         cx.notify();
                     }))
                     .on_action(cx.listener(|this, _: &SelectAllItems, _, cx| {
-                        this.selection.select_all(this.visible().len());
+                        this.selection.select_all(this.rows.len());
+                        this.clamp_to_visible();
                         cx.notify();
                     }))
                     .on_action(cx.listener(|this, _: &Rate0, _, cx| this.set_rating(0, cx)))
@@ -709,13 +990,17 @@ impl Render for Browser {
             .child(
                 StatusBar::new()
                     .left(self.scan_status.clone())
-                    .right(format!("{} shown", self.visible().len())),
+                    .right(format!(
+                        "{} shown · G grid/single · Z fit · ⇧Z 100%",
+                        self.rows.len()
+                    )),
             )
     }
 }
 
 /// Worker body for both browse job kinds. Progress events drive the contact
-/// sheet; the terminal event is sent by the worker loop itself.
+/// sheet; the terminal event is sent by the worker loop itself. The scan
+/// announces its own `(0, fresh_total)` upfront, so no pre-walk is needed.
 pub fn browse_job_handler(
     catalog: Arc<Catalog>,
     job: &edit_catalog::ClaimedJob,
@@ -726,16 +1011,15 @@ pub fn browse_job_handler(
             let payload: CatalogScanPayload = serde_json::from_str(&job.payload_json)
                 .map_err(|e| format!("bad scan payload: {e}"))?;
             let root = PathBuf::from(&payload.root);
-            let total = crate::browse::collect_entries(&root).len() as u64;
             let tx_each = tx.clone();
             let id = job.id;
-            run_catalog_scan(&catalog, &root, &|done, _| {
+            run_catalog_scan(&catalog, &root, &|done, total| {
                 tx_each
                     .send(JobEvent {
                         id,
                         kind: JobEventKind::Progress {
                             done: done as u64,
-                            total,
+                            total: total as u64,
                         },
                     })
                     .ok();
@@ -757,5 +1041,65 @@ pub fn browse_job_handler(
             }
         }
         _ => Ok(()),
+    }
+}
+
+#[cfg(test)]
+mod paint_tests {
+    use super::*;
+
+    fn fit_zoom() -> ZoomState {
+        ZoomState {
+            mode: ZoomMode::Fit,
+            pan_x: 0.0,
+            pan_y: 0.0,
+        }
+    }
+
+    #[::core::prelude::v1::test]
+    fn paint_applies_free_zoom_not_just_fit() {
+        // Regression (review B1 blocking 4): the canvas used to paint the
+        // fit scale even while zoom was in a free/100% state.
+        let viewport = (800.0, 600.0);
+        let frame = (1000.0, 750.0);
+        assert!((fit_zoom().scale_in(frame.0, frame.1, viewport.0, viewport.1) - 0.8).abs() < 1e-6);
+
+        let mut zoomed = fit_zoom();
+        zoomed.mode = ZoomMode::Scale(2.0);
+        assert!((zoomed.scale_in(frame.0, frame.1, viewport.0, viewport.1) - 2.0).abs() < 1e-6);
+        // The paint origin centers the scaled frame, whatever the fit was.
+        let (ox, oy) = paint_origin(frame.0, frame.1, viewport.0, viewport.1, 2.0, zoomed);
+        assert!((ox - (viewport.0 - frame.0 * 2.0) / 2.0).abs() < 1e-6);
+        assert!((oy - (viewport.1 - frame.1 * 2.0) / 2.0).abs() < 1e-6);
+
+        let mut hundred = fit_zoom();
+        hundred.mode = ZoomMode::Hundred;
+        assert!((hundred.scale_in(frame.0, frame.1, viewport.0, viewport.1) - 1.0).abs() < 1e-6);
+    }
+
+    #[::core::prelude::v1::test]
+    fn paint_applies_pan_offsets() {
+        let viewport = (800.0, 600.0);
+        let frame = (1000.0, 750.0);
+        let (cx, cy) = paint_origin(frame.0, frame.1, viewport.0, viewport.1, 0.8, fit_zoom());
+        let mut panned = fit_zoom();
+        panned.pan_x = 0.25;
+        panned.pan_y = -0.5;
+        let (px, py) = paint_origin(frame.0, frame.1, viewport.0, viewport.1, 0.8, panned);
+        assert!((px - (cx + 0.25 * frame.0 * 0.8)).abs() < 1e-6);
+        assert!((py - (cy - 0.5 * frame.1 * 0.8)).abs() < 1e-6);
+    }
+
+    #[::core::prelude::v1::test]
+    fn fit_honors_the_constraining_axis() {
+        // Portrait frame in landscape viewport: fit scales by height.
+        let mut zoom = fit_zoom();
+        assert!((zoom.scale_in(500.0, 1500.0, 1000.0, 1000.0) - 1000.0 / 1500.0).abs() < 1e-6);
+        // Landscape frame in portrait viewport: fit scales by width.
+        assert!((zoom.scale_in(1500.0, 500.0, 1000.0, 1000.0) - 1000.0 / 1500.0).abs() < 1e-6);
+        // Degenerate sizes never divide by zero.
+        assert_eq!(zoom.scale_in(0.0, 1500.0, 1000.0, 1000.0), 1.0);
+        zoom.show_hundred();
+        assert_eq!(zoom.scale_in(500.0, 1500.0, 1000.0, 1000.0), 1.0);
     }
 }

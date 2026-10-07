@@ -4,14 +4,17 @@
 //! Everything here is UI-agnostic so `cargo test` covers it without a
 //! display. The GPUI views in [`crate::views`] render snapshots of these
 //! types; the durable rows stay in `edit-catalog` (migration 001 is frozen,
-//! so this module groups photos in memory instead of adding a store).
+//! so pairing lookups go through the existing stores plus the side-fill
+//! `UPDATE`).
 
+use std::cmp::Ordering;
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
 
-/// Photo file kinds the browser understands.
+/// Photo file kinds the browser understands: raws through the
+/// embedded-preview path, plain stills decoded directly.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub enum PhotoKind {
     Raw,
@@ -21,11 +24,10 @@ pub enum PhotoKind {
 /// Raw extensions served through the embedded-preview path
 /// (`lightcraft-raw`; NEF/ARW/CR2/DNG plus the preview-grade rest).
 pub const RAW_EXTS: &[&str] = &[
-    "NEF", "NRW", "ARW", "SRF", "SR2", "CR2", "CR3", "RAF", "ORF", "RW2", "DNG", "PEF", "TIF",
-    "TIFF",
+    "NEF", "NRW", "ARW", "SRF", "SR2", "CR2", "CR3", "RAF", "ORF", "RW2", "DNG", "PEF",
 ];
-/// Plain display files decoded directly.
-pub const JPEG_EXTS: &[&str] = &["JPG", "JPEG"];
+/// Plain stills decoded directly (JPEG photos and TIFFs).
+pub const PLAIN_EXTS: &[&str] = &["JPG", "JPEG", "TIF", "TIFF"];
 
 /// Classify a file by extension (case-insensitive). `None` means skipped.
 pub fn classify_file(path: &Path) -> Option<PhotoKind> {
@@ -35,7 +37,7 @@ pub fn classify_file(path: &Path) -> Option<PhotoKind> {
         .map(|e| e.to_ascii_uppercase())?;
     if RAW_EXTS.contains(&ext.as_str()) {
         Some(PhotoKind::Raw)
-    } else if JPEG_EXTS.contains(&ext.as_str()) {
+    } else if PLAIN_EXTS.contains(&ext.as_str()) {
         Some(PhotoKind::Jpeg)
     } else {
         None
@@ -92,7 +94,9 @@ fn entry_for(path: PathBuf) -> Option<FileEntry> {
 }
 
 /// Recursively collect supported files under `root`, sorted by path so scans
-/// are deterministic and progress events read in order.
+/// are deterministic and progress events read in order. Symlinked
+/// directories are never descended into (a link cycle would loop forever);
+/// symlinked files are still collected under the link path.
 pub fn collect_entries(root: &Path) -> Vec<FileEntry> {
     let mut out = Vec::new();
     let mut stack = vec![root.to_path_buf()];
@@ -104,6 +108,12 @@ pub fn collect_entries(root: &Path) -> Vec<FileEntry> {
         let mut children: Vec<PathBuf> = read.filter_map(|e| e.ok().map(|e| e.path())).collect();
         children.sort();
         for child in children.into_iter().rev() {
+            let is_link = std::fs::symlink_metadata(&child)
+                .map(|meta| meta.file_type().is_symlink())
+                .unwrap_or(false);
+            if is_link && child.is_dir() {
+                continue;
+            }
             if child.is_dir() {
                 stack.push(child);
             } else if let Some(entry) = entry_for(child) {
@@ -113,6 +123,13 @@ pub fn collect_entries(root: &Path) -> Vec<FileEntry> {
     }
     out.sort_by(|a, b| a.path.cmp(&b.path));
     out
+}
+
+/// Pair key for grouping files into contact-sheet cells: the directory
+/// verbatim (case-sensitive on Linux) plus a case-folded stem, so
+/// `DSC0001.NEF` and `dsc0001.JPG` land in one cell.
+pub fn pair_key(dir: &str, base_name: &str) -> (String, String) {
+    (dir.to_string(), base_name.to_lowercase())
 }
 
 /// One contact-sheet cell: a RAW+JPEG pair (or lone file) sharing
@@ -125,21 +142,61 @@ pub struct PairGroup {
     pub jpeg: Option<FileEntry>,
 }
 
-/// Group entries into pair groups. Later files win within one side; groups
-/// sort by `(dir, base_name)`.
+/// Group entries into pair groups. The first file per side wins the pair
+/// slot; a second file on the same side (e.g. `DSC1.NEF` plus `DSC1.ARW`)
+/// becomes its own lone cell keyed `{stem} ({ext})` instead of silently
+/// dropping a photo. Groups sort by the folded pair key.
+///
+/// The `{stem} ({ext})` key can theoretically collide with a real file of
+/// that stem (e.g. `DSC1 (ARW).NEF`); both would then share one cell. No
+/// photo is lost either way.
 pub fn pair_entries(entries: Vec<FileEntry>) -> Vec<PairGroup> {
     let mut map: BTreeMap<(String, String), PairGroup> = BTreeMap::new();
     for entry in entries {
-        let key = (entry.dir.clone(), entry.base_name.clone());
+        let key = pair_key(&entry.dir, &entry.base_name);
         let group = map.entry(key).or_insert_with(|| PairGroup {
             dir: entry.dir.clone(),
             base_name: entry.base_name.clone(),
             raw: None,
             jpeg: None,
         });
-        match entry.kind {
-            PhotoKind::Raw => group.raw = Some(entry),
-            PhotoKind::Jpeg => group.jpeg = Some(entry),
+        let slot = match entry.kind {
+            PhotoKind::Raw => &mut group.raw,
+            PhotoKind::Jpeg => &mut group.jpeg,
+        };
+        if slot.is_none() {
+            *slot = Some(entry);
+        } else {
+            // Same-side collision: first free `{stem} ({ext}[ n])` key wins
+            // its own lone cell, so no photo is ever silently dropped.
+            let mut n = 0;
+            loop {
+                let lone_base = if n == 0 {
+                    format!("{} ({})", entry.base_name, entry.ext.to_ascii_uppercase())
+                } else {
+                    format!(
+                        "{} ({} {n})",
+                        entry.base_name,
+                        entry.ext.to_ascii_uppercase()
+                    )
+                };
+                n += 1;
+                let lone_key = pair_key(&entry.dir, &lone_base);
+                let lone = map.entry(lone_key).or_insert_with(|| PairGroup {
+                    dir: entry.dir.clone(),
+                    base_name: lone_base.clone(),
+                    raw: None,
+                    jpeg: None,
+                });
+                let lone_slot = match entry.kind {
+                    PhotoKind::Raw => &mut lone.raw,
+                    PhotoKind::Jpeg => &mut lone.jpeg,
+                };
+                if lone_slot.is_none() {
+                    *lone_slot = Some(entry);
+                    break;
+                }
+            }
         }
     }
     map.into_values().collect()
@@ -220,13 +277,17 @@ pub enum SortOrder {
     FileName,
 }
 
+/// Filename order over string refs: one comparator shared by every sort
+/// site, so the grid and the filter helper can never disagree.
+pub fn cmp_item_key(a: &BrowseItem, b: &BrowseItem) -> Ordering {
+    (&a.dir, &a.base_name).cmp(&(&b.dir, &b.base_name))
+}
+
 impl SortOrder {
     pub fn apply(&self, items: &mut [BrowseItem]) {
         match self {
             Self::IngestOrder => items.sort_by_key(|item| item.item_id),
-            Self::FileName => items.sort_by(|a, b| {
-                (a.dir.clone(), a.base_name.clone()).cmp(&(b.dir.clone(), b.base_name.clone()))
-            }),
+            Self::FileName => items.sort_by(cmp_item_key),
         }
     }
 }
@@ -257,9 +318,7 @@ pub fn apply_filter_sort<'a>(
         .collect();
     match sort {
         SortOrder::IngestOrder => picked.sort_by_key(|item| item.item_id),
-        SortOrder::FileName => picked.sort_by(|a, b| {
-            (a.dir.clone(), a.base_name.clone()).cmp(&(b.dir.clone(), b.base_name.clone()))
-        }),
+        SortOrder::FileName => picked.sort_by(|a, b| cmp_item_key(a, b)),
     }
     picked
 }
@@ -343,6 +402,15 @@ impl SelectionModel {
 
     pub fn select_all(&mut self, len: usize) {
         self.selected = (0..len).collect();
+        // Keep the cursor where it was (or 0 when empty) and re-anchor
+        // there, so a later Shift+arrow extends from the visible focus
+        // instead of a stale position.
+        if len == 0 {
+            self.cursor = 0;
+        } else {
+            self.cursor = self.cursor.min(len - 1);
+        }
+        self.anchor = self.cursor;
     }
 
     pub fn contains(&self, index: usize) -> bool {
@@ -392,9 +460,27 @@ impl ZoomState {
         }
     }
 
-    pub fn scroll_zoom(&mut self, factor: f32) {
+    /// Paint scale for a frame in a viewport, using both dimensions so the
+    /// Fit state honors the constraining axis (portrait frames fit by
+    /// height, not by width). Free/Hundred scales are absolute and
+    /// viewport-independent — the paint closure must apply them (review B1).
+    pub fn scale_in(&self, frame_w: f32, frame_h: f32, vw: f32, vh: f32) -> f32 {
+        if frame_w <= 0.0 || frame_h <= 0.0 || vw <= 0.0 || vh <= 0.0 {
+            return 1.0;
+        }
+        match self.mode {
+            ZoomMode::Fit => (vw / frame_w).min(vh / frame_h),
+            ZoomMode::Hundred => 1.0,
+            ZoomMode::Scale(s) => s.max(0.05),
+        }
+    }
+
+    /// Zoom one scroll notch by `factor`. A Fit view enters a free scale
+    /// from `fit_scale` (the scale the canvas is currently painting at) so
+    /// scroll-zoom works from every mode instead of no-oping on Fit.
+    pub fn scroll_zoom(&mut self, factor: f32, fit_scale: f32) {
         let current = match self.mode {
-            ZoomMode::Fit => return,
+            ZoomMode::Fit => fit_scale.max(0.05),
             ZoomMode::Hundred => 1.0,
             ZoomMode::Scale(s) => s,
         };
@@ -442,10 +528,20 @@ pub struct ThumbPayload {
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct ScanSummary {
     pub root_id: i64,
+    /// Files on disk that belong in the catalog (fresh + already known).
     pub files_seen: usize,
     pub photos_added: usize,
     pub items_touched: usize,
     pub thumb_jobs: usize,
+    /// Files skipped because their path is already cataloged (rescan,
+    /// duplicate root spellings, or a cross-root collision).
+    pub skipped_existing: usize,
+}
+
+/// Canonicalize a folder for catalog identity: `photos/` and `photos`
+/// resolve to one root row instead of two competing roots.
+pub fn canonical_root(path: &Path) -> PathBuf {
+    path.canonicalize().unwrap_or_else(|_| path.to_path_buf())
 }
 
 /// Scan `root_path` into the catalog: one `folder` root, photo rows, pair
@@ -453,14 +549,16 @@ pub struct ScanSummary {
 ///
 /// Idempotent: files already cataloged under this root are skipped, so a
 /// second scan (or a restarted `catalog_scan` job) only adds newcomers.
-/// `on_file` fires per new file so the job handler can emit
-/// `JobEventKind::Progress` and live-update the UI.
+/// `on_file` fires first with `(0, fresh_total)` so the worker can report a
+/// correct total without a redundant pre-walk, then per new file so the job
+/// handler can emit `JobEventKind::Progress` and live-update the UI.
 pub fn run_catalog_scan(
     catalog: &edit_catalog::Catalog,
     root_path: &Path,
     on_file: &dyn Fn(usize, usize),
 ) -> Result<ScanSummary, edit_catalog::Error> {
-    let root_str = root_path.to_string_lossy().into_owned();
+    let canon = canonical_root(root_path);
+    let root_str = canon.to_string_lossy().into_owned();
     let root_id = match catalog.get_root_by_path(&root_str)? {
         Some(root) => root.id,
         None => catalog.insert_root(&root_str, "folder")?,
@@ -471,11 +569,12 @@ pub fn run_catalog_scan(
         .map(|photo| photo.path)
         .collect();
 
-    let fresh: Vec<FileEntry> = collect_entries(root_path)
+    let fresh: Vec<FileEntry> = collect_entries(&canon)
         .into_iter()
         .filter(|entry| !known.contains(&entry.path.to_string_lossy().into_owned()))
         .collect();
     let total = fresh.len();
+    on_file(0, total);
     let groups = pair_entries(fresh);
 
     let mut summary = ScanSummary {
@@ -485,8 +584,9 @@ pub fn run_catalog_scan(
     };
     let mut done = 0usize;
     for group in groups.iter() {
-        let mut raw_id = None;
-        let mut jpeg_id = None;
+        // Insert the fresh sides, tolerating paths that are already
+        // cataloged (unique violation) instead of aborting the scan.
+        let mut inserted: Vec<(&FileEntry, i64)> = Vec::new();
         for entry in [group.raw.as_ref(), group.jpeg.as_ref()]
             .into_iter()
             .flatten()
@@ -495,7 +595,7 @@ pub fn run_catalog_scan(
                 PhotoKind::Raw => "raw",
                 PhotoKind::Jpeg => "jpeg",
             };
-            let photo_id = catalog.insert_photo(&edit_catalog::models::NewPhoto {
+            match catalog.insert_photo(&edit_catalog::models::NewPhoto {
                 root_id,
                 path: entry.path.to_string_lossy().into_owned(),
                 dir: entry.dir.clone(),
@@ -504,28 +604,55 @@ pub fn run_catalog_scan(
                 kind: kind_str.to_string(),
                 bytes: entry.bytes as i64,
                 mtime: entry.mtime,
-            })?;
-            match entry.kind {
-                PhotoKind::Raw => raw_id = Some(photo_id),
-                PhotoKind::Jpeg => jpeg_id = Some(photo_id),
+            }) {
+                Ok(photo_id) => {
+                    inserted.push((entry, photo_id));
+                    summary.photos_added += 1;
+                    let payload = serde_json::to_string(&ThumbPayload {
+                        photo_id,
+                        path: entry.path.to_string_lossy().into_owned(),
+                    })
+                    .unwrap_or_else(|_| "{}".to_string());
+                    catalog.enqueue_job(edit_catalog::JobKind::Thumb, &payload)?;
+                    summary.thumb_jobs += 1;
+                    done += 1;
+                    on_file(done, total);
+                }
+                Err(e) if e.is_unique_violation() => {
+                    summary.skipped_existing += 1;
+                }
+                Err(e) => return Err(e),
             }
-            summary.photos_added += 1;
-            let payload = serde_json::to_string(&ThumbPayload {
-                photo_id,
-                path: entry.path.to_string_lossy().into_owned(),
-            })
-            .unwrap_or_else(|_| "{}".to_string());
-            catalog.enqueue_job(edit_catalog::JobKind::Thumb, &payload)?;
-            summary.thumb_jobs += 1;
-            done += 1;
-            on_file(done, total);
         }
-        // Pair grain: reuse the existing item row when a rescan completes a
-        // half-pair, else insert the new pair cell.
-        match catalog.get_item_by_dir_base(&group.dir, &group.base_name)? {
-            Some(_) => {}
+        if inserted.is_empty() {
+            continue;
+        }
+        // Pair grain: item rows are keyed by the folded pair key, so
+        // `DSC0001.NEF` and `dsc0001.JPG` share one cell even across
+        // rescans. A rescan filling a half-pair lands in `set_item_side`;
+        // otherwise the new pair cell is inserted.
+        let folded_base = pair_key(&group.dir, &group.base_name).1;
+        match catalog.get_item_by_dir_base(&group.dir, &folded_base)? {
             None => {
-                catalog.insert_item(&group.dir, &group.base_name, raw_id, jpeg_id)?;
+                let (raw_id, jpeg_id) = inserted_ids(&inserted);
+                catalog.insert_item(&group.dir, &folded_base, raw_id, jpeg_id)?;
+            }
+            Some(item) => {
+                for (entry, photo_id) in &inserted {
+                    let (occupied, raw_flag) = match entry.kind {
+                        PhotoKind::Raw => (item.raw_photo_id, true),
+                        PhotoKind::Jpeg => (item.jpeg_photo_id, false),
+                    };
+                    match occupied {
+                        None => catalog.set_item_side(item.id, *photo_id, raw_flag)?,
+                        Some(_) => {
+                            // Side already held (same folded stem, distinct
+                            // file, e.g. a case-variant duplicate added
+                            // later): the newcomer rides the existing cell,
+                            // so there is nothing to update.
+                        }
+                    }
+                }
             }
         }
         summary.items_touched += 1;
@@ -533,8 +660,23 @@ pub fn run_catalog_scan(
     Ok(summary)
 }
 
+/// Split freshly inserted photo ids back into item sides.
+fn inserted_ids(inserted: &[(&FileEntry, i64)]) -> (Option<i64>, Option<i64>) {
+    let mut raw_id = None;
+    let mut jpeg_id = None;
+    for (entry, id) in inserted {
+        match entry.kind {
+            PhotoKind::Raw => raw_id = Some(*id),
+            PhotoKind::Jpeg => jpeg_id = Some(*id),
+        }
+    }
+    (raw_id, jpeg_id)
+}
+
 /// Rebuild browse snapshots for a root: photos regrouped into pair cells
-/// with item ids resolved through the `items` table.
+/// on the folded pair key, with item ids resolved through the `items` table
+/// (keyed folded since the case-folding fix). Display names stay verbatim
+/// from the photo rows (JPEG side preferred).
 pub fn list_browse_items(
     catalog: &edit_catalog::Catalog,
     root_id: i64,
@@ -543,28 +685,31 @@ pub fn list_browse_items(
     let mut groups: BTreeMap<(String, String), Vec<&edit_catalog::models::Photo>> = BTreeMap::new();
     for photo in &photos {
         groups
-            .entry((photo.dir.clone(), photo.base_name.clone()))
+            .entry(pair_key(&photo.dir, &photo.base_name))
             .or_default()
             .push(photo);
     }
     let mut items = Vec::with_capacity(groups.len());
-    for ((dir, base_name), members) in groups {
+    for ((dir, folded), members) in groups {
         let item_id = catalog
-            .get_item_by_dir_base(&dir, &base_name)?
+            .get_item_by_dir_base(&dir, &folded)?
             .map(|item| item.id)
             .unwrap_or(-1);
         let has_raw = members.iter().any(|p| p.kind == "raw");
         let has_jpeg = members.iter().any(|p| p.kind == "jpeg");
-        let display_path = members
+        let display = members
             .iter()
             .find(|p| p.kind == "jpeg")
-            .or_else(|| members.first())
-            .map(|p| p.path.clone())
-            .unwrap_or_default();
+            .or_else(|| members.first());
+        let display_path = display.map(|p| p.path.clone()).unwrap_or_default();
+        let base_name = display
+            .map(|p| p.base_name.clone())
+            .unwrap_or_else(|| folded.clone());
+        let member_dir = display.map(|p| p.dir.clone()).unwrap_or(dir);
         let rating = members.iter().map(|p| p.rating).max().unwrap_or(0);
         items.push(BrowseItem {
             item_id,
-            dir,
+            dir: member_dir,
             base_name,
             display_path,
             has_raw,
@@ -630,6 +775,15 @@ mod tests {
             classify_file(Path::new("/a/photo.jpg")),
             Some(PhotoKind::Jpeg)
         );
+        // TIFFs decode directly on the plain side, never via raw.
+        assert_eq!(
+            classify_file(Path::new("/a/scan.tif")),
+            Some(PhotoKind::Jpeg)
+        );
+        assert_eq!(
+            classify_file(Path::new("/a/scan.TIFF")),
+            Some(PhotoKind::Jpeg)
+        );
         assert_eq!(classify_file(Path::new("/a/photo.png")), None);
         assert_eq!(classify_file(Path::new("/a/notes.txt")), None);
     }
@@ -669,6 +823,49 @@ mod tests {
     }
 
     #[test]
+    fn pairing_folds_case() {
+        // DSC0001.NEF + dsc0001.JPG share one cell despite the case gap.
+        let dir = scratch_dir("pair-case");
+        touch(&dir, "DSC0001.NEF");
+        touch(&dir, "dsc0001.JPG");
+        let groups = pair_entries(collect_entries(&dir));
+        assert_eq!(groups.len(), 1);
+        let group = &groups[0];
+        assert!(group.raw.is_some() && group.jpeg.is_some());
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn same_side_collision_becomes_a_lone_cell() {
+        // DSC1.NEF + DSC1.ARW: no photo is dropped; the loser keeps its own
+        // lone cell.
+        let dir = scratch_dir("pair-collision");
+        touch(&dir, "DSC1.NEF");
+        touch(&dir, "DSC1.ARW");
+        let groups = pair_entries(collect_entries(&dir));
+        assert_eq!(groups.len(), 2);
+        let raws: usize = groups.iter().map(|g| usize::from(g.raw.is_some())).sum();
+        assert_eq!(raws, 2);
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn symlinked_dirs_are_not_descended_into() {
+        use std::os::unix::fs::symlink;
+        let dir = scratch_dir("pair-symlink");
+        let real = dir.join("real");
+        std::fs::create_dir_all(&real).unwrap();
+        touch(&real, "A.JPG");
+        symlink(&real, dir.join("link")).unwrap();
+        symlink(&dir, real.join("cycle")).unwrap();
+        // One photo, seen once: no double counts, no infinite loop.
+        let entries = collect_entries(&dir);
+        assert_eq!(entries.len(), 1);
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
     fn scan_inserts_pairs_and_thumb_jobs_then_rescans_clean() {
         let dir = scratch_dir("scan");
         touch(&dir, "A.NEF");
@@ -686,7 +883,10 @@ mod tests {
         assert_eq!(summary.items_touched, 2);
         assert_eq!(summary.thumb_jobs, 3);
         assert_eq!(summary.files_seen, 3);
-        assert!(!progress.borrow().is_empty());
+        assert_eq!(summary.skipped_existing, 0);
+        // The total is announced upfront, so workers never need a pre-walk.
+        assert_eq!(progress.borrow().first(), Some(&(0, 3)));
+        assert_eq!(progress.borrow().last(), Some(&(3, 3)));
 
         let items = list_browse_items(&catalog, summary.root_id).unwrap();
         assert_eq!(items.len(), 2);
@@ -698,6 +898,44 @@ mod tests {
         let again = run_catalog_scan(&catalog, &dir, &|_, _| {}).unwrap();
         assert_eq!(again.photos_added, 0);
         assert_eq!(again.thumb_jobs, 0);
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn rescan_completes_a_half_pair_in_place() {
+        // RAW first, JPEG later: one item row gains its second side instead
+        // of a duplicate cell.
+        let dir = scratch_dir("scan-halfpair");
+        touch(&dir, "H.NEF");
+        let db_path = dir.join("catalog.sqlite");
+        let catalog = edit_catalog::Catalog::open(&db_path).unwrap();
+        let first = run_catalog_scan(&catalog, &dir, &|_, _| {}).unwrap();
+        assert_eq!(list_browse_items(&catalog, first.root_id).unwrap().len(), 1);
+
+        touch(&dir, "h.JPG");
+        let second = run_catalog_scan(&catalog, &dir, &|_, _| {}).unwrap();
+        assert_eq!(second.root_id, first.root_id);
+        assert_eq!(second.photos_added, 1);
+        let items = list_browse_items(&catalog, second.root_id).unwrap();
+        assert_eq!(items.len(), 1);
+        assert!(items[0].has_raw && items[0].has_jpeg);
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn root_spellings_share_one_root_row() {
+        // `dir` and `dir/` canonicalize to the same root: the second scan
+        // adds nothing instead of duplicating the folder.
+        let dir = scratch_dir("scan-canon");
+        tiny_jpeg(&dir, "C.JPG");
+        let db_path = dir.join("catalog.sqlite");
+        let catalog = edit_catalog::Catalog::open(&db_path).unwrap();
+        let first = run_catalog_scan(&catalog, &dir, &|_, _| {}).unwrap();
+        let slashed = PathBuf::from(format!("{}/", dir.to_string_lossy()));
+        let second = run_catalog_scan(&catalog, &slashed, &|_, _| {}).unwrap();
+        assert_eq!(second.root_id, first.root_id);
+        assert_eq!(second.photos_added, 0);
+        assert_eq!(catalog.list_roots().unwrap().len(), 1);
         std::fs::remove_dir_all(&dir).ok();
     }
 
@@ -778,8 +1016,19 @@ mod tests {
         assert_eq!((sel.cursor, sel.selected.len()), (1, 1));
         sel.move_cursor(1, true, 3);
         assert_eq!(sel.selected.len(), 2);
+        // Shift+arrows extend from the anchor instead of collapsing.
+        let mut anchored = SelectionModel::new(5);
+        anchored.move_cursor(2, false, 5);
+        anchored.move_cursor(-1, true, 5);
+        assert_eq!(anchored.selected, BTreeSet::from([1, 2]));
+        assert_eq!((anchored.cursor, anchored.anchor), (1, 2));
         sel.select_all(3);
         assert_eq!(sel.selected.len(), 3);
+        // Select-all re-anchors at the cursor, so the next Shift+arrow
+        // extends from the visible focus.
+        assert_eq!(sel.anchor, sel.cursor);
+        sel.move_cursor(-1, true, 3);
+        assert!(sel.selected.contains(&sel.cursor) && sel.selected.contains(&sel.anchor));
         sel.select_single(2, 3);
         assert!(sel.contains(2) && !sel.contains(0));
         sel.clamp(1);
@@ -792,7 +1041,13 @@ mod tests {
         assert_eq!(zoom.scale_for(100.0, 200.0), 2.0);
         zoom.show_hundred();
         assert_eq!(zoom.scale_for(100.0, 200.0), 1.0);
-        zoom.scroll_zoom(2.0);
+        // Scroll-zoom from Fit enters a free scale from the painted fit
+        // scale instead of ignoring the gesture.
+        zoom.reset();
+        zoom.scroll_zoom(2.0, 0.5);
+        assert_eq!(zoom.mode, ZoomMode::Scale(1.0));
+        zoom.scroll_zoom(2.0, 0.5);
+        assert_eq!(zoom.mode, ZoomMode::Scale(2.0));
         assert!(zoom.scale_for(50.0, 100.0) > 1.0);
         zoom.drag_pan(0.2, -0.3);
         zoom.reset();
