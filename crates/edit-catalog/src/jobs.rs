@@ -303,6 +303,21 @@ impl Catalog {
         })
     }
 
+    /// Queued or running `ingest_copy` jobs. The app rebuilds its card/job
+    /// routing from these on startup, so a crash-resumed ingest is visible.
+    pub fn list_active_ingest_jobs(&self) -> Result<Vec<Job>> {
+        self.with_conn(|conn| {
+            let mut stmt = conn.prepare(
+                "SELECT id, kind, payload_json, state, attempts, error, created_at, updated_at
+                   FROM jobs WHERE kind = 'ingest_copy' AND state IN ('queued', 'running')
+                   ORDER BY id",
+            )?;
+            Ok(stmt
+                .query_map([], row_job)?
+                .collect::<rusqlite::Result<_>>()?)
+        })
+    }
+
     /// Newest jobs first, at most `limit`.
     pub fn list_jobs(&self, limit: i64) -> Result<Vec<Job>> {
         self.with_conn(|conn| {

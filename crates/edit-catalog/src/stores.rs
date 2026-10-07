@@ -3,6 +3,8 @@
 //! Reads return [`crate::models`] rows; writes take plain parameters (or a
 //! `New*` struct for wide tables). Timestamps use [`crate::db::now_unix`].
 
+use std::str::FromStr;
+
 use rusqlite::{OptionalExtension, Row, params};
 
 use crate::db::{Catalog, now_unix};
@@ -45,6 +47,7 @@ fn row_photo(row: &Row) -> rusqlite::Result<Photo> {
         color_label: row.get(20)?,
         ingest_batch_id: row.get(21)?,
         created_at: row.get(22)?,
+        original_name: row.get(23)?,
     })
 }
 
@@ -188,6 +191,42 @@ fn row_batch(row: &Row) -> rusqlite::Result<IngestBatch> {
     })
 }
 
+fn row_ingest_file(row: &Row) -> rusqlite::Result<IngestFile> {
+    let state: String = row.get(10)?;
+    let state = edit_core::IngestFileState::from_str(&state).map_err(|_| {
+        rusqlite::Error::FromSqlConversionFailure(
+            10,
+            rusqlite::types::Type::Text,
+            state.clone().into(),
+        )
+    })?;
+    Ok(IngestFile {
+        id: row.get(0)?,
+        batch_id: row.get(1)?,
+        original_name: row.get(2)?,
+        taken_at: row.get(3)?,
+        bytes: row.get(4)?,
+        source_path: row.get(5)?,
+        dest_path: row.get(6)?,
+        backup_path: row.get(7)?,
+        blake3: row.get(8)?,
+        photo_id: row.get(9)?,
+        state,
+        error: row.get(11)?,
+        created_at: row.get(12)?,
+    })
+}
+
+/// The column list shared by every ingest-file SELECT, in [`row_ingest_file`]
+/// order.
+const INGEST_FILE_COLUMNS: &str = "id, batch_id, original_name, taken_at, bytes, source_path, \
+                                   dest_path, backup_path, blake3, photo_id, state, error, created_at";
+
+/// The column list shared by every photo SELECT, in [`row_photo`] order.
+const PHOTO_COLUMNS: &str = "id, root_id, path, dir, base_name, ext, kind, bytes, mtime, width, \
+                             height, orientation, taken_at, camera, lens, iso, aperture, shutter, \
+                             focal, rating, color_label, ingest_batch_id, created_at, original_name";
+
 fn not_found(what: &str, id: i64) -> Error {
     Error::NotFound(format!("{what} {id}"))
 }
@@ -202,6 +241,23 @@ impl Catalog {
                 params![path, kind, now_unix()],
             )?;
             Ok(conn.last_insert_rowid())
+        })
+    }
+
+    /// Get or create the root for `path`, racing safely: a concurrent insert
+    /// is ignored and the existing row is re-selected. Two parallel ingest
+    /// jobs on a fresh destination must not abort on the `path` UNIQUE key.
+    pub fn ensure_root(&self, path: &str, kind: &str) -> Result<i64> {
+        self.with_conn(|conn| {
+            conn.execute(
+                "INSERT OR IGNORE INTO roots (path, kind, added_at) VALUES (?1, ?2, ?3)",
+                params![path, kind, now_unix()],
+            )?;
+            Ok(
+                conn.query_row("SELECT id FROM roots WHERE path = ?1", [path], |row| {
+                    row.get(0)
+                })?,
+            )
         })
     }
 
@@ -244,8 +300,10 @@ impl Catalog {
     pub fn insert_photo(&self, photo: &NewPhoto) -> Result<i64> {
         self.with_conn(|conn| {
             conn.execute(
-                "INSERT INTO photos (root_id, path, dir, base_name, ext, kind, bytes, mtime, created_at)
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
+                "INSERT INTO photos
+                   (root_id, path, dir, base_name, ext, kind, bytes, mtime, created_at,
+                    original_name, taken_at)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)",
                 params![
                     photo.root_id,
                     photo.path,
@@ -255,7 +313,9 @@ impl Catalog {
                     photo.kind,
                     photo.bytes,
                     photo.mtime,
-                    now_unix()
+                    now_unix(),
+                    photo.original_name,
+                    photo.taken_at
                 ],
             )?;
             Ok(conn.last_insert_rowid())
@@ -264,15 +324,35 @@ impl Catalog {
 
     pub fn get_photo(&self, id: i64) -> Result<Photo> {
         self.with_conn(|conn| {
-            conn.query_row("SELECT id, root_id, path, dir, base_name, ext, kind, bytes, mtime, width, height, orientation, taken_at, camera, lens, iso, aperture, shutter, focal, rating, color_label, ingest_batch_id, created_at FROM photos WHERE id = ?1", [id], row_photo)
-                .optional()?
-                .ok_or_else(|| not_found("photo", id))
+            conn.query_row(
+                &format!("SELECT {PHOTO_COLUMNS} FROM photos WHERE id = ?1"),
+                [id],
+                row_photo,
+            )
+            .optional()?
+            .ok_or_else(|| not_found("photo", id))
+        })
+    }
+
+    /// Look up a photo by its unique path (recovery after a crash between
+    /// insert and the ingest-file completion).
+    pub fn get_photo_by_path(&self, path: &str) -> Result<Option<Photo>> {
+        self.with_conn(|conn| {
+            Ok(conn
+                .query_row(
+                    &format!("SELECT {PHOTO_COLUMNS} FROM photos WHERE path = ?1"),
+                    [path],
+                    row_photo,
+                )
+                .optional()?)
         })
     }
 
     pub fn list_photos_by_root(&self, root_id: i64) -> Result<Vec<Photo>> {
         self.with_conn(|conn| {
-            let mut stmt = conn.prepare("SELECT id, root_id, path, dir, base_name, ext, kind, bytes, mtime, width, height, orientation, taken_at, camera, lens, iso, aperture, shutter, focal, rating, color_label, ingest_batch_id, created_at FROM photos WHERE root_id = ?1 ORDER BY id")?;
+            let mut stmt = conn.prepare(&format!(
+                "SELECT {PHOTO_COLUMNS} FROM photos WHERE root_id = ?1 ORDER BY id"
+            ))?;
             Ok(stmt
                 .query_map([root_id], row_photo)?
                 .collect::<rusqlite::Result<_>>()?)
@@ -289,6 +369,31 @@ impl Catalog {
                 return Err(not_found("photo", id));
             }
             Ok(())
+        })
+    }
+
+    /// Duplicate lookup on (original name, capture time, size) over catalog
+    /// photo rows. Covers files cataloged outside the ingest history; rows
+    /// with no `original_name` (e.g. a plain folder scan before C2) never
+    /// match.
+    pub fn find_photo_duplicate(
+        &self,
+        original_name: &str,
+        taken_at: Option<i64>,
+        bytes: i64,
+    ) -> Result<Option<Photo>> {
+        self.with_conn(|conn| {
+            Ok(conn
+                .query_row(
+                    &format!(
+                        "SELECT {PHOTO_COLUMNS} FROM photos
+                          WHERE original_name = ?1 AND taken_at IS ?2 AND bytes = ?3
+                          ORDER BY id LIMIT 1"
+                    ),
+                    params![original_name, taken_at, bytes],
+                    row_photo,
+                )
+                .optional()?)
         })
     }
 
@@ -861,6 +966,180 @@ impl Catalog {
         })
     }
 
+    /// Batches currently in one state (used to rebuild the dialog's card
+    /// progress after a crash-resume).
+    pub fn list_ingest_batches_by_state(&self, state: &str) -> Result<Vec<IngestBatch>> {
+        Self::check_ingest_batch_state(state)?;
+        self.with_conn(|conn| {
+            let mut stmt = conn.prepare(
+                "SELECT id, volume_uuid, volume_label, session_name, dest_dir, backup_dir,
+                        template_id, state, started_at, finished_at
+                   FROM ingest_batches WHERE state = ?1 ORDER BY id",
+            )?;
+            Ok(stmt
+                .query_map([state], row_batch)?
+                .collect::<rusqlite::Result<_>>()?)
+        })
+    }
+
+    /// Open an ingest batch with its volume, session and backup context.
+    pub fn create_ingest_batch(&self, batch: &NewIngestBatch) -> Result<i64> {
+        Self::check_ingest_batch_state(&batch.state)?;
+        self.with_conn(|conn| {
+            conn.execute(
+                "INSERT INTO ingest_batches
+                   (volume_uuid, volume_label, session_name, dest_dir, backup_dir, template_id, state, started_at)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+                params![
+                    batch.volume_uuid,
+                    batch.volume_label,
+                    batch.session_name,
+                    batch.dest_dir,
+                    batch.backup_dir,
+                    batch.template_id,
+                    batch.state,
+                    now_unix()
+                ],
+            )?;
+            Ok(conn.last_insert_rowid())
+        })
+    }
+
+    // ---- ingest files ----
+
+    /// Record one file entering the pipeline (state `Queued` normally).
+    pub fn record_ingest_file(&self, file: &NewIngestFile) -> Result<i64> {
+        self.with_conn(|conn| {
+            conn.execute(
+                "INSERT INTO ingest_files
+                   (batch_id, original_name, taken_at, bytes, source_path, state, created_at)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+                params![
+                    file.batch_id,
+                    file.original_name,
+                    file.taken_at,
+                    file.bytes,
+                    file.source_path,
+                    file.state.as_str(),
+                    now_unix()
+                ],
+            )?;
+            Ok(conn.last_insert_rowid())
+        })
+    }
+
+    /// Move one ingest file to a new state, without touching the verification
+    /// fields. Used for the copy/verify/backup/rename progress steps and for
+    /// terminal `Duplicate`/`Failed` markings.
+    pub fn set_ingest_file_state(
+        &self,
+        id: i64,
+        state: edit_core::IngestFileState,
+        error: Option<&str>,
+    ) -> Result<()> {
+        self.with_conn(|conn| {
+            let n = conn.execute(
+                "UPDATE ingest_files SET state = ?1, error = ?2 WHERE id = ?3",
+                params![state.as_str(), error, id],
+            )?;
+            if n == 0 {
+                return Err(not_found("ingest_file", id));
+            }
+            Ok(())
+        })
+    }
+
+    /// Persist the landed paths and verified hash right after the rename,
+    /// before the catalog insert. A crash between here and
+    /// [`Catalog::complete_ingest_file`] leaves a `Renaming` row with enough
+    /// information to recover instead of re-copying (plan C2 review).
+    pub fn mark_ingest_file_landed(
+        &self,
+        id: i64,
+        dest_path: &str,
+        backup_path: Option<&str>,
+        blake3: &str,
+    ) -> Result<()> {
+        self.with_conn(|conn| {
+            let n = conn.execute(
+                "UPDATE ingest_files
+                    SET state = 'renaming', dest_path = ?1, backup_path = ?2, blake3 = ?3
+                  WHERE id = ?4",
+                params![dest_path, backup_path, blake3, id],
+            )?;
+            if n == 0 {
+                return Err(not_found("ingest_file", id));
+            }
+            Ok(())
+        })
+    }
+
+    /// Mark a file cataloged, recording the verified hash, the landed paths,
+    /// and the inserted photo row.
+    pub fn complete_ingest_file(
+        &self,
+        id: i64,
+        dest_path: &str,
+        backup_path: Option<&str>,
+        blake3: &str,
+        photo_id: Option<i64>,
+    ) -> Result<()> {
+        self.with_conn(|conn| {
+            let n = conn.execute(
+                "UPDATE ingest_files
+                    SET state = 'cataloged', dest_path = ?1, backup_path = ?2,
+                        blake3 = ?3, photo_id = ?4, error = NULL
+                  WHERE id = ?5",
+                params![dest_path, backup_path, blake3, photo_id, id],
+            )?;
+            if n == 0 {
+                return Err(not_found("ingest_file", id));
+            }
+            Ok(())
+        })
+    }
+
+    /// Newest ingest-history row for the duplicate triple (original name,
+    /// capture time, size), in any state except `failed`.
+    ///
+    /// A `Cataloged` row is a true duplicate; a `Renaming`/`Backup` row with
+    /// landed paths is a crash-interrupted copy the caller can resume instead
+    /// of re-landing a second file. `taken_at` matches with `IS`, so a
+    /// missing capture time matches a missing capture time.
+    pub fn find_ingest_file_by_key(
+        &self,
+        original_name: &str,
+        taken_at: Option<i64>,
+        bytes: i64,
+    ) -> Result<Option<IngestFile>> {
+        self.with_conn(|conn| {
+            Ok(conn
+                .query_row(
+                    &format!(
+                        "SELECT {INGEST_FILE_COLUMNS} FROM ingest_files
+                          WHERE original_name = ?1 AND taken_at IS ?2 AND bytes = ?3
+                            AND state NOT IN ('failed', 'duplicate')
+                          ORDER BY id DESC LIMIT 1"
+                    ),
+                    params![original_name, taken_at, bytes],
+                    row_ingest_file,
+                )
+                .optional()?)
+        })
+    }
+
+    /// All files of one batch in insert order (the dialog's table order).
+    pub fn list_ingest_files(&self, batch_id: i64) -> Result<Vec<IngestFile>> {
+        self.with_conn(|conn| {
+            let mut stmt = conn.prepare(&format!(
+                "SELECT {INGEST_FILE_COLUMNS} FROM ingest_files WHERE batch_id = ?1 ORDER BY id"
+            ))?;
+            Ok(stmt
+                .query_map([batch_id], row_ingest_file)?
+                .collect::<rusqlite::Result<_>>()?)
+        })
+    }
+
     // ---- settings ----
 
     pub fn set_setting(&self, key: &str, value: &str) -> Result<()> {
@@ -889,6 +1168,7 @@ impl Catalog {
 mod tests {
     use super::*;
     use crate::db::tests::scratch_db;
+    use edit_core::IngestFileState;
 
     fn photo_fixture(root_id: i64, n: i64) -> NewPhoto {
         NewPhoto {
@@ -900,6 +1180,8 @@ mod tests {
             kind: "raw".into(),
             bytes: 1024,
             mtime: 1_700_000_000,
+            original_name: None,
+            taken_at: None,
         }
     }
 
@@ -1026,6 +1308,133 @@ mod tests {
         assert_eq!(db.get_setting("missing").unwrap(), None);
 
         assert!(db.get_root(999_999).is_err());
+        std::fs::remove_file(path).ok();
+    }
+
+    #[test]
+    fn ingest_files_record_progress_and_dedupe() {
+        let path = scratch_db("ingest-files");
+        let db = Catalog::open(&path).unwrap();
+        let root = db.insert_root("/photos", "folder").unwrap();
+        let batch = db
+            .create_ingest_batch(&NewIngestBatch {
+                volume_uuid: Some("UUID-1".into()),
+                volume_label: Some("EOS_DIGITAL".into()),
+                session_name: Some("shoot".into()),
+                dest_dir: "/photos/2026/10-07".into(),
+                backup_dir: Some("/backup".into()),
+                template_id: None,
+                state: "running".into(),
+            })
+            .unwrap();
+        let row = db.get_ingest_batch(batch).unwrap();
+        assert_eq!(row.volume_label.as_deref(), Some("EOS_DIGITAL"));
+        assert_eq!(row.backup_dir.as_deref(), Some("/backup"));
+
+        let file = db
+            .record_ingest_file(&NewIngestFile {
+                batch_id: batch,
+                original_name: "DSC01234.NEF".into(),
+                taken_at: Some(1_700_000_000),
+                bytes: 1024,
+                source_path: "/media/card/DCIM/DSC01234.NEF".into(),
+                state: IngestFileState::Queued,
+            })
+            .unwrap();
+
+        // The key lookup sees the open row (so a crash mid-copy resumes),
+        // even though it is not cataloged yet.
+        let open = db
+            .find_ingest_file_by_key("DSC01234.NEF", Some(1_700_000_000), 1024)
+            .unwrap()
+            .expect("open row");
+        assert_eq!(open.id, file);
+        assert_eq!(open.state, IngestFileState::Queued);
+
+        db.set_ingest_file_state(file, IngestFileState::Copying, None)
+            .unwrap();
+        db.set_ingest_file_state(file, IngestFileState::Verifying, None)
+            .unwrap();
+        // The landed paths persist before the catalog insert, so a crash
+        // after the rename is recoverable.
+        db.mark_ingest_file_landed(
+            file,
+            "/photos/2026/10-07/shoot_0001.NEF",
+            Some("/backup/2026/10-07/shoot_0001.NEF"),
+            "ab12",
+        )
+        .unwrap();
+        let photo = db.insert_photo(&photo_fixture(root, 1234)).unwrap();
+        db.complete_ingest_file(
+            file,
+            "/photos/2026/10-07/shoot_0001.NEF",
+            Some("/backup/2026/10-07/shoot_0001.NEF"),
+            "ab12",
+            Some(photo),
+        )
+        .unwrap();
+
+        let rows = db.list_ingest_files(batch).unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].state, IngestFileState::Cataloged);
+        assert_eq!(rows[0].blake3.as_deref(), Some("ab12"));
+        assert_eq!(rows[0].photo_id, Some(photo));
+        assert_eq!(
+            rows[0].dest_path.as_deref(),
+            Some("/photos/2026/10-07/shoot_0001.NEF")
+        );
+
+        // Now the same triple is a duplicate...
+        let dup = db
+            .find_ingest_file_by_key("DSC01234.NEF", Some(1_700_000_000), 1024)
+            .unwrap()
+            .expect("duplicate");
+        assert_eq!(dup.id, file);
+        // ...but a different size, time, or name is not.
+        assert!(
+            db.find_ingest_file_by_key("DSC01234.NEF", Some(1_700_000_000), 2048)
+                .unwrap()
+                .is_none()
+        );
+        assert!(
+            db.find_ingest_file_by_key("DSC01234.NEF", Some(1), 1024)
+                .unwrap()
+                .is_none()
+        );
+        assert!(
+            db.find_ingest_file_by_key("OTHER.NEF", Some(1_700_000_000), 1024)
+                .unwrap()
+                .is_none()
+        );
+
+        // A failed row no longer blocks a fresh attempt.
+        db.set_ingest_file_state(file, IngestFileState::Failed, Some("x"))
+            .unwrap();
+        assert!(
+            db.find_ingest_file_by_key("DSC01234.NEF", Some(1_700_000_000), 1024)
+                .unwrap()
+                .is_none()
+        );
+
+        // An unlanded row is still found, so a crash mid-copy resumes
+        // instead of recording a second history row.
+        let open = db
+            .record_ingest_file(&NewIngestFile {
+                batch_id: batch,
+                original_name: "OPEN.NEF".into(),
+                taken_at: Some(7),
+                bytes: 5,
+                source_path: "/open".into(),
+                state: IngestFileState::Copying,
+            })
+            .unwrap();
+        assert_eq!(
+            db.find_ingest_file_by_key("OPEN.NEF", Some(7), 5)
+                .unwrap()
+                .unwrap()
+                .id,
+            open
+        );
         std::fs::remove_file(path).ok();
     }
 

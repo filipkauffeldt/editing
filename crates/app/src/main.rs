@@ -8,10 +8,21 @@ use gpui_kit::component::input::InputState;
 use gpui_kit::component::{TitleBar, v_flex};
 use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::*;
-use ingest::{AppState, IngestDialog, OpenIngest};
+use ingest::{AppState, IngestDialog, OpenIngest, apply_ingest_event};
 
 use app::browse::CatalogScanPayload;
-use app::views::{Browser, browse_job_handler};
+use app::ingest_job::handle_job;
+use app::views::Browser;
+
+/// Worker threads draining the durable job queue.
+///
+/// The pool is created before volume detection, so it cannot be sized to the
+/// live card count. Three is the common card count (and comfortably covers one
+/// or two), so up to three cards ingest in parallel; a fourth card's job stays
+/// `queued` and starts as soon as a worker frees up. The copy stage, not the
+/// database, is the bottleneck, and each worker holds its own SQLite
+/// connection, so raising this is a one-line change when more cards are common.
+const WORKER_THREADS: usize = 3;
 
 fn catalog_path() -> PathBuf {
     let base = std::env::var_os("EDITING_CATALOG")
@@ -82,9 +93,11 @@ fn main() {
 
     let worker_catalog = Arc::clone(&catalog);
     let handler: edit_catalog::JobHandler =
-        Arc::new(move |job, tx| browse_job_handler(worker_catalog.clone(), job, tx));
-    let pool = edit_catalog::spawn_workers(&catalog, 2, handler).expect("spawn workers");
+        Arc::new(move |job, tx| handle_job(worker_catalog.clone(), job, tx));
+    let pool =
+        edit_catalog::spawn_workers(&catalog, WORKER_THREADS, handler).expect("spawn workers");
     let events = pool.events().clone();
+    let browser_events = events.clone();
     // The pool owns the worker threads; leak it so background jobs keep
     // draining for the life of the window.
     std::mem::forget(pool);
@@ -116,11 +129,11 @@ fn main() {
         let window_options = TitleBar::window_options();
         let (window_handle, shell) = gpui_kit::open_window(window_options, cx, |window, cx| {
             let browser_catalog = Arc::clone(&catalog);
-            let events = events.clone();
-            let browser = cx.new(|cx| Browser::new(browser_catalog, events, cx));
-            browser.update(cx, |browser, cx| browser.start_event_drain(cx));
-            // Ingest dialog state + inputs.
+            let browser = cx.new(|cx| Browser::new(browser_catalog, browser_events.clone(), cx));
+            // Ingest dialog state + inputs. Rebuild the card/job routing from
+            // durable state so a crash-resumed ingest is visible.
             let state = cx.new(|_| AppState::new());
+            state.update(cx, |state, cx| state.resume_batches(&catalog, cx));
             let dest_dir = cx.new(|cx| {
                 InputState::new(window, cx)
                     .placeholder("~/Photos")
@@ -133,8 +146,15 @@ fn main() {
             });
             let backup_dir =
                 cx.new(|cx| InputState::new(window, cx).placeholder("/mnt/backup (optional)"));
-            let dialog =
-                cx.new(|_| IngestDialog::new(state.clone(), dest_dir, file_rule, backup_dir));
+            let dialog = cx.new(|_| {
+                IngestDialog::new(
+                    state.clone(),
+                    Arc::clone(&catalog),
+                    dest_dir,
+                    file_rule,
+                    backup_dir,
+                )
+            });
             cx.new(|cx| BrowserShell::new(browser, state, dialog, cx))
         })
         .expect("Failed to open window");
@@ -153,6 +173,31 @@ fn main() {
                 state.set_ingest_open(true, cx);
             });
         });
+
+        // One drain loop for every durable job event, so background threads
+        // never touch entities. It fans out to the contact sheet and to the
+        // ingest dialog (per-card progress, live file rows, duplicates).
+        let drain_browser = shell.read(cx).browser.clone();
+        let drain_ingest_state = shell.read(cx).state.clone();
+        let drain_catalog = Arc::clone(&catalog);
+        cx.spawn(async move |cx| {
+            while let Ok(event) = events.recv_async().await {
+                let ingest_event = event.clone();
+                let browser = drain_browser.clone();
+                let state = drain_ingest_state.clone();
+                let catalog = Arc::clone(&drain_catalog);
+                cx.update(|cx| {
+                    browser.update(cx, |browser, cx| {
+                        browser.on_job_event(&event);
+                        cx.notify();
+                    });
+                    state.update(cx, |state, cx| {
+                        apply_ingest_event(state, &catalog, &ingest_event, cx);
+                    });
+                });
+            }
+        })
+        .detach();
 
         // Volume detection: blocking poll + udev hotplug on a worker thread,
         // snapshots drained on the GPUI executor so the dialog refreshes on
