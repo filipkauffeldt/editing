@@ -114,31 +114,30 @@ fn main() {
         }
 
         let window_options = TitleBar::window_options();
-        let (window_handle, shell) =
-            gpui_kit::open_window(window_options, cx, |window, cx| {
-                let browser_catalog = Arc::clone(&catalog);
-                let events = events.clone();
-                let browser = cx.new(|cx| Browser::new(browser_catalog, events, cx));
-                browser.update(cx, |browser, cx| browser.start_event_drain(cx));
-                // Ingest dialog state + inputs.
-                let state = cx.new(|_| AppState::new());
-                let dest_dir = cx.new(|cx| {
-                    InputState::new(window, cx)
-                        .placeholder("~/Photos")
-                        .default_value("~/Photos/{yyyy}/{mm}-{dd}")
-                });
-                let file_rule = cx.new(|cx| {
-                    InputState::new(window, cx)
-                        .placeholder("{session}_{seq:4}")
-                        .default_value("{session}_{seq:4}")
-                });
-                let backup_dir =
-                    cx.new(|cx| InputState::new(window, cx).placeholder("/mnt/backup (optional)"));
-                let dialog =
-                    cx.new(|_| IngestDialog::new(state.clone(), dest_dir, file_rule, backup_dir));
-                cx.new(|cx| BrowserShell::new(browser, state, dialog, cx))
-            })
-            .expect("Failed to open window");
+        let (window_handle, shell) = gpui_kit::open_window(window_options, cx, |window, cx| {
+            let browser_catalog = Arc::clone(&catalog);
+            let events = events.clone();
+            let browser = cx.new(|cx| Browser::new(browser_catalog, events, cx));
+            browser.update(cx, |browser, cx| browser.start_event_drain(cx));
+            // Ingest dialog state + inputs.
+            let state = cx.new(|_| AppState::new());
+            let dest_dir = cx.new(|cx| {
+                InputState::new(window, cx)
+                    .placeholder("~/Photos")
+                    .default_value("~/Photos/{yyyy}/{mm}-{dd}")
+            });
+            let file_rule = cx.new(|cx| {
+                InputState::new(window, cx)
+                    .placeholder("{session}_{seq:4}")
+                    .default_value("{session}_{seq:4}")
+            });
+            let backup_dir =
+                cx.new(|cx| InputState::new(window, cx).placeholder("/mnt/backup (optional)"));
+            let dialog =
+                cx.new(|_| IngestDialog::new(state.clone(), dest_dir, file_rule, backup_dir));
+            cx.new(|cx| BrowserShell::new(browser, state, dialog, cx))
+        })
+        .expect("Failed to open window");
 
         // Keyboard shortcut target: focus the shell so `i` dispatches.
         let focus_handle = shell.read(cx).focus_handle.clone();
