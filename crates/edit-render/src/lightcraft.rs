@@ -371,11 +371,20 @@ pub fn fit_preview(
 /// Decode a file into a linear Rec.2020 image no larger than `max_edge`,
 /// oriented, plus the `SourceInfo` the pipeline renders it against. Mirrors
 /// `lightcraft-engine::files::load_bytes` for the raw path.
-pub fn load_bytes(bytes: Cow<'_, [u8]>, max_edge: usize) -> Result<(Rgb32f, SourceInfo), String> {
-    load_bytes_now(bytes, max_edge)
+pub fn load_bytes(
+    bytes: Cow<'_, [u8]>,
+    max_edge: usize,
+    cancel: &edit_core::CancelToken,
+) -> Result<(Rgb32f, SourceInfo), String> {
+    load_bytes_now(bytes, max_edge, cancel)
 }
 
-fn load_bytes_now(bytes: Cow<'_, [u8]>, max_edge: usize) -> Result<(Rgb32f, SourceInfo), String> {
+fn load_bytes_now(
+    bytes: Cow<'_, [u8]>,
+    max_edge: usize,
+    cancel: &edit_core::CancelToken,
+) -> Result<(Rgb32f, SourceInfo), String> {
+    cancel.check().map_err(|e| e.to_string())?;
     if lightcraft_raw::probe(&bytes).is_some() {
         let mut raw = match lightcraft_raw::decode(&bytes) {
             Ok(r) => r,
@@ -386,6 +395,7 @@ fn load_bytes_now(bytes: Cow<'_, [u8]>, max_edge: usize) -> Result<(Rgb32f, Sour
             }
             Err(e) => return Err(e.to_string()),
         };
+        cancel.check().map_err(|e| e.to_string())?;
         let xy = lightcraft_raw::color::as_shot_white_xy(&raw);
         let t = lightcraft_raw::color::camera_transform(&raw, xy);
         let camera_look = fit_preview(&raw, &bytes, &t);
@@ -411,6 +421,7 @@ fn load_bytes_now(bytes: Cow<'_, [u8]>, max_edge: usize) -> Result<(Rgb32f, Sour
             }
         };
         raw.data = lightcraft_raw::RawData::U16(Vec::new());
+        cancel.check().map_err(|e| e.to_string())?;
         let mut stages = vec![("develop", t0.elapsed())];
         lightcraft_raw::highlight::reconstruct(&mut img, t.wb, HIGHLIGHT_CLIP);
         stages.push(("highlights", t0.elapsed()));
@@ -438,8 +449,10 @@ fn load_bytes_now(bytes: Cow<'_, [u8]>, max_edge: usize) -> Result<(Rgb32f, Sour
         });
         stages.push(("transform", t0.elapsed()));
         stages.push(("colour", t0.elapsed()));
+        cancel.check().map_err(|e| e.to_string())?;
         let img = fit(&img, max_edge, max_edge, Filter::Box);
         stages.push(("fit", t0.elapsed()));
+        cancel.check().map_err(|e| e.to_string())?;
         let img = img.into_oriented(raw.orientation);
         stages.push(("orient", t0.elapsed()));
         if lightcraft_pipeline::profiling() {
@@ -485,7 +498,7 @@ fn load_bytes_now(bytes: Cow<'_, [u8]>, max_edge: usize) -> Result<(Rgb32f, Sour
             },
         ));
     }
-    let d = crate::plain::decode_plain(&bytes, max_edge)?;
+    let d = crate::plain::decode_plain(&bytes, max_edge, cancel)?;
     drop(bytes);
     Ok((d.image, d.info))
 }
@@ -508,7 +521,8 @@ pub fn load_embedded_preview(bytes: &[u8], max_edge: usize) -> Option<(Rgb32f, S
     ))
 }
 
-/// Seed-relevant facts about a source, derived cheaply (no pixel develop).
+/// Seed-relevant facts about a source, derived from the headers only, for
+/// the develop session's white-point seed (never developing samples).
 #[derive(Clone, Copy, Debug, Default, PartialEq)]
 pub struct SourceFacts {
     /// Absolute-as-shot Kelvin WB interpretation (raw) or rendered-relative.
@@ -517,15 +531,14 @@ pub struct SourceFacts {
     pub as_shot_tint: f64,
 }
 
-/// Derive [`SourceFacts`] without developing samples: a container parse only,
-/// so a select lands the facts in the same class as the preview path.
+/// Derive [`SourceFacts`] with a header-only container parse (no samples, per
+/// `probe_info`).
 pub fn source_facts(bytes: &[u8]) -> Option<SourceFacts> {
-    let mut raw = lightcraft_raw::decode(bytes).ok()?;
-    let xy = lightcraft_raw::color::as_shot_white_xy(&raw);
-    let t = lightcraft_raw::color::camera_transform(&raw, xy);
-    raw.data = lightcraft_raw::RawData::U16(Vec::new());
+    let info = lightcraft_raw::probe_info(bytes).ok()?;
+    let xy = lightcraft_raw::color::as_shot_white_xy_of(&info);
+    let fallback = !lightcraft_raw::color::has_matrix(&info.color);
+    let relative = file_local_look(info.format) && fallback;
     let (temp, tint) = xy_to_temp_tint(xy);
-    let relative = file_local_look(raw.format) && t.matrix_is_fallback;
     let (temp, tint) = if relative {
         (6500.0, 0.0)
     } else {

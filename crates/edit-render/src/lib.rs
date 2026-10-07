@@ -22,19 +22,29 @@ use std::borrow::Cow;
 use std::collections::{HashMap, VecDeque};
 use std::io::Cursor;
 use std::path::{Path, PathBuf};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Condvar, Mutex};
 
 use edit_core::cancel::CancelToken;
 use edit_core::error::{Error, Result};
-use edit_core::render::{Aspect, Crop, Frame, RenderRequest, RenderSize};
-use edit_core::traits::DevelopEngine;
-use edit_core::{DevelopSettings, ItemId};
+use edit_core::render::{Aspect, Crop, Frame, OutputColor, RenderRequest, RenderSize};
+use edit_core::traits::{DevelopEngine, RetouchStage as RetouchStageTrait};
+use edit_core::{DevelopSettings, ItemId, MaskPlane, RetouchOp, RetouchRecipe};
 use lightcraft_pipeline::Quality;
 
 /// Long edge of the downscaled proxy rendered during a slider drag. The
 /// proxy-decode bins raws in milliseconds and keeps every slider frame in the
 /// ~15–64 ms class the R0 memo measured.
 pub const PROXY_DRAG_LONG_EDGE: u32 = 1600;
+
+/// Long edge of the bounded display proxy rendered on slider release and on
+/// selection: crisper than the drag edge, still display-grade — full
+/// resolution stays export-only (E1/M2).
+pub const PROXY_RELEASE_LONG_EDGE: u32 = 2560;
+
+/// Byte budget of the decoded-source cache (+ warm stage caches). A high-MP
+/// `Full` f32 source is 250–540 MB, so browsing raws must evict by bytes,
+/// not by entry count.
+pub const DECODE_CACHE_BUDGET_BYTES: usize = 768 << 20;
 
 /// Item → display-photo-path resolution, kept behind a trait so the service
 /// stays independent of any concrete catalog handle.
@@ -51,13 +61,61 @@ struct DecodeSource {
     stages: lightcraft_pipeline::StageCache,
 }
 
-type DecodeKey = (PathBuf, i64, u16);
+impl DecodeSource {
+    /// Bytes this entry holds: the source samples plus warm stage caches.
+    fn held_bytes(&self) -> usize {
+        self.img
+            .data
+            .len()
+            .saturating_mul(3 * std::mem::size_of::<f32>())
+            .saturating_add(self.stages.bytes())
+    }
+}
 
-/// Decoded sources for the last render sizes (one slot per edge class, so the
-/// drag edge and the release edge never evict each other mid-drag).
+type DecodeKey = (PathBuf, i64, u64, u16);
+
+/// A decode in flight: the owner publishes; concurrent misses of the same
+/// key wait on the condvar and hit the cache instead of re-decoding.
+struct PendingDecode {
+    out: Mutex<Option<std::result::Result<Arc<DecodeSource>, String>>>,
+    cond: Condvar,
+}
+
+impl PendingDecode {
+    fn publish(&self, result: std::result::Result<Arc<DecodeSource>, String>) {
+        if let Ok(mut slot) = self.out.lock() {
+            *slot = Some(result);
+        }
+        self.cond.notify_all();
+    }
+
+    /// Wait for the owner's result, checking the cancel token between timed
+    /// waits. `None` when the caller was cancelled.
+    fn wait(&self, cancel: &CancelToken) -> Option<std::result::Result<Arc<DecodeSource>, String>> {
+        let mut guard = self.out.lock().ok()?;
+        loop {
+            if let Some(result) = guard.as_ref() {
+                return Some(result.clone());
+            }
+            if cancel.is_cancelled() {
+                return None;
+            }
+            guard = self
+                .cond
+                .wait_timeout(guard, std::time::Duration::from_millis(50))
+                .ok()?
+                .0;
+        }
+    }
+}
+
+/// The decode cache: hit sources, in-flight decodes, and byte-bounded LRU
+/// eviction, so browsing high-MP raws cannot grow the process without limit.
 struct DecodeCache {
     sources: HashMap<DecodeKey, Arc<DecodeSource>>,
+    pending: HashMap<DecodeKey, Arc<PendingDecode>>,
     order: VecDeque<DecodeKey>,
+    bytes_held: usize,
     capacity: usize,
 }
 
@@ -65,26 +123,83 @@ impl DecodeCache {
     fn new(capacity: usize) -> Self {
         Self {
             sources: HashMap::new(),
+            pending: HashMap::new(),
             order: VecDeque::new(),
+            bytes_held: 0,
             capacity: capacity.max(1),
         }
     }
 
-    fn get(&self, key: &DecodeKey) -> Option<Arc<DecodeSource>> {
-        self.sources.get(key).map(Arc::clone)
+    /// LRU check: move the hit to the back of the order bank.
+    fn check(&mut self, key: &DecodeKey) -> Option<Arc<DecodeSource>> {
+        let hit = self.sources.get(key).map(Arc::clone)?;
+        if let Some(pos) = self.order.iter().position(|k| k == key) {
+            self.order.remove(pos);
+        }
+        self.order.push_back(key.clone());
+        Some(hit)
     }
 
-    fn put(&mut self, key: DecodeKey, source: Arc<DecodeSource>) {
-        if !self.sources.contains_key(&key) {
-            while self.sources.len() >= self.capacity {
-                let Some(old) = self.order.pop_front() else {
-                    break;
-                };
-                self.sources.remove(&old);
+    /// The in-flight slot for `key`: re-used when one is already waiting,
+    /// freshly created (with the `(slot, owner)` owner flag) otherwise.
+    fn pending_slot(&mut self, key: &DecodeKey) -> (Arc<PendingDecode>, bool) {
+        if let Some(slot) = self.pending.get(key) {
+            return (Arc::clone(slot), false);
+        }
+        let slot = Arc::new(PendingDecode {
+            out: Mutex::new(None),
+            cond: Condvar::new(),
+        });
+        self.pending.insert(key.clone(), Arc::clone(&slot));
+        (slot, true)
+    }
+
+    /// Publish the owner's result: bank the source (LRU + byte budget),
+    /// drop the pending slot, wake every waiter.
+    /// Publish the owner's result: bank the source (LRU + byte budget), drop
+    /// the pending slot, wake every waiter.
+    fn finish_pending(&mut self, key: &DecodeKey, source: Arc<DecodeSource>) {
+        // Evict from the front until the entry count fits; a single entry
+        // always banks even when it alone exceeds the byte budget.
+        while self.sources.len() >= self.capacity {
+            let Some(old) = self.order.pop_front() else {
+                break;
+            };
+            if old == *key {
+                break;
             }
+            self.sources.remove(&old);
+        }
+        self.sources.insert(key.clone(), Arc::clone(&source));
+        if !self.order.contains(key) {
             self.order.push_back(key.clone());
         }
-        self.sources.insert(key, source);
+        // Held bytes recomputed from the bank, so the tracking never drifts,
+        // then byte-budget eviction (the fresh entry is never evicted here).
+        self.bytes_held = self.sources.values().map(|s| s.held_bytes()).sum();
+        self.evict_to_budget(key);
+        self.pending.remove(key);
+    }
+
+    /// Byte-budget eviction: with one entry per edge class, drop until the
+    /// total fits; never evict the entry the caller just produced.
+    fn evict_to_budget(&mut self, keep: &DecodeKey) {
+        while self.bytes_held > DECODE_CACHE_BUDGET_BYTES && self.sources.len() > 1 {
+            let Some(old) = self.order.pop_front() else {
+                break;
+            };
+            if old == *keep {
+                break;
+            }
+            if let Some(removed) = self.sources.remove(&old) {
+                self.bytes_held = self.bytes_held.saturating_sub(removed.held_bytes());
+            }
+        }
+    }
+
+    /// The owner failed or was cancelled: drop the slot, wake everyone.
+    fn drop_pending(&mut self, key: &DecodeKey) {
+        self.pending.remove(key);
     }
 }
 
@@ -121,6 +236,10 @@ impl RenderService {
     /// One render, from source file to BGRA frame. `DisplaySrgb` and
     /// `ExportSrgb` share the same pixel math; an export adds only the file
     /// side (JPEG encode, IPTC) in E1.
+    /// One render, from source file to BGRA frame. Cache hits reuse decoded
+    /// sources and warm stage caches; concurrent misses of one key share a
+    /// single decode. `DisplaySrgb` and `ExportSrgb` share the pixel math; the
+    /// file side of an export (JPEG encode, IPTC) lands in E1.
     pub fn render_path(
         &self,
         path: &Path,
@@ -129,45 +248,32 @@ impl RenderService {
         crop: Option<&Crop>,
         cancel: &CancelToken,
     ) -> Result<Frame> {
+        if let RenderSize::Proxy(0) = size {
+            return Err(Error::InvalidInput("proxy edge must be nonzero".into()));
+        }
         cancel.check()?;
-        // The full-proxy edge is resolved from the file's own bytes on a
-        // decode miss only: cache hits must not re-read 25 MB raws.
-        // Proxy edges key by their long edge; Full uses the 0 sentinel
-        // (Proxy(0) is not a valid edge).
+        // The key identifies the file (path, mtime, size) and the requested
+        // decode edge; a re-render picks up edits from disk. Proxy(0) is
+        // rejected above, so Full uses the 0 sentinel.
         let size_key = match size {
             RenderSize::Proxy(n) => n,
             RenderSize::Full => 0,
         };
-        let key: DecodeKey = (path.to_path_buf(), fs_mtime_secs(path), size_key);
-        let cached = self
-            .decoded
-            .lock()
-            .map_err(|_| Error::InvalidInput("decode cache poisoned".into()))?
-            .get(&key);
+        let key: DecodeKey = (
+            path.to_path_buf(),
+            fs_mtime_secs(path),
+            fs_size(path),
+            size_key,
+        );
+        let cached = {
+            self.decoded
+                .lock()
+                .map_err(|_| Error::InvalidInput("decode cache poisoned".into()))?
+                .check(&key)
+        };
         let source = match cached {
             Some(source) => source,
-            None => {
-                cancel.check()?;
-                let bytes = std::fs::read(path).map_err(|e| Error::Engine {
-                    stage: "decode",
-                    message: format!("cannot read {}: {e}", path.display()),
-                })?;
-                let edge = match size {
-                    RenderSize::Proxy(n) => n as usize,
-                    RenderSize::Full => full_proxy_target_edge(&bytes).unwrap_or(usize::MAX),
-                };
-                let (img, info) = self.decode(bytes, edge, cancel)?;
-                let source = Arc::new(DecodeSource {
-                    img: Arc::new(img),
-                    info,
-                    stages: lightcraft_pipeline::StageCache::default(),
-                });
-                self.decoded
-                    .lock()
-                    .map_err(|_| Error::InvalidInput("decode cache poisoned".into()))?
-                    .put(key, Arc::clone(&source));
-                source
-            }
+            None => self.decode_shared(path, size, size_key, cancel)?,
         };
 
         // The develop settings are user buffer state; the crop rides in them
@@ -196,6 +302,87 @@ impl RenderService {
         bgra_frame(&rendered.image)
     }
 
+    /// Decode miss: own-or-wait the in-flight slot for this key, then decode
+    /// exactly once. Concurrent callers of one key share the outcome.
+    fn decode_shared(
+        &self,
+        path: &Path,
+        size: RenderSize,
+        size_key: u16,
+        cancel: &CancelToken,
+    ) -> Result<Arc<DecodeSource>> {
+        let decode_key = (
+            path.to_path_buf(),
+            fs_mtime_secs(path),
+            fs_size(path),
+            size_key,
+        );
+        let (slot, owner) = {
+            self.decoded
+                .lock()
+                .map_err(|_| Error::InvalidInput("decode cache poisoned".into()))?
+                .pending_slot(&decode_key)
+        };
+        if owner {
+            let result = self.run_decode(path, size, cancel);
+            if let Ok(source) = &result {
+                self.decoded
+                    .lock()
+                    .map_err(|_| Error::InvalidInput("decode cache poisoned".into()))?
+                    .finish_pending(&decode_key, Arc::clone(source));
+                return Ok(Arc::clone(source));
+            }
+            // Failure or cancellation: wake the waiters with the error, then
+            // drop the slot so a later caller can retry.
+            let message = match &result {
+                Err(e) => e.to_string(),
+                Ok(_) => unreachable!(),
+            };
+            slot.publish(Err(message.clone()));
+            self.decoded
+                .lock()
+                .map_err(|_| Error::InvalidInput("decode cache poisoned".into()))?
+                .drop_pending(&decode_key);
+            return Err(Error::Engine {
+                stage: "decode",
+                message,
+            });
+        }
+        // Waiter: the owner publishes or the slot evaporates; a cancelled
+        // caller returns early and re-kicks on the next edit.
+        match slot.wait(cancel) {
+            Some(Ok(source)) => Ok(source),
+            Some(Err(message)) => Err(Error::Engine {
+                stage: "decode",
+                message,
+            }),
+            None => Err(Error::Cancelled),
+        }
+    }
+
+    /// The decode itself: read the file, then decode at the requested edge.
+    fn run_decode(
+        &self,
+        path: &Path,
+        size: RenderSize,
+        cancel: &CancelToken,
+    ) -> std::result::Result<Arc<DecodeSource>, String> {
+        let bytes =
+            std::fs::read(path).map_err(|e| format!("cannot read {}: {e}", path.display()))?;
+        let edge = match size {
+            RenderSize::Proxy(n) => n as usize,
+            RenderSize::Full => full_proxy_target_edge(&bytes).unwrap_or(usize::MAX),
+        };
+        let (img, info) = self
+            .decode(bytes, edge, cancel)
+            .map_err(|e| e.to_string())?;
+        Ok(Arc::new(DecodeSource {
+            img: Arc::new(img),
+            info,
+            stages: lightcraft_pipeline::StageCache::default(),
+        }))
+    }
+
     fn decode(
         &self,
         bytes: Vec<u8>,
@@ -205,12 +392,12 @@ impl RenderService {
         let cow = Cow::Owned(bytes);
         cancel.check()?;
         if lightcraft_raw::probe(&cow).is_some() {
-            lightcraft::load_bytes(cow, edge).map_err(|message| Error::Engine {
+            lightcraft::load_bytes(cow, edge, cancel).map_err(|message| Error::Engine {
                 stage: "decode",
                 message,
             })
         } else {
-            plain::decode_plain(&cow, edge)
+            plain::decode_plain(&cow, edge, cancel)
                 .map(|p| (p.image, p.info))
                 .map_err(|message| Error::Engine {
                     stage: "decode",
@@ -243,7 +430,35 @@ impl DevelopEngine for RenderService {
                 req.item.get()
             )));
         };
+        // The export path is E1; C1 renders display sRGB only. A non-empty
+        // retouch recipe needs the R2 mosaic/gaussian stage and arrives with
+        // an explicit mask — reject with a diagnostic instead of dropping it.
+        match req.color {
+            OutputColor::ExportSrgb => {
+                return Err(Error::InvalidInput("export renders land in E1".into()));
+            }
+            OutputColor::DisplaySrgb => {}
+        }
+        let nonempty_retouch = req
+            .retouch
+            .as_ref()
+            .is_some_and(|recipe| !recipe.is_empty());
+        if nonempty_retouch {
+            return Err(Error::InvalidInput("retouch re-renders land in E3".into()));
+        }
         self.render_path(&path, req.size, &req.develop, req.crop.as_ref(), cancel)
+    }
+}
+
+/// Documented no-op retouch stage for the DevelopEngine contract: pixels are
+/// returned unretouched until R2 applies the real mosaic/gaussian ops.
+#[derive(Clone, Copy, Debug, Default)]
+pub struct RetouchStageStub;
+
+impl RetouchStageTrait for RetouchStageStub {
+    fn apply(&self, _frame: &mut Frame, _recipe: &RetouchRecipe, _mask: &MaskPlane) -> Result<()> {
+        let _ = RetouchOp::Mosaic { cell_px: 0 };
+        Ok(())
     }
 }
 
@@ -296,15 +511,21 @@ fn bgra_frame(image: &lightcraft_raster::Rgba8) -> Result<Frame> {
     Ok(frame)
 }
 
-/// Seconds since the epoch for `path`, part of the decode-cache key so a
-/// re-render picks up edits from disk.
+/// Nanoseconds since the epoch for `path` (sub-second identity in the
+/// decode-cache key, so a fast re-render after a picker re-render picks up
+/// edits from disk).
 fn fs_mtime_secs(path: &Path) -> i64 {
     std::fs::metadata(path)
         .ok()
         .and_then(|meta| meta.modified().ok())
         .and_then(|time| time.duration_since(std::time::UNIX_EPOCH).ok())
-        .map(|d| d.as_secs() as i64)
+        .map(|d| d.as_nanos() as i64)
         .unwrap_or(0)
+}
+
+/// File size in bytes, part of the decode-cache key (mtime alone can repeat).
+fn fs_size(path: &Path) -> u64 {
+    std::fs::metadata(path).map(|meta| meta.len()).unwrap_or(0)
 }
 
 /// Long edge targeted by a full-proxy render: the file's own preview-grade

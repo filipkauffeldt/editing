@@ -20,8 +20,14 @@ pub struct Plain {
 }
 
 /// Decode a plain file to scene-linear Rec.2020 (oriented, never upscaled,
-/// downscaled on the long edge to `max_edge`).
-pub fn decode_plain(bytes: &[u8], max_edge: usize) -> Result<Plain, String> {
+/// downscaled on the long edge to `max_edge`). `cancel` is checked after the
+/// container decode and after the pixel pass.
+pub fn decode_plain(
+    bytes: &[u8],
+    max_edge: usize,
+    cancel: &edit_core::CancelToken,
+) -> Result<Plain, String> {
+    cancel.check().map_err(|e| e.to_string())?;
     let reader = image::ImageReader::new(Cursor::new(bytes))
         .with_guessed_format()
         .map_err(|e| e.to_string())?;
@@ -32,6 +38,7 @@ pub fn decode_plain(bytes: &[u8], max_edge: usize) -> Result<Plain, String> {
         .unwrap_or(image::metadata::Orientation::NoTransforms);
     let mut img = DynamicImage::from_decoder(dec).map_err(|e| e.to_string())?;
     img.apply_orientation(orientation);
+    cancel.check().map_err(|e| e.to_string())?;
 
     // Downscale on the long edge; never upscale.
     let long = img.width().max(img.height());
@@ -46,6 +53,7 @@ pub fn decode_plain(bytes: &[u8], max_edge: usize) -> Result<Plain, String> {
         Some(profile) => moxcms_to_linear(&src, &profile, width, height)?,
         None => linear_from_rgba8(&src, width, height),
     };
+    cancel.check().map_err(|e| e.to_string())?;
     Ok(Plain {
         image: linear,
         info: SourceInfo::default(),
