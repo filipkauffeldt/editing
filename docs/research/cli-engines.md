@@ -1,5 +1,11 @@
 # Headless CLI photo engines: darktable-cli, RawTherapee/ART, exiftool, fallbacks, ingest
 
+> **Superseded on engine choice (2026-10-07).** `PLAN.md` now links LightCraft
+> (`develop`, `pipeline`, `raw`, `codecs`) in-process as the only render engine and drops
+> darktable-cli and all subprocess-engine fallbacks. See `PLAN.md` and
+> `docs/research/retouch-selection-faceblur.md`. The findings below remain useful as
+> historical research (CLI flags, exiftool, ingest, licensing), but are not the current plan.
+
 Research for the `editing` app (Rust/GPUI photo editor + IPTC manager). Question: which existing
 open-source engines can we drive headlessly via CLI for raw development and metadata, and what are
 the licensing/architecture consequences of each choice?

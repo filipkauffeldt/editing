@@ -1,5 +1,13 @@
 # Rust image pipeline research: raw decode, previews, quick-edit ops, color, JPEG codecs
 
+> **Superseded on engine and raw handling (2026-10-07).** This doc's recommendations —
+> rawler for previews, darktable-cli for development/export, own quick-edit tone math, and
+> a subprocess fallback for unsupported raws — are retired. `PLAN.md` now uses
+> `lightcraft-raw` for previews/decode and `lightcraft-pipeline` + `DevelopSettings` for
+> development and export, with no fallback engine. See `PLAN.md` and
+> `docs/research/retouch-selection-faceblur.md`. The format/embedded-preview analysis, GPUI
+> BGRA rendering notes and codec comparisons below remain useful as technical reference.
+
 **Date:** 2026-08-16
 **Context:** Cross-platform Rust/GPUI desktop photo editor. Raw development + export delegated to `darktable-cli`; the app must quickly decode embedded JPEG previews from raws and apply real-time "quick edit" ops (exposure, WB, highlights/shadows, white/black point) on-screen.
 **Method:** All claims verified against primary sources (crates.io registry data via lib.rs/docs.rs, source repositories, official docs). Source URLs inline; full list at the end.

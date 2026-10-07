@@ -1,5 +1,12 @@
 # Lightroom edit math & round-trip: research findings
 
+> **Superseded on engine choice (2026-10-07).** The darktable-cli export path and the
+> own-tone-math preview plan are retired; `PLAN.md` now uses LightCraft `DevelopSettings` +
+> `lightcraft-pipeline` for preview and export. See `PLAN.md` and
+> `docs/research/retouch-selection-faceblur.md`. The PV2012 slider semantics, `crs:` field
+> mapping and exiftool round-trip findings below are still current and are the basis for LR
+> preset import and the sidecar writer.
+
 **Date:** 2026-08-16
 **Scope:** Slider semantics of Lightroom's PV2012 Basic panel; open-source reimplementations/converter mappings; darktable module equivalents and what is programmatically settable; XMP (`crs:`) round-trip to Lightroom Classic via exiftool; ProcessVersion gotchas.
 **Audience:** the Rust/GPUI cross-platform photo editor (live preview must feel like LR's Basic panel; crops must round-trip; export via `darktable-cli`).
