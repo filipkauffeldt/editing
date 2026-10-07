@@ -10,7 +10,6 @@ gpui_platform.workspace = true
 gpui-kit.workspace = true
 edit-core.workspace = true
 edit-catalog.workspace = true
-edit-metadata.workspace = true
 edit-ingest.workspace = true
 edit-metadata.workspace = true
 serde.workspace = true

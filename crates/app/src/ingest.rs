@@ -112,6 +112,10 @@ impl AppState {
         self.ingest_open
     }
 
+    pub fn is_templates_open(&self) -> bool {
+        self.templates_open
+    }
+
     /// All live file rows, batches in registration order.
     pub fn files(&self) -> Vec<IngestFileRow> {
         let mut rows: Vec<IngestFileRow> = Vec::new();

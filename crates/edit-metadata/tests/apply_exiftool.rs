@@ -102,6 +102,8 @@ fn template_apply_recipe_writes_the_selection() {
                 kind: "jpeg".into(),
                 bytes: 5,
                 mtime: 0,
+                original_name: None,
+                taken_at: None,
             })
             .unwrap();
         let item_id = catalog
