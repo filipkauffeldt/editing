@@ -1498,6 +1498,16 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "d0881ea181b1df73ff77ffaaf9c7544ecc11e82fba9b5f27b262a3c73a332555"
 
 [[package]]
+name = "edit-core"
+version = "0.1.0"
+dependencies = [
+ "lightcraft-develop",
+ "serde",
+ "serde_json",
+ "thiserror 2.0.21",
+]
+
+[[package]]
 name = "either"
 version = "1.19.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -3652,6 +3662,34 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "61ff90caf6077a803a240f62fdbe88645a890bbca49ef8174c3cb0404362171d"
 dependencies = [
  "libc",
+]
+
+[[package]]
+name = "lightcraft-color"
+version = "0.2.1"
+source = "git+https://github.com/storytold/lightcraft?rev=f2f449611d248a907f755d6e18f3701db5755f03#f2f449611d248a907f755d6e18f3701db5755f03"
+dependencies = [
+ "lightcraft-geom",
+ "serde",
+]
+
+[[package]]
+name = "lightcraft-develop"
+version = "0.2.1"
+source = "git+https://github.com/storytold/lightcraft?rev=f2f449611d248a907f755d6e18f3701db5755f03#f2f449611d248a907f755d6e18f3701db5755f03"
+dependencies = [
+ "lightcraft-color",
+ "lightcraft-geom",
+ "serde",
+ "serde_json",
+]
+
+[[package]]
+name = "lightcraft-geom"
+version = "0.2.1"
+source = "git+https://github.com/storytold/lightcraft?rev=f2f449611d248a907f755d6e18f3701db5755f03#f2f449611d248a907f755d6e18f3701db5755f03"
+dependencies = [
+ "serde",
 ]
 
 [[package]]

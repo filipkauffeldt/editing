@@ -1,5 +1,5 @@
 [workspace]
-members = ["crates/app"]
+members = ["crates/app", "crates/edit-core"]
 resolver = "2"
 
 [workspace.package]
@@ -9,6 +9,14 @@ rust-version = "1.95"
 license = "Apache-2.0"
 
 [workspace.dependencies]
+# storytold/lightcraft @ f2f449611d248a907f755d6e18f3701db5755f03 (2026-10-07,
+# see docs/research/retouch-r0-memo.md). Not on crates.io, so git-pinned.
+# Only lightcraft-develop is a workspace dependency; each service wraps its
+# own upstream crate in one bridge module.
+lightcraft-develop = { git = "https://github.com/storytold/lightcraft", rev = "f2f449611d248a907f755d6e18f3701db5755f03" }
+serde = { version = "1", features = ["derive"] }
+serde_json = { version = "1" }
+thiserror = { version = "2" }
 # The x11 and wayland features select gpui's Linux windowing backends;
 # font-kit enables the freetype/fontconfig text stack, runtime_shaders compiles
 # Metal shaders at runtime on macOS.
