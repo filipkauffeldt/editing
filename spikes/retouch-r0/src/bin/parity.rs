@@ -47,7 +47,7 @@ fn main() -> Result<(), String> {
         }
     }
     println!(
-        "mean |diff|/channel: {mean_abs:.6}  max |diff|: {max_abs} (px {}, ch {})  differing pixels: {:.6} %",
+        "mean |diff|/channel: {mean_abs:.6}  max |diff|: {max_abs} (px {}, ch {})  differing channel samples: {:.6} %",
         max_at.0,
         max_at.1,
         share_diff * 100.0
@@ -56,7 +56,7 @@ fn main() -> Result<(), String> {
     let s = surface_from_rgba8(&a);
     let back = retouch_r0::photocraft_bridge::rgba8_from_surface(&s, photocraft_geom::Rect::from_xywh(0, 0, a.width as u32, a.height as u32));
     let (m, d) = compare(&a, &back).ok_or("roundtrip size mismatch")?;
-    println!("surface roundtrip: mean {m:.6} differing {d:.6} %");
+    println!("surface roundtrip: mean {m:.6} differing channel samples {d:.6} %");
     if max_abs == 0.0 {
         println!("PASS: pixel-identical");
         Ok(())

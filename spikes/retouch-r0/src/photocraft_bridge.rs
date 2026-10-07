@@ -37,9 +37,9 @@ pub fn mask_surface(img_rect: Rect, sel_rect: Rect) -> Surface {
     s
 }
 
-/// Mean absolute per-channel difference between two RGBA images, plus the
-/// share of pixels that differ at all. Used for tiling / size-consistency
-/// checks.
+/// Mean absolute per-channel-sample difference between two RGBA images, plus
+/// the share of channel samples that differ at all. Used for tiling /
+/// size-consistency checks.
 pub fn compare(a: &Rgba8, b: &Rgba8) -> Option<(f64, f64)> {
     if (a.width, a.height) != (b.width, b.height) {
         return None;

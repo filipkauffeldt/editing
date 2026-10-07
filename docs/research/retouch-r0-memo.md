@@ -168,7 +168,7 @@ crowd recall is still too low.
 mosaic:   auto 1100 ms | tile128 == auto: true | tile257 == auto: true | rerun identical
 gaussian: auto  500 ms | tile128 == auto: ~1 LSB | tile257 == auto: ~1 LSB | rerun identical
 masked mosaic (central 50% region): 1217 ms, 5.2 M px changed inside, 0 outside
-mosaic full-downscaled vs proxy-applied: mean|diff| 3.77/255 (1.5 %), 0.6 % px differ
+mosaic full-downscaled vs proxy-applied: mean|diff| 3.77/255 (1.5 %), 0.6 % channel samples differ
 mean preserved (full): mosaic Δ0.016, gaussian Δ0.008; (proxy): mosaic Δ0.012
 ```
 

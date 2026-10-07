@@ -63,7 +63,7 @@ fn main() -> Result<(), String> {
         );
         if !eq(&b, &a) {
             let (border, interior) = diff_breakdown(&a, &b, 30);
-            println!("   {name} tile128-vs-auto: mean|diff| {gm128:.4}/255, differing {gd128:.3} % (border {border}, interior {interior})");
+            println!("   {name} tile128-vs-auto: mean|diff| {gm128:.4}/255, differing channel samples {gd128:.3} % (border {border}, interior {interior})");
         }
         let png = encode_png(&a);
         std::fs::write(out_dir.join(format!("{name}_full.png")), &png).map_err(|e| e.to_string())?;
@@ -114,7 +114,7 @@ fn main() -> Result<(), String> {
     let full_down = resize_rgba8(&rgba8_from_surface(&mosaic_full, bounds), 1600, 1600)?;
     let proxy_img = rgba8_from_surface(&mosaic_proxy, p_bounds);
     let (m, d) = compare(&full_down, &proxy_img).ok_or("proxy sizes differ")?;
-    println!("mosaic  full-downscaled vs proxy-applied: mean|diff| {m:.3} / 255, differing {d:.3} % (resampling tolerance)");
+    println!("mosaic  full-downscaled vs proxy-applied: mean|diff| {m:.3} / 255, differing channel samples {d:.3} % (resampling tolerance)");
     if m > 4.0 {
         return Err(format!("FAIL: mosaic preview/full drift too large ({m:.3})"));
     }
