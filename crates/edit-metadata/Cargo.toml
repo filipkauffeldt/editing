@@ -1,0 +1,24 @@
+[package]
+name = "edit-metadata"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+description = "EXIF/XMP read and exiftool resident writer with crs sidecars."
+
+[features]
+# Expose the scripted exiftool transport to downstream crates' tests.
+test-transport = []
+
+[dependencies]
+edit-core.workspace = true
+edit-catalog.workspace = true
+lightcraft-develop.workspace = true
+kamadak-exif.workspace = true
+quick-xml.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+thiserror.workspace = true
+
+[dev-dependencies]
+tempfile = "3"
