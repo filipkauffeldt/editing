@@ -1,10 +1,10 @@
 //! Catalog open, numbered migrations, crash recovery.
 //!
-//! [`Catalog::open`] applies pending migrations, then returns interrupted
-//! work to the queue: every `running` job goes back to `queued` (see
-//! [`crate::jobs`] for why this is safe). Worker threads use
-//! [`Catalog::open_worker`], which migrates without recovering so it never
-//! steals a job another thread is running.
+//! [`Catalog::open`] applies pending migrations and nothing else. Crash
+//! recovery is an explicit second step: call [`Catalog::recover_running`]
+//! once at startup to return interrupted jobs to `queued` (see
+//! [`crate::jobs`]). Keeping recovery out of the constructor means a second
+//! `open` mid-run can never re-queue jobs another handle is running.
 
 use std::path::{Path, PathBuf};
 use std::sync::Mutex;
@@ -33,38 +33,46 @@ pub fn now_unix() -> i64 {
 }
 
 /// The SQLite catalog. One shared connection behind a mutex; worker threads
-/// open their own connections through [`Catalog::open_worker`].
+/// hold their own connections, opened through [`Catalog::open_worker_conn`].
 pub struct Catalog {
     path: PathBuf,
     conn: Mutex<Connection>,
 }
 
 impl Catalog {
-    /// Open (creating) the catalog at `path`, migrate it, and recover
-    /// interrupted jobs. This is the only entry point that runs recovery.
+    /// Open (creating) the catalog at `path` and apply pending migrations.
+    /// Recovery is deliberately separate: call [`Catalog::recover_running`]
+    /// once at startup.
     pub fn open(path: &Path) -> Result<Self> {
-        let catalog = Self::open_inner(path, true)?;
-        Ok(catalog)
-    }
-
-    /// Open a worker handle: migrate, but do NOT recover `running` jobs.
-    /// Workers call this once per thread so every claim sees the schema
-    /// without resetting jobs other threads are running.
-    pub fn open_worker(path: &Path) -> Result<WorkerHandle> {
         let conn = connect(path)?;
         apply_migrations(&conn)?;
-        Ok(WorkerHandle { conn })
-    }
-
-    fn open_inner(path: &Path, recover: bool) -> Result<Self> {
-        let conn = connect(path)?;
-        apply_migrations(&conn)?;
-        if recover {
-            recover_running_jobs(&conn)?;
-        }
         Ok(Self {
             path: path.to_path_buf(),
             conn: Mutex::new(conn),
+        })
+    }
+
+    /// Crash recovery: jobs still marked `running` belonged to a dead
+    /// process — no worker can be alive to finish them, so they return to
+    /// `queued` with their attempt counts intact. Call once at startup, never
+    /// while workers are running. Returns the number of recovered jobs.
+    pub fn recover_running(&self) -> Result<usize> {
+        self.with_conn(recover_running_jobs)
+    }
+
+    /// Re-apply pending migrations. Idempotent and cheap once migrated;
+    /// `spawn_workers` calls this on the main handle so worker connections
+    /// never race on the schema.
+    pub(crate) fn ensure_migrated(&self) -> Result<()> {
+        self.with_conn(apply_migrations)
+    }
+
+    /// Open a worker's private connection over the same file: pragmas, but
+    /// no migrations and no recovery. Only `spawn_workers` uses this, after
+    /// [`Catalog::ensure_migrated`] ran on the main handle.
+    pub(crate) fn open_worker_conn(&self) -> Result<WorkerHandle> {
+        Ok(WorkerHandle {
+            conn: connect(&self.path)?,
         })
     }
 
@@ -103,7 +111,10 @@ fn connect(path: &Path) -> Result<Connection> {
     conn.pragma_update(None, "journal_mode", "WAL")?;
     conn.pragma_update(None, "foreign_keys", "ON")?;
     conn.pragma_update(None, "busy_timeout", 5000)?;
-    conn.pragma_update(None, "synchronous", "FULL")?;
+    // NORMAL with WAL is process-crash safe (a dead worker loses nothing
+    // committed); FULL would fsync every claim for OS-crash durability the
+    // queue does not need.
+    conn.pragma_update(None, "synchronous", "NORMAL")?;
     Ok(conn)
 }
 

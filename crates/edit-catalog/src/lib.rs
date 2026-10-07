@@ -1,8 +1,9 @@
 //! SQLite catalog: schema, typed stores, and a durable job queue.
 //!
-//! Open with [`Catalog::open`], which migrates the database and recovers
-//! jobs left `running` by a crash. Background threads claim jobs through
-//! [`spawn_workers`] and report progress on a [`flume`] channel.
+//! Open with [`Catalog::open`] (applies pending migrations), call
+//! [`Catalog::recover_running`] once at startup to re-queue jobs left
+//! `running` by a crash, then drain the queue with [`spawn_workers`].
+//! Background threads report progress on a [`flume`] channel.
 
 pub mod db;
 pub mod error;

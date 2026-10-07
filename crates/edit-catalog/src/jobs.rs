@@ -3,15 +3,14 @@
 //! Workers claim jobs with one atomic `UPDATE ... RETURNING` statement, so N
 //! threads never run the same job twice. Progress flows back over a
 //! [`flume`] channel that the UI drains; background threads never touch UI
-//! state. A crash mid-job is safe: [`Catalog::open`] returns `running` rows
-//! to `queued` (no worker can still be alive to finish them), and the next
-//! worker picks them up with the attempt count intact.
+//! state. A crash mid-job is safe: [`Catalog::recover_running`] (called once
+//! at startup) returns `running` rows to `queued`, and the next worker picks
+//! them up with the attempt count intact.
 //!
 //! Job kinds (plan section 1.2): `catalog_scan`, `thumb`, `preview`,
 //! `develop_full`, `retouch_render`, `export`, `face_detect`,
 //! `metadata_write`, `ingest_copy`, `ingest_verify`, `backup_copy`, `upload`.
 
-use std::path::Path;
 use std::str::FromStr;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -156,7 +155,7 @@ pub struct Job {
 
 /// A job owned by one worker. The worker must finish it with
 /// [`Catalog::complete_job`] or [`Catalog::fail_job`]; if the process dies
-/// first, reopening the catalog re-queues it.
+/// first, the next startup's [`Catalog::recover_running`] re-queues it.
 #[derive(Clone, Debug)]
 pub struct ClaimedJob {
     pub id: JobId,
@@ -287,7 +286,7 @@ impl Catalog {
     /// Read one job row.
     pub fn job(&self, id: JobId) -> Result<Job> {
         self.with_conn(|conn| {
-            conn.query_row("SELECT * FROM jobs WHERE id = ?1", [id.0], row_job)
+            conn.query_row("SELECT id, kind, payload_json, state, attempts, error, created_at, updated_at FROM jobs WHERE id = ?1", [id.0], row_job)
                 .optional()?
                 .ok_or_else(|| Error::NotFound(format!("job {}", id.0)))
         })
@@ -307,7 +306,7 @@ impl Catalog {
     /// Newest jobs first, at most `limit`.
     pub fn list_jobs(&self, limit: i64) -> Result<Vec<Job>> {
         self.with_conn(|conn| {
-            let mut stmt = conn.prepare("SELECT * FROM jobs ORDER BY id DESC LIMIT ?1")?;
+            let mut stmt = conn.prepare("SELECT id, kind, payload_json, state, attempts, error, created_at, updated_at FROM jobs ORDER BY id DESC LIMIT ?1")?;
             Ok(stmt
                 .query_map([limit], row_job)?
                 .collect::<rusqlite::Result<_>>()?)
@@ -376,13 +375,22 @@ impl WorkerPool {
     }
 }
 
-/// Spawn `count` worker threads over the catalog at `db_path`.
-pub fn spawn_workers(db_path: &Path, count: usize, handler: JobHandler) -> Result<WorkerPool> {
+/// Spawn `count` worker threads over an open catalog.
+///
+/// Migrations run once on the main handle before any thread starts, so
+/// worker connections never race on the schema. Every connection opens
+/// before the first thread spawns, so a failure returns here instead of
+/// leaking detached spinning workers.
+pub fn spawn_workers(catalog: &Catalog, count: usize, handler: JobHandler) -> Result<WorkerPool> {
+    catalog.ensure_migrated()?;
+    let mut workers = Vec::with_capacity(count);
+    for _ in 0..count {
+        workers.push(catalog.open_worker_conn()?);
+    }
     let (tx, rx) = flume::unbounded();
     let shutdown = Arc::new(AtomicBool::new(false));
     let mut handles = Vec::with_capacity(count);
-    for _ in 0..count {
-        let worker = Catalog::open_worker(db_path)?;
+    for worker in workers {
         let tx = tx.clone();
         let handler = Arc::clone(&handler);
         let shutdown = Arc::clone(&shutdown);
@@ -418,24 +426,29 @@ fn worker_loop(
                 );
                 match handler(&job, tx) {
                     Ok(()) => {
-                        worker.complete_job(id).ok();
-                        send(
-                            tx,
-                            JobEvent {
-                                id,
-                                kind: JobEventKind::Succeeded,
-                            },
-                        );
+                        // Only report success when the row actually
+                        // transitioned: a job cancelled mid-run stays
+                        // `cancelled` instead of flashing a done badge.
+                        if worker.complete_job(id).is_ok() {
+                            send(
+                                tx,
+                                JobEvent {
+                                    id,
+                                    kind: JobEventKind::Succeeded,
+                                },
+                            );
+                        }
                     }
                     Err(error) => {
-                        worker.fail_job(id, &error).ok();
-                        send(
-                            tx,
-                            JobEvent {
-                                id,
-                                kind: JobEventKind::Failed { error },
-                            },
-                        );
+                        if worker.fail_job(id, &error).is_ok() {
+                            send(
+                                tx,
+                                JobEvent {
+                                    id,
+                                    kind: JobEventKind::Failed { error },
+                                },
+                            );
+                        }
                     }
                 }
             }
@@ -498,7 +511,7 @@ mod tests {
             assert_eq!(job.payload_json, r#"{"photo":1}"#);
             Ok(())
         });
-        let pool = spawn_workers(&path, 1, handler).unwrap();
+        let pool = spawn_workers(&db, 1, handler).unwrap();
         wait_for(Duration::from_secs(10), || {
             db.count_jobs_by_state(JobState::Done).unwrap_or(0) == 1
         });
@@ -529,7 +542,7 @@ mod tests {
         let id = db.enqueue_job(JobKind::Export, "{}").unwrap();
 
         let handler: JobHandler = Arc::new(|_, _| Err("disk full".to_string()));
-        let pool = spawn_workers(&path, 1, handler).unwrap();
+        let pool = spawn_workers(&db, 1, handler).unwrap();
         wait_for(Duration::from_secs(10), || {
             db.count_jobs_by_state(JobState::Failed).unwrap_or(0) == 1
         });
@@ -542,7 +555,7 @@ mod tests {
     }
 
     #[test]
-    fn running_job_reverts_to_queued_on_reopen() {
+    fn running_job_reverts_to_queued_on_recover() {
         let path = scratch_db("job-resume");
         let id = {
             let db = Catalog::open(&path).unwrap();
@@ -555,14 +568,20 @@ mod tests {
         // `db` is dropped here without finishing the job: the crash.
 
         let db = Catalog::open(&path).unwrap();
+        // A plain open never touches in-flight jobs: only the explicit
+        // startup recovery does.
+        assert_eq!(db.job(id).unwrap().state, JobState::Running);
+        assert_eq!(db.recover_running().unwrap(), 1);
         let job = db.job(id).unwrap();
         assert_eq!(job.state, JobState::Queued);
         // The attempt is kept, so retries can back off or give up.
         assert_eq!(job.attempts, 1);
+        // Recovering again is a no-op.
+        assert_eq!(db.recover_running().unwrap(), 0);
 
         // And the job actually runs after recovery.
         let handler: JobHandler = Arc::new(|_, _| Ok(()));
-        let pool = spawn_workers(&path, 1, handler).unwrap();
+        let pool = spawn_workers(&db, 1, handler).unwrap();
         wait_for(Duration::from_secs(10), || {
             db.count_jobs_by_state(JobState::Done).unwrap_or(0) == 1
         });
@@ -589,7 +608,7 @@ mod tests {
             *handler_runs.lock().unwrap().entry(job.id.0).or_default() += 1;
             Ok(())
         });
-        let pool = spawn_workers(&path, 4, handler).unwrap();
+        let pool = spawn_workers(&db, 4, handler).unwrap();
         wait_for(Duration::from_secs(30), || {
             db.count_jobs_by_state(JobState::Done).unwrap_or(0) == JOBS as i64
         });
@@ -606,6 +625,85 @@ mod tests {
             .collect();
         assert_eq!(ids.len(), JOBS);
         pool.shutdown();
+        std::fs::remove_file(path).ok();
+    }
+
+    #[test]
+    fn cancelled_running_job_reports_no_terminal_event() {
+        let path = scratch_db("job-cancel");
+        let db = Catalog::open(&path).unwrap();
+        let id = db.enqueue_job(JobKind::Export, "{}").unwrap();
+
+        // Slow handler: still inside the job body when the cancel lands.
+        let handler: JobHandler = Arc::new(|_, _| {
+            thread::sleep(Duration::from_millis(200));
+            Ok(())
+        });
+        let pool = spawn_workers(&db, 1, handler).unwrap();
+        wait_for(Duration::from_secs(10), || {
+            db.job(id).unwrap().state == JobState::Running
+        });
+        db.cancel_job(id).unwrap();
+        // Let the worker finish the body and attempt the completion.
+        thread::sleep(Duration::from_millis(500));
+
+        // The cancel wins: no Succeeded event, no silent flip to done.
+        assert_eq!(db.job(id).unwrap().state, JobState::Cancelled);
+        let events = drain_events(pool.events());
+        assert!(
+            events
+                .iter()
+                .any(|e| e.id == id && matches!(e.kind, JobEventKind::Started { .. }))
+        );
+        assert!(
+            !events.iter().any(|e| e.id == id
+                && matches!(
+                    e.kind,
+                    JobEventKind::Succeeded | JobEventKind::Failed { .. }
+                )),
+            "cancelled job must not report a terminal event: {events:?}"
+        );
+        pool.shutdown();
+        std::fs::remove_file(path).ok();
+    }
+
+    #[test]
+    fn handler_progress_events_reach_the_drain() {
+        let path = scratch_db("job-progress");
+        let db = Catalog::open(&path).unwrap();
+        let id = db.enqueue_job(JobKind::Thumb, "{}").unwrap();
+
+        // Handler contract: Started/Succeeded come from the worker loop;
+        // Progress comes from the handler itself on the same channel.
+        let handler: JobHandler = Arc::new(|job, tx| {
+            for done in 1..=2 {
+                tx.send(JobEvent {
+                    id: job.id,
+                    kind: JobEventKind::Progress { done, total: 2 },
+                })
+                .unwrap();
+            }
+            Ok(())
+        });
+        let pool = spawn_workers(&db, 1, handler).unwrap();
+        // Started + 2x Progress + Succeeded, in order on one channel.
+        wait_for(Duration::from_secs(10), || pool.events().len() >= 4);
+
+        let kinds: Vec<JobEventKind> = drain_events(pool.events())
+            .into_iter()
+            .filter(|e| e.id == id)
+            .map(|e| e.kind)
+            .collect();
+        pool.shutdown();
+        assert_eq!(
+            kinds,
+            vec![
+                JobEventKind::Started { attempts: 1 },
+                JobEventKind::Progress { done: 1, total: 2 },
+                JobEventKind::Progress { done: 2, total: 2 },
+                JobEventKind::Succeeded,
+            ]
+        );
         std::fs::remove_file(path).ok();
     }
 }
