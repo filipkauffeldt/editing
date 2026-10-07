@@ -1,0 +1,48 @@
+# R0 retouch spike — standalone crate, intentionally NOT a member of the app
+# workspace (A1 owns that). All upstream crates are git-pinned; bumps are their
+# own PR. Pins recorded in docs/research/retouch-r0-memo.md.
+[package]
+name = "retouch-r0"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.95"
+publish = false
+description = "R0 spike: LightCraft in-process render, face-detector bake-off, photocraft-algo retouch"
+
+[dependencies]
+# storytold/lightcraft @ f2f449611d248a907f755d6e18f3701db5755f03 (2026-10-07)
+lightcraft-develop = { git = "https://github.com/storytold/lightcraft", rev = "f2f449611d248a907f755d6e18f3701db5755f03" }
+lightcraft-pipeline = { git = "https://github.com/storytold/lightcraft", rev = "f2f449611d248a907f755d6e18f3701db5755f03" }
+lightcraft-raw = { git = "https://github.com/storytold/lightcraft", rev = "f2f449611d248a907f755d6e18f3701db5755f03" }
+lightcraft-codecs = { git = "https://github.com/storytold/lightcraft", rev = "f2f449611d248a907f755d6e18f3701db5755f03", default-features = false }
+lightcraft-color = { git = "https://github.com/storytold/lightcraft", rev = "f2f449611d248a907f755d6e18f3701db5755f03" }
+lightcraft-raster = { git = "https://github.com/storytold/lightcraft", rev = "f2f449611d248a907f755d6e18f3701db5755f03" }
+lightcraft-geom = { git = "https://github.com/storytold/lightcraft", rev = "f2f449611d248a907f755d6e18f3701db5755f03" }
+
+# storytold/photocraft @ 90df9cfc159e5916be92c6b25f30c13913dfdd70 (2026-10-07)
+photocraft-algo = { git = "https://github.com/storytold/photocraft", rev = "90df9cfc159e5916be92c6b25f30c13913dfdd70" }
+photocraft-raster = { git = "https://github.com/storytold/photocraft", rev = "90df9cfc159e5916be92c6b25f30c13913dfdd70" }
+photocraft-color = { git = "https://github.com/storytold/photocraft", rev = "90df9cfc159e5916be92c6b25f30c13913dfdd70" }
+photocraft-geom = { git = "https://github.com/storytold/photocraft", rev = "90df9cfc159e5916be92c6b25f30c13913dfdd70" }
+
+serde_json = "1"
+image = { version = "0.25", default-features = false, features = ["png", "jpeg"] }
+
+[features]
+default = ["libfd", "tract"]
+# ShiqiYu/libfacedetection rust/ port @ acf7b254121927e7dced30e233a2e03119f28ea2
+libfd = ["dep:libfacedetection_rs"]
+# tract + YuNet ONNX (model downloaded separately, never committed)
+tract = ["dep:tract-onnx"]
+
+[dependencies.libfacedetection_rs]
+git = "https://github.com/ShiqiYu/libfacedetection"
+rev = "acf7b254121927e7dced30e233a2e03119f28ea2"
+optional = true
+
+[dependencies.tract-onnx]
+version = "0.21"
+optional = true
+
+[profile.release]
+debug = false

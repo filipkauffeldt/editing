@@ -1,0 +1,13 @@
+# Downloads stay out of the repo: datasets, models, rendered outputs.
+downloads/
+data/
+models/
+out/
+*.onnx
+*.nef
+*.NEF
+
+# Build output.
+target/
+target-cli/
+
