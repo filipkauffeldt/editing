@@ -264,7 +264,7 @@ impl Catalog {
 
     pub fn get_photo(&self, id: i64) -> Result<Photo> {
         self.with_conn(|conn| {
-            conn.query_row("SELECT * FROM photos WHERE id = ?1", [id], row_photo)
+            conn.query_row("SELECT id, root_id, path, dir, base_name, ext, kind, bytes, mtime, width, height, orientation, taken_at, camera, lens, iso, aperture, shutter, focal, rating, color_label, ingest_batch_id, created_at FROM photos WHERE id = ?1", [id], row_photo)
                 .optional()?
                 .ok_or_else(|| not_found("photo", id))
         })
@@ -272,7 +272,7 @@ impl Catalog {
 
     pub fn list_photos_by_root(&self, root_id: i64) -> Result<Vec<Photo>> {
         self.with_conn(|conn| {
-            let mut stmt = conn.prepare("SELECT * FROM photos WHERE root_id = ?1 ORDER BY id")?;
+            let mut stmt = conn.prepare("SELECT id, root_id, path, dir, base_name, ext, kind, bytes, mtime, width, height, orientation, taken_at, camera, lens, iso, aperture, shutter, focal, rating, color_label, ingest_batch_id, created_at FROM photos WHERE root_id = ?1 ORDER BY id")?;
             Ok(stmt
                 .query_map([root_id], row_photo)?
                 .collect::<rusqlite::Result<_>>()?)
@@ -313,9 +313,13 @@ impl Catalog {
 
     pub fn get_item(&self, id: i64) -> Result<Item> {
         self.with_conn(|conn| {
-            conn.query_row("SELECT * FROM items WHERE id = ?1", [id], row_item)
-                .optional()?
-                .ok_or_else(|| not_found("item", id))
+            conn.query_row(
+                "SELECT id, dir, base_name, raw_photo_id, jpeg_photo_id FROM items WHERE id = ?1",
+                [id],
+                row_item,
+            )
+            .optional()?
+            .ok_or_else(|| not_found("item", id))
         })
     }
 
@@ -323,7 +327,7 @@ impl Catalog {
         self.with_conn(|conn| {
             Ok(conn
                 .query_row(
-                    "SELECT * FROM items WHERE dir = ?1 AND base_name = ?2",
+                    "SELECT id, dir, base_name, raw_photo_id, jpeg_photo_id FROM items WHERE dir = ?1 AND base_name = ?2",
                     params![dir, base_name],
                     row_item,
                 )
@@ -357,7 +361,7 @@ impl Catalog {
         self.with_conn(|conn| {
             Ok(conn
                 .query_row(
-                    "SELECT * FROM edits WHERE item_id = ?1",
+                    "SELECT item_id, develop_json, crop_json, updated_at, crs_written_at FROM edits WHERE item_id = ?1",
                     [item_id],
                     row_edit,
                 )
@@ -396,7 +400,7 @@ impl Catalog {
     pub fn get_selection(&self, id: i64) -> Result<Selection> {
         self.with_conn(|conn| {
             conn.query_row(
-                "SELECT * FROM selections WHERE id = ?1",
+                "SELECT id, item_id, name, shapes_json, updated_at FROM selections WHERE id = ?1",
                 [id],
                 row_selection,
             )
@@ -408,7 +412,7 @@ impl Catalog {
     pub fn list_selections_for_item(&self, item_id: i64) -> Result<Vec<Selection>> {
         self.with_conn(|conn| {
             let mut stmt =
-                conn.prepare("SELECT * FROM selections WHERE item_id = ?1 ORDER BY id")?;
+                conn.prepare("SELECT id, item_id, name, shapes_json, updated_at FROM selections WHERE item_id = ?1 ORDER BY id")?;
             Ok(stmt
                 .query_map([item_id], row_selection)?
                 .collect::<rusqlite::Result<_>>()?)
@@ -430,7 +434,7 @@ impl Catalog {
         self.with_conn(|conn| {
             Ok(conn
                 .query_row(
-                    "SELECT * FROM masks WHERE selection_id = ?1 AND size = ?2",
+                    "SELECT selection_id, size, hash, rle FROM masks WHERE selection_id = ?1 AND size = ?2",
                     params![selection_id, size],
                     row_mask,
                 )
@@ -459,7 +463,7 @@ impl Catalog {
     pub fn get_retouch_recipe(&self, id: i64) -> Result<RetouchRecipeRow> {
         self.with_conn(|conn| {
             conn.query_row(
-                "SELECT * FROM retouch_recipes WHERE id = ?1",
+                "SELECT id, name, ops_json, is_sticky, created_at FROM retouch_recipes WHERE id = ?1",
                 [id],
                 row_recipe,
             )
@@ -470,7 +474,9 @@ impl Catalog {
 
     pub fn list_retouch_recipes(&self) -> Result<Vec<RetouchRecipeRow>> {
         self.with_conn(|conn| {
-            let mut stmt = conn.prepare("SELECT * FROM retouch_recipes ORDER BY id")?;
+            let mut stmt = conn.prepare(
+                "SELECT id, name, ops_json, is_sticky, created_at FROM retouch_recipes ORDER BY id",
+            )?;
             Ok(stmt
                 .query_map([], row_recipe)?
                 .collect::<rusqlite::Result<_>>()?)
@@ -497,18 +503,21 @@ impl Catalog {
     pub fn list_retouch_versions_for_item(&self, item_id: i64) -> Result<Vec<RetouchVersion>> {
         self.with_conn(|conn| {
             let mut stmt =
-                conn.prepare("SELECT * FROM retouch_versions WHERE item_id = ?1 ORDER BY id")?;
+                conn.prepare("SELECT id, item_id, parent_id, recipe_json, is_top, created_at FROM retouch_versions WHERE item_id = ?1 ORDER BY id")?;
             Ok(stmt
                 .query_map([item_id], row_version)?
                 .collect::<rusqlite::Result<_>>()?)
         })
     }
 
+    /// The newest version flagged as the export top. Callers keep at most
+    /// one `is_top` row per item; this is a convention, not a constraint —
+    /// follow-up: a partial unique index on (item_id) WHERE is_top = 1.
     pub fn top_retouch_version(&self, item_id: i64) -> Result<Option<RetouchVersion>> {
         self.with_conn(|conn| {
             Ok(conn
                 .query_row(
-                    "SELECT * FROM retouch_versions WHERE item_id = ?1 AND is_top = 1 ORDER BY id DESC LIMIT 1",
+                    "SELECT id, item_id, parent_id, recipe_json, is_top, created_at FROM retouch_versions WHERE item_id = ?1 AND is_top = 1 ORDER BY id DESC LIMIT 1",
                     [item_id],
                     row_version,
                 )
@@ -537,7 +546,9 @@ impl Catalog {
 
     pub fn list_presets(&self) -> Result<Vec<Preset>> {
         self.with_conn(|conn| {
-            let mut stmt = conn.prepare("SELECT * FROM presets ORDER BY id")?;
+            let mut stmt = conn.prepare(
+                "SELECT id, name, group_name, path, source, updated_at FROM presets ORDER BY id",
+            )?;
             Ok(stmt
                 .query_map([], row_preset)?
                 .collect::<rusqlite::Result<_>>()?)
@@ -566,7 +577,7 @@ impl Catalog {
     pub fn list_detections_for_item(&self, item_id: i64) -> Result<Vec<Detection>> {
         self.with_conn(|conn| {
             let mut stmt =
-                conn.prepare("SELECT * FROM detections WHERE item_id = ?1 ORDER BY id")?;
+                conn.prepare("SELECT id, item_id, region_json, boxes_json, detector, created_at FROM detections WHERE item_id = ?1 ORDER BY id")?;
             Ok(stmt
                 .query_map([item_id], row_detection)?
                 .collect::<rusqlite::Result<_>>()?)
@@ -574,6 +585,19 @@ impl Catalog {
     }
 
     // ---- transfers ----
+
+    /// States a transfer row may hold (plan section 1.3).
+    const TRANSFER_STATES: &[&str] = &["queued", "uploading", "done", "failed"];
+
+    fn check_transfer_state(state: &str) -> Result<()> {
+        if Self::TRANSFER_STATES.contains(&state) {
+            Ok(())
+        } else {
+            Err(Error::InvalidValue(format!(
+                "unknown transfer state: {state}"
+            )))
+        }
+    }
 
     pub fn insert_transfer(&self, item_id: i64, recipe_id: i64, remote_path: &str) -> Result<i64> {
         self.with_conn(|conn| {
@@ -588,7 +612,7 @@ impl Catalog {
 
     pub fn get_transfer(&self, id: i64) -> Result<Transfer> {
         self.with_conn(|conn| {
-            conn.query_row("SELECT * FROM transfers WHERE id = ?1", [id], row_transfer)
+            conn.query_row("SELECT id, item_id, recipe_id, remote_path, state, bytes_done, attempts, error, updated_at FROM transfers WHERE id = ?1", [id], row_transfer)
                 .optional()?
                 .ok_or_else(|| not_found("transfer", id))
         })
@@ -597,13 +621,16 @@ impl Catalog {
     pub fn list_transfers_for_item(&self, item_id: i64) -> Result<Vec<Transfer>> {
         self.with_conn(|conn| {
             let mut stmt =
-                conn.prepare("SELECT * FROM transfers WHERE item_id = ?1 ORDER BY id")?;
+                conn.prepare("SELECT id, item_id, recipe_id, remote_path, state, bytes_done, attempts, error, updated_at FROM transfers WHERE item_id = ?1 ORDER BY id")?;
             Ok(stmt
                 .query_map([item_id], row_transfer)?
                 .collect::<rusqlite::Result<_>>()?)
         })
     }
 
+    /// Move a transfer to a new state. `attempts` counts delivery tries, so
+    /// it only bumps on terminal/error transitions (`done`, `failed`);
+    /// per-chunk progress goes through [`Catalog::update_transfer_progress`].
     pub fn set_transfer_state(
         &self,
         id: i64,
@@ -611,11 +638,34 @@ impl Catalog {
         bytes_done: i64,
         error: Option<&str>,
     ) -> Result<()> {
+        Self::check_transfer_state(state)?;
+        let bump_attempts = matches!(state, "done" | "failed");
         self.with_conn(|conn| {
             let n = conn.execute(
                 "UPDATE transfers SET state = ?1, bytes_done = ?2, error = ?3,
-                     attempts = attempts + 1, updated_at = ?4 WHERE id = ?5",
-                params![state, bytes_done, error, now_unix(), id],
+                     attempts = attempts + ?4, updated_at = ?5 WHERE id = ?6",
+                params![
+                    state,
+                    bytes_done,
+                    error,
+                    bump_attempts as i64,
+                    now_unix(),
+                    id
+                ],
+            )?;
+            if n == 0 {
+                return Err(not_found("transfer", id));
+            }
+            Ok(())
+        })
+    }
+
+    /// Record upload progress without touching state or attempts.
+    pub fn update_transfer_progress(&self, id: i64, bytes_done: i64) -> Result<()> {
+        self.with_conn(|conn| {
+            let n = conn.execute(
+                "UPDATE transfers SET bytes_done = ?1, updated_at = ?2 WHERE id = ?3",
+                params![bytes_done, now_unix(), id],
             )?;
             if n == 0 {
                 return Err(not_found("transfer", id));
@@ -640,7 +690,7 @@ impl Catalog {
     pub fn get_iptc_template(&self, id: i64) -> Result<IptcTemplate> {
         self.with_conn(|conn| {
             conn.query_row(
-                "SELECT * FROM iptc_templates WHERE id = ?1",
+                "SELECT id, name, fields_json, scope, updated_at FROM iptc_templates WHERE id = ?1",
                 [id],
                 row_template,
             )
@@ -651,7 +701,9 @@ impl Catalog {
 
     pub fn list_iptc_templates(&self) -> Result<Vec<IptcTemplate>> {
         self.with_conn(|conn| {
-            let mut stmt = conn.prepare("SELECT * FROM iptc_templates ORDER BY id")?;
+            let mut stmt = conn.prepare(
+                "SELECT id, name, fields_json, scope, updated_at FROM iptc_templates ORDER BY id",
+            )?;
             Ok(stmt
                 .query_map([], row_template)?
                 .collect::<rusqlite::Result<_>>()?)
@@ -679,7 +731,7 @@ impl Catalog {
     pub fn get_send_recipe(&self, id: i64) -> Result<SendRecipe> {
         self.with_conn(|conn| {
             conn.query_row(
-                "SELECT * FROM send_recipes WHERE id = ?1",
+                "SELECT id, name, config_json, is_active, updated_at FROM send_recipes WHERE id = ?1",
                 [id],
                 row_send_recipe,
             )
@@ -688,11 +740,14 @@ impl Catalog {
         })
     }
 
+    /// The newest recipe flagged active. Callers keep at most one active
+    /// recipe; this is a convention, not a constraint — follow-up: a partial
+    /// unique index on (is_active) WHERE is_active = 1.
     pub fn active_send_recipe(&self) -> Result<Option<SendRecipe>> {
         self.with_conn(|conn| {
             Ok(conn
                 .query_row(
-                    "SELECT * FROM send_recipes WHERE is_active = 1 ORDER BY id DESC LIMIT 1",
+                    "SELECT id, name, config_json, is_active, updated_at FROM send_recipes WHERE is_active = 1 ORDER BY id DESC LIMIT 1",
                     [],
                     row_send_recipe,
                 )
@@ -728,7 +783,7 @@ impl Catalog {
     pub fn list_codes_in_group(&self, group: &str) -> Result<Vec<CodeReplacement>> {
         self.with_conn(|conn| {
             let mut stmt = conn
-                .prepare("SELECT * FROM code_replacements WHERE group_name = ?1 ORDER BY code")?;
+                .prepare("SELECT id, group_name, code, value FROM code_replacements WHERE group_name = ?1 ORDER BY code")?;
             Ok(stmt
                 .query_map([group], row_code)?
                 .collect::<rusqlite::Result<_>>()?)
@@ -737,7 +792,21 @@ impl Catalog {
 
     // ---- ingest batches ----
 
+    /// States an ingest batch may hold: active, then one terminal state.
+    const INGEST_BATCH_STATES: &[&str] = &["running", "done", "failed"];
+
+    fn check_ingest_batch_state(state: &str) -> Result<()> {
+        if Self::INGEST_BATCH_STATES.contains(&state) {
+            Ok(())
+        } else {
+            Err(Error::InvalidValue(format!(
+                "unknown ingest batch state: {state}"
+            )))
+        }
+    }
+
     pub fn insert_ingest_batch(&self, dest_dir: &str, state: &str) -> Result<i64> {
+        Self::check_ingest_batch_state(state)?;
         self.with_conn(|conn| {
             conn.execute(
                 "INSERT INTO ingest_batches (dest_dir, state, started_at)
@@ -751,7 +820,7 @@ impl Catalog {
     pub fn get_ingest_batch(&self, id: i64) -> Result<IngestBatch> {
         self.with_conn(|conn| {
             conn.query_row(
-                "SELECT * FROM ingest_batches WHERE id = ?1",
+                "SELECT id, volume_uuid, volume_label, session_name, dest_dir, backup_dir, template_id, state, started_at, finished_at FROM ingest_batches WHERE id = ?1",
                 [id],
                 row_batch,
             )
@@ -761,6 +830,7 @@ impl Catalog {
     }
 
     pub fn finish_ingest_batch(&self, id: i64, state: &str) -> Result<()> {
+        Self::check_ingest_batch_state(state)?;
         self.with_conn(|conn| {
             let n = conn.execute(
                 "UPDATE ingest_batches SET state = ?1, finished_at = ?2 WHERE id = ?3",
@@ -836,6 +906,7 @@ mod tests {
         let batch_row = db.get_ingest_batch(batch).unwrap();
         assert_eq!(batch_row.state, "done");
         assert!(batch_row.finished_at.is_some());
+        assert!(db.insert_ingest_batch("/photos/2026", "bogus").is_err());
 
         let photo = db.insert_photo(&photo_fixture(root, 1)).unwrap();
         assert_eq!(db.get_photo(photo).unwrap().base_name, "DSC00001");
@@ -910,6 +981,19 @@ mod tests {
             (tx_row.state.as_str(), tx_row.bytes_done),
             ("uploading", 512)
         );
+        // Progress updates move bytes only: no attempt is consumed.
+        db.update_transfer_progress(tx, 1024).unwrap();
+        let tx_row = db.get_transfer(tx).unwrap();
+        assert_eq!(
+            (tx_row.state.as_str(), tx_row.bytes_done, tx_row.attempts),
+            ("uploading", 1024, 0)
+        );
+        // Only terminal/error transitions bump attempts.
+        db.set_transfer_state(tx, "failed", 1024, Some("reset by peer"))
+            .unwrap();
+        let tx_row = db.get_transfer(tx).unwrap();
+        assert_eq!(tx_row.attempts, 1);
+        assert!(db.set_transfer_state(tx, "bogus", 0, None).is_err());
         assert_eq!(db.list_transfers_for_item(item).unwrap().len(), 1);
 
         db.upsert_code("sports", "=h1=", "SHL").unwrap();
