@@ -1,5 +1,5 @@
 [workspace]
-members = ["crates/app", "crates/edit-core", "crates/edit-catalog", "crates/edit-ingest", "crates/edit-metadata"]
+members = ["crates/app", "crates/edit-core", "crates/edit-catalog", "crates/edit-ingest", "crates/edit-metadata", "crates/edit-render"]
 resolver = "2"
 
 [workspace.package]
@@ -11,10 +11,17 @@ license = "Apache-2.0"
 [workspace.dependencies]
 # storytold/lightcraft @ f2f449611d248a907f755d6e18f3701db5755f03 (2026-10-07,
 # see docs/research/retouch-r0-memo.md). Not on crates.io, so git-pinned.
-# Only lightcraft-develop is a workspace dependency; each service wraps its
-# own upstream crate in one bridge module.
+# Pinned here so every service can wrap its own upstream crates in one bridge
+# module; the raw code path (decode, or embedded preview when unsupported) and
+# the develop path (lightcraft-pipeline + DevelopSettings) are C1's only
+# consumers of the LightCraft tree. A revision bump is one small PR.
 lightcraft-develop = { git = "https://github.com/storytold/lightcraft", rev = "f2f449611d248a907f755d6e18f3701db5755f03" }
 lightcraft-raw = { git = "https://github.com/storytold/lightcraft", rev = "f2f449611d248a907f755d6e18f3701db5755f03" }
+lightcraft-pipeline = { git = "https://github.com/storytold/lightcraft", rev = "f2f449611d248a907f755d6e18f3701db5755f03" }
+lightcraft-codecs = { git = "https://github.com/storytold/lightcraft", rev = "f2f449611d248a907f755d6e18f3701db5755f03", default-features = false }
+lightcraft-raster = { git = "https://github.com/storytold/lightcraft", rev = "f2f449611d248a907f755d6e18f3701db5755f03" }
+lightcraft-color = { git = "https://github.com/storytold/lightcraft", rev = "f2f449611d248a907f755d6e18f3701db5755f03" }
+lightcraft-geom = { git = "https://github.com/storytold/lightcraft", rev = "f2f449611d248a907f755d6e18f3701db5755f03" }
 image = { version = "0.25", default-features = false, features = ["png", "jpeg"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = { version = "1" }
@@ -30,8 +37,19 @@ edit-ingest = { path = "crates/edit-ingest" }
 # a later cross-platform milestone).
 udev = { version = "0.9" }
 edit-metadata = { path = "crates/edit-metadata" }
+edit-render = { path = "crates/edit-render" }
 kamadak-exif = { version = "0.6" }
 quick-xml = { version = "0.41" }
+# Pure-Rust ICC transform for app-side paths that carry profiles (already in
+# image's tree, so no new lock entry).
+moxcms = { version = "0.8", default-features = false, features = [
+    "avx_shaper_paths",
+    "avx_luts",
+    "sse_shaper_paths",
+    "sse_luts",
+    "neon_shaper_paths",
+    "neon_luts",
+] }
 # The x11 and wayland features select gpui's Linux windowing backends;
 # font-kit enables the freetype/fontconfig text stack, runtime_shaders compiles
 # Metal shaders at runtime on macOS.

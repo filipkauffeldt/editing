@@ -195,10 +195,12 @@ dependencies = [
  "edit-core",
  "edit-ingest",
  "edit-metadata",
+ "edit-render",
  "flume 0.11.1",
  "gpui-kit",
  "gpui-pre-platform",
  "image",
+ "lightcraft-develop",
  "lightcraft-raw",
  "serde",
  "serde_json",
@@ -664,19 +666,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "blake3"
-version = "1.8.7"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "6d9e454fc11f76977dc803893aff6304ed33d6a26efae8696573bea74baa27ae"
-dependencies = [
- "arrayvec",
- "cc",
- "cfg-if",
- "constant_time_eq",
- "cpufeatures 0.3.1",
-]
-
-[[package]]
 name = "block"
 version = "0.1.6"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1087,12 +1076,6 @@ dependencies = [
  "once_cell",
  "tiny-keccak",
 ]
-
-[[package]]
-name = "constant_time_eq"
-version = "0.4.2"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "3d52eff69cd5e647efe296129160853a42795992097e8af39800e1060caeea9b"
 
 [[package]]
 name = "convert_case"
@@ -1575,13 +1558,8 @@ dependencies = [
 name = "edit-ingest"
 version = "0.1.0"
 dependencies = [
- "blake3",
- "edit-catalog",
- "edit-core",
  "flume 0.11.1",
- "libc",
  "serde",
- "serde_json",
  "sysinfo 0.36.1",
  "thiserror 2.0.21",
  "udev",
@@ -1601,6 +1579,22 @@ dependencies = [
  "serde_json",
  "tempfile",
  "thiserror 2.0.21",
+]
+
+[[package]]
+name = "edit-render"
+version = "0.1.0"
+dependencies = [
+ "edit-core",
+ "image",
+ "lightcraft-codecs",
+ "lightcraft-color",
+ "lightcraft-develop",
+ "lightcraft-geom",
+ "lightcraft-pipeline",
+ "lightcraft-raster",
+ "lightcraft-raw",
+ "moxcms 0.8.1",
 ]
 
 [[package]]
@@ -3439,7 +3433,7 @@ dependencies = [
  "exr",
  "gif 0.14.2",
  "image-webp",
- "moxcms",
+ "moxcms 0.8.1",
  "num-traits",
  "png 0.18.1",
  "qoi",
@@ -3672,6 +3666,18 @@ dependencies = [
 ]
 
 [[package]]
+name = "jpeg-decoder"
+version = "0.3.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "00810f1d8b74be64b13dbf3db89ac67740615d6c891f0e7b6179326533011a07"
+
+[[package]]
+name = "jpeg-encoder"
+version = "0.7.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "a0370574b86f7eca156b9f298392b5e69a23f8c86f3f865add60bbc2e79467a6"
+
+[[package]]
 name = "js-sys"
 version = "0.3.106"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -3847,6 +3853,28 @@ dependencies = [
 ]
 
 [[package]]
+name = "lightcraft-codecs"
+version = "0.2.1"
+source = "git+https://github.com/storytold/lightcraft?rev=f2f449611d248a907f755d6e18f3701db5755f03#f2f449611d248a907f755d6e18f3701db5755f03"
+dependencies = [
+ "bytemuck",
+ "image",
+ "image-webp",
+ "jpeg-decoder",
+ "jpeg-encoder",
+ "lightcraft-color",
+ "lightcraft-geom",
+ "lightcraft-raster",
+ "moxcms 0.9.1",
+ "png 0.18.1",
+ "serde",
+ "thiserror 2.0.21",
+ "tiff",
+ "zune-core 0.5.3",
+ "zune-jpeg 0.5.15",
+]
+
+[[package]]
 name = "lightcraft-color"
 version = "0.2.1"
 source = "git+https://github.com/storytold/lightcraft?rev=f2f449611d248a907f755d6e18f3701db5755f03#f2f449611d248a907f755d6e18f3701db5755f03"
@@ -3882,6 +3910,19 @@ dependencies = [
  "lightcraft-geom",
  "lightcraft-tiff",
  "quick-xml 0.38.4",
+ "serde",
+]
+
+[[package]]
+name = "lightcraft-pipeline"
+version = "0.2.1"
+source = "git+https://github.com/storytold/lightcraft?rev=f2f449611d248a907f755d6e18f3701db5755f03#f2f449611d248a907f755d6e18f3701db5755f03"
+dependencies = [
+ "lightcraft-color",
+ "lightcraft-develop",
+ "lightcraft-geom",
+ "lightcraft-raster",
+ "rayon",
  "serde",
 ]
 
@@ -4250,6 +4291,16 @@ name = "moxcms"
 version = "0.8.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "bb85c154ba489f01b25c0d36ae69a87e4a1c73a72631fc6c0eb6dde34a73e44b"
+dependencies = [
+ "num-traits",
+ "pxfm",
+]
+
+[[package]]
+name = "moxcms"
+version = "0.9.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "396077b717181ce3f9a6b66739b269b82d756be5ec0f76be0bc40a7c51775830"
 dependencies = [
  "num-traits",
  "pxfm",
