@@ -316,7 +316,6 @@ fn load_bytes_now(bytes: Cow<'_, [u8]>, max_edge: usize) -> Result<(Rgb32f, Sour
         };
         raw.data = lightcraft_raw::RawData::U16(Vec::new());
         let mut stages = vec![("develop", t0.elapsed())];
-        stages.push(("transform", t0.elapsed()));
         lightcraft_raw::highlight::reconstruct(&mut img, t.wb, HIGHLIGHT_CLIP);
         stages.push(("highlights", t0.elapsed()));
         let m = camera_look.map(|p| p.matrix.mul(&t.matrix)).unwrap_or(t.matrix).to_f32();
@@ -335,6 +334,7 @@ fn load_bytes_now(bytes: Cow<'_, [u8]>, max_edge: usize) -> Result<(Rgb32f, Sour
                 None => rgb.map(|v| (v * gain).max(0.0)),
             }
         });
+        stages.push(("transform", t0.elapsed()));
         stages.push(("colour", t0.elapsed()));
         let img = fit(&img, max_edge, max_edge, Filter::Box);
         stages.push(("fit", t0.elapsed()));
