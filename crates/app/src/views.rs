@@ -27,14 +27,16 @@ use std::sync::Arc;
 
 use edit_catalog::{Catalog, JobEvent, JobEventKind, JobId, JobKind};
 use gpui_kit::component::{TitleBar, h_flex, status_bar::StatusBar, v_flex};
+use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::*;
 
 use crate::browse::{
-    BrowseFilter, BrowseItem, CatalogScanPayload, SelectionModel, SortOrder, ThumbPayload,
-    ThumbState, UploadBadge, ZoomMode, ZoomState, apply_filter_sort, canonical_root,
-    list_browse_items, pair_key, run_catalog_scan,
+    BrowseFilter, BrowseItem, CatalogScanPayload, MetaBadge, SelectionModel, SortOrder,
+    ThumbPayload, ThumbState, UploadBadge, ZoomMode, ZoomState, apply_filter_sort, canonical_root,
+    item_photo_paths, list_browse_items, pair_key, run_catalog_scan,
 };
 use crate::preview::BrowsePreviewProvider;
+use edit_metadata::{MetadataWritePayload, TemplateFields};
 
 /// Cells per contact-sheet row over `uniform_list`.
 pub const GRID_COLS: usize = 4;
@@ -123,7 +125,13 @@ pub struct Browser {
     /// Thumb job id → photo path, resolved from the job payload on
     /// `Started` so progress/completion can mark the right cell.
     thumb_jobs: HashMap<JobId, String>,
+    /// `metadata_write` job id → item id, resolved from the payload so
+    /// per-item badges flip on the right row even across restarts.
+    meta_jobs: HashMap<JobId, i64>,
     scan_jobs: Vec<JobId>,
+    /// Status strip line for template applies (plan section 2.1:
+    /// "template changes" marker).
+    template_status: String,
     drag_from: Option<Point<Pixels>>,
     strip_scroll: ScrollHandle,
     /// Fit scale painted by the last canvas frame; scroll-zoom reads it to
@@ -177,7 +185,9 @@ impl Browser {
             thumb_order: VecDeque::new(),
             thumb_pending: HashSet::new(),
             thumb_jobs: HashMap::new(),
+            meta_jobs: HashMap::new(),
             scan_jobs: Vec::new(),
+            template_status: String::new(),
             drag_from: None,
             strip_scroll: ScrollHandle::new(),
             fit_scale: Rc::new(Cell::new(1.0)),
@@ -275,18 +285,25 @@ impl Browser {
     }
 
     fn merge_thumbs(&mut self, fresh: Vec<BrowseItem>) {
-        // Keep per-photo thumb/upload state across rescans keyed by item id.
-        let kept: HashMap<i64, (ThumbState, UploadBadge, bool)> = self
+        // Keep per-photo thumb/upload/meta state across rescans keyed by
+        // item id so a refresh never forgets what the worker reported.
+        let kept: HashMap<i64, (ThumbState, UploadBadge, bool, MetaBadge)> = self
             .items
             .iter()
-            .map(|item| (item.item_id, (item.thumb, item.upload, item.ingest_fresh)))
+            .map(|item| {
+                (
+                    item.item_id,
+                    (item.thumb, item.upload, item.ingest_fresh, item.meta),
+                )
+            })
             .collect();
         self.items = fresh;
         for item in &mut self.items {
-            if let Some((thumb, upload, fresh_flag)) = kept.get(&item.item_id) {
+            if let Some((thumb, upload, fresh_flag, meta)) = kept.get(&item.item_id) {
                 item.thumb = *thumb;
                 item.upload = *upload;
                 item.ingest_fresh = *fresh_flag;
+                item.meta = *meta;
             } else {
                 item.ingest_fresh = true;
             }
@@ -333,6 +350,117 @@ impl Browser {
         self.rows.get(self.current).cloned()
     }
 
+    /// Display rows of the multi-selection (plan section 2.7: apply a
+    /// template to the selection). The focused row is always included, so
+    /// a fresh single-cell browser still applies.
+    pub fn selected_items(&self) -> Vec<BrowseItem> {
+        self.selection
+            .selected
+            .iter()
+            .filter_map(|index| self.rows.get(*index))
+            .cloned()
+            .collect()
+    }
+
+    /// Display path of the focused row (drive-through for previews).
+    pub fn current_display_path(&self) -> Option<String> {
+        self.current_item().map(|item| item.display_path)
+    }
+
+    /// Which display index holds `item_id` (tests read back by id).
+    pub fn item_meta(&self, item_id: i64) -> Option<MetaBadge> {
+        self.items
+            .iter()
+            .find(|row| row.item_id == item_id)
+            .map(|row| row.meta)
+    }
+
+    /// Current template status strip text.
+    pub fn template_status(&self) -> String {
+        self.template_status.clone()
+    }
+
+    /// Queue the template over the multi-selection as durable
+    /// `metadata_write` jobs (plan section 2.7). Variables expand inside
+    /// the worker per photo. Sequence numbers are display order, 1-based.
+    pub fn apply_template(
+        &mut self,
+        fields: TemplateFields,
+        template_name: &str,
+        cx: &mut Context<Self>,
+    ) {
+        let selection = self.selected_items();
+        if selection.is_empty() || fields == TemplateFields::default() {
+            self.template_status = "Apply skipped: nothing selected or template empty.".into();
+            cx.notify();
+            return;
+        }
+        let mut results: Vec<(i64, MetaBadge)> = Vec::with_capacity(selection.len());
+        for (offset, item) in selection.iter().enumerate() {
+            let paths = item_photo_paths(&self.catalog, item);
+            let payload = serde_json::to_string(&MetadataWritePayload {
+                item_id: item.item_id,
+                paths,
+                sequence: (offset + 1) as u64,
+                fields_json: serde_json::to_string(&fields).unwrap_or_else(|_| "{}".to_string()),
+            })
+            .unwrap_or_else(|_| "{}".to_string());
+            match self.catalog.enqueue_job(JobKind::MetadataWrite, &payload) {
+                Ok(job_id) => {
+                    self.meta_jobs.insert(job_id, item.item_id);
+                    results.push((item.item_id, MetaBadge::Queued));
+                }
+                Err(_) => results.push((item.item_id, MetaBadge::Failed)),
+            }
+        }
+        let queued: usize = results
+            .iter()
+            .filter(|(_, meta)| *meta == MetaBadge::Queued)
+            .count();
+        for (item_id, meta) in &results {
+            if let Some(item) = self.items.iter_mut().find(|i| i.item_id == *item_id) {
+                item.meta = *meta;
+            }
+        }
+        // Skip a re-rebuild when nothing queued: items already carry their
+        // failed badges; the display table still refreshes on notify.
+        if queued > 0 {
+            self.rebuild_rows();
+        }
+        self.template_status = if queued == 0 {
+            format!("Apply failed to queue for {template_name}.")
+        } else {
+            format!("Applying template \"{template_name}\" to {queued} photos…")
+        };
+        cx.notify();
+    }
+
+    fn meta_item_id(&mut self, id: JobId) -> Option<i64> {
+        if let Some(item_id) = self.meta_jobs.get(&id) {
+            return Some(*item_id);
+        }
+        let job = self.catalog.job(id).ok()?;
+        if job.kind != JobKind::MetadataWrite {
+            return None;
+        }
+        let payload: MetadataWritePayload = serde_json::from_str(&job.payload_json).ok()?;
+        self.meta_jobs.insert(id, payload.item_id);
+        Some(payload.item_id)
+    }
+
+    fn set_meta(&mut self, item_id: i64, badge: MetaBadge) {
+        let mut hit = false;
+        for item in &mut self.items {
+            if item.item_id == item_id {
+                item.meta = badge;
+                hit = true;
+            }
+        }
+        if hit {
+            self.rebuild_rows();
+        }
+    }
+
     /// Apply one worker event to the visible rows.
     pub fn on_job_event(&mut self, event: &JobEvent) {
         match &event.kind {
@@ -342,6 +470,11 @@ impl Browser {
                     self.scan_status = "Scanning folder…".to_string();
                 } else if let Some(path) = self.thumb_path_for(event.id) {
                     self.mark_thumb(&path, ThumbState::Running);
+                } else if let Some(item_id) = self.meta_item_id(event.id) {
+                    self.set_meta(item_id, MetaBadge::Writing);
+                    if self.template_status.is_empty() {
+                        self.template_status = "Writing template metadata…".into();
+                    }
                 }
             }
             JobEventKind::Progress { done, total } => {
@@ -349,6 +482,8 @@ impl Browser {
                     self.resolve_scan_root(event.id);
                     self.scan_status = format!("Scanning: {done}/{total}");
                     self.refresh_items();
+                } else if self.meta_jobs.contains_key(&event.id) {
+                    self.template_status = format!("Writing template metadata: {done}/{total}");
                 }
             }
             JobEventKind::Succeeded => {
@@ -359,6 +494,23 @@ impl Browser {
                 } else if let Some(path) = self.thumb_jobs.remove(&event.id) {
                     self.mark_thumb(&path, ThumbState::Ready);
                     self.rebuild_rows();
+                } else if let Some(item_id) = self.meta_item_id(event.id) {
+                    self.meta_jobs.remove(&event.id);
+                    self.set_meta(item_id, MetaBadge::Done);
+                    let in_flight = self.meta_jobs.len();
+                    let done_count = self
+                        .items
+                        .iter()
+                        .filter(|i| i.meta == MetaBadge::Done)
+                        .count();
+                    self.template_status = if in_flight == 0 {
+                        format!(
+                            "Template applied: {done_count} photo{}.",
+                            if done_count == 1 { "" } else { "s" }
+                        )
+                    } else {
+                        format!("Template applied: {done_count} done, {in_flight} in flight…")
+                    };
                 }
             }
             JobEventKind::Failed { error } => {
@@ -367,6 +519,10 @@ impl Browser {
                 } else if let Some(path) = self.thumb_jobs.remove(&event.id) {
                     self.mark_thumb(&path, ThumbState::Failed);
                     self.rebuild_rows();
+                } else if let Some(item_id) = self.meta_item_id(event.id) {
+                    self.meta_jobs.remove(&event.id);
+                    self.set_meta(item_id, MetaBadge::Failed);
+                    self.template_status = format!("Template apply failed: {error}");
                 }
             }
         }
@@ -584,8 +740,15 @@ impl Browser {
             UploadBadge::Done => " ● done".to_string(),
             UploadBadge::Failed => " ● failed".to_string(),
         };
+        let meta = match item.meta {
+            MetaBadge::None => String::new(),
+            MetaBadge::Queued => " ⊘ meta:queued".to_string(),
+            MetaBadge::Writing => " ⊘ meta:writing".to_string(),
+            MetaBadge::Done => " ⊘ meta:done".to_string(),
+            MetaBadge::Failed => " ⊘ meta:failed".to_string(),
+        };
         let fresh = if item.ingest_fresh { " ◌ new" } else { "" };
-        format!("{stars} {} · {thumb}{upload}{fresh}", item.base_name)
+        format!("{stars} {} · {thumb}{upload}{meta}{fresh}", item.base_name)
     }
 
     fn render_grid(&mut self, cx: &mut Context<Self>) -> impl IntoElement {
@@ -865,11 +1028,17 @@ impl Browser {
             .children(cells)
     }
 
-    /// Left metadata placeholder bound to the current item (M3 fills it).
+    /// Left metadata panel: item summary plus the template entry point
+    /// (plan section 2.7: the template editor opens over the shell).
     fn render_metadata(&self, _cx: &mut Context<Self>) -> impl IntoElement {
-        let (title, dir, rating) = match self.current_item() {
-            Some(row) => (row.base_name, row.dir, row.rating),
-            None => ("—".to_string(), String::new(), 0),
+        let (title, dir, rating, meta_state) = match self.current_item() {
+            Some(row) => (
+                row.base_name.clone(),
+                row.dir.clone(),
+                row.rating,
+                Self::meta_text(row.meta),
+            ),
+            None => ("—".to_string(), String::new(), 0, String::new()),
         };
         v_flex()
             .w(px(220.0))
@@ -878,16 +1047,29 @@ impl Browser {
             .py_1()
             .gap_1()
             .bg(rgb(0x181818))
-            .child(div().text_sm().child("Metadata (M3)".to_string()))
+            .child(div().text_sm().child("Metadata".to_string()))
             .child(div().text_xs().child(format!("File: {title}")))
             .child(div().text_xs().child(format!("Dir: {dir}")))
             .child(div().text_xs().child(format!("Rating: {rating}/5")))
+            .when(!meta_state.is_empty(), |panel| {
+                panel.child(div().text_xs().text_color(rgb(0xBBBB88)).child(meta_state))
+            })
             .child(
                 div()
                     .text_xs()
                     .text_color(rgb(0x888888))
-                    .child("Caption, keywords and the template editor land in M3.".to_string()),
+                    .child("T — open the IPTC template editor.".to_string()),
             )
+    }
+
+    fn meta_text(meta: MetaBadge) -> String {
+        match meta {
+            MetaBadge::None => String::new(),
+            MetaBadge::Queued => "Template: queued".to_string(),
+            MetaBadge::Writing => "Template: writing…".to_string(),
+            MetaBadge::Done => "Template: applied".to_string(),
+            MetaBadge::Failed => "Template: failed".to_string(),
+        }
     }
 }
 
@@ -989,9 +1171,13 @@ impl Render for Browser {
             )
             .child(
                 StatusBar::new()
-                    .left(self.scan_status.clone())
+                    .left(if self.template_status.is_empty() {
+                        self.scan_status.clone()
+                    } else {
+                        format!("{} · {}", self.template_status, self.scan_status)
+                    })
                     .right(format!(
-                        "{} shown · G grid/single · Z fit · ⇧Z 100%",
+                        "{} shown · G grid/single · Z fit · ⇧Z 100% · T templates",
                         self.rows.len()
                     )),
             )

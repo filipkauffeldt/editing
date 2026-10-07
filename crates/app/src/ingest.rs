@@ -83,6 +83,7 @@ impl IngestBatchProgress {
 pub struct AppState {
     volumes: Vec<Volume>,
     ingest_open: bool,
+    templates_open: bool,
     batches: Vec<IngestBatchProgress>,
     files_by_batch: HashMap<i64, Vec<IngestFileRow>>,
     job_batches: HashMap<JobId, i64>,
@@ -95,6 +96,7 @@ impl AppState {
         Self {
             volumes: Vec::new(),
             ingest_open: false,
+            templates_open: false,
             batches: Vec::new(),
             files_by_batch: HashMap::new(),
             job_batches: HashMap::new(),
@@ -233,6 +235,13 @@ impl AppState {
             changed = true;
         }
         if changed {
+            cx.notify();
+        }
+    }
+
+    pub fn set_templates_open(&mut self, open: bool, cx: &mut Context<Self>) {
+        if open != self.templates_open {
+            self.templates_open = open;
             cx.notify();
         }
     }

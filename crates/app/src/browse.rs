@@ -744,10 +744,7 @@ pub fn list_browse_items(
 /// Filesystem paths of every photo side of one item (plan section 1.3:
 /// "A paired RAW+JPEG item stamps both files"). Falls back to the display
 /// path for an item row the catalog has not paired yet (item_id -1).
-pub fn item_photo_paths(
-    catalog: &edit_catalog::Catalog,
-    item: &BrowseItem,
-) -> Vec<String> {
+pub fn item_photo_paths(catalog: &edit_catalog::Catalog, item: &BrowseItem) -> Vec<String> {
     if item.item_id >= 0
         && let Ok(item_row) = catalog.get_item(item.item_id)
     {
@@ -755,9 +752,7 @@ pub fn item_photo_paths(
         let paths: Vec<String> = sides
             .into_iter()
             .flatten()
-            .filter_map(|photo_id| {
-                catalog.get_photo(photo_id).ok().map(|photo| photo.path)
-            })
+            .filter_map(|photo_id| catalog.get_photo(photo_id).ok().map(|photo| photo.path))
             .collect();
         if !paths.is_empty() {
             return paths;
@@ -1142,8 +1137,8 @@ mod tests {
 
 #[cfg(test)]
 mod meta_paths_tests {
-    use super::*;
     use super::tests::{scratch_dir, touch};
+    use super::*;
 
     #[test]
     fn item_photo_paths_covers_both_sides_of_a_pair() {
