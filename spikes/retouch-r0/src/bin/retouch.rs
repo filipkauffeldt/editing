@@ -65,7 +65,7 @@ fn main() -> Result<(), String> {
             let (border, interior) = diff_breakdown(&a, &b, 30);
             println!("   {name} tile128-vs-auto: mean|diff| {gm128:.4}/255, differing channel samples {gd128:.3} % (border {border}, interior {interior})");
         }
-        let png = encode_png(&a);
+        let png = encode_png(&a)?;
         std::fs::write(out_dir.join(format!("{name}_full.png")), &png).map_err(|e| e.to_string())?;
     }
 
@@ -95,7 +95,7 @@ fn main() -> Result<(), String> {
     if changed_outside != 0 {
         return Err(format!("FAIL: {changed_outside} pixels changed outside the selection"));
     }
-    std::fs::write(out_dir.join("mosaic_region.png"), encode_png(&masked_img)).map_err(|e| e.to_string())?;
+    std::fs::write(out_dir.join("mosaic_region.png"), encode_png(&masked_img)?).map_err(|e| e.to_string())?;
 
     // -- preview / full-size consistency -------------------------------------
     let proxy = resize_rgba8(&full, 1600, 1600)?;
@@ -149,8 +149,8 @@ fn main() -> Result<(), String> {
         d_mean(proxy_src_mean, proxy_mosaic_mean)
     );
 
-    std::fs::write(out_dir.join("mosaic_proxy.png"), encode_png(&proxy_img)).map_err(|e| e.to_string())?;
-    std::fs::write(out_dir.join("gauss_proxy.png"), encode_png(&rgba8_from_surface(&gauss_proxy, p_bounds))).map_err(|e| e.to_string())?;
+    std::fs::write(out_dir.join("mosaic_proxy.png"), encode_png(&proxy_img)?).map_err(|e| e.to_string())?;
+    std::fs::write(out_dir.join("gauss_proxy.png"), encode_png(&rgba8_from_surface(&gauss_proxy, p_bounds))?).map_err(|e| e.to_string())?;
     println!("ok");
     Ok(())
 }
@@ -183,8 +183,8 @@ fn resize_rgba8(img: &Rgba8, max_w: u32, max_h: u32) -> Result<Rgba8, String> {
     Ok(rgba8_from_image(&dst))
 }
 
-fn encode_png(img: &Rgba8) -> Vec<u8> {
-    lightcraft_codecs::encode_png(&lightcraft_codecs::EncodeImage::rgba8(img), &lightcraft_codecs::EncodeMeta::default()).unwrap_or_default()
+fn encode_png(img: &Rgba8) -> Result<Vec<u8>, String> {
+    lightcraft_codecs::encode_png(&lightcraft_codecs::EncodeImage::rgba8(img), &lightcraft_codecs::EncodeMeta::default()).map_err(|e| format!("encode png: {e}"))
 }
 
 /// Count differing pixels inside a `band`-pixel border vs the interior.
