@@ -189,10 +189,10 @@ fn encode_png(img: &Rgba8) -> Vec<u8> {
 
 /// Count differing pixels inside a `band`-pixel border vs the interior.
 fn diff_breakdown(a: &Rgba8, b: &Rgba8, band: usize) -> (usize, usize) {
-    let (w, h) = (a.width, b.width.min(a.height));
+    let (w, h) = (a.width, a.height);
     let mut border = 0usize;
     let mut interior = 0usize;
-    for y in 0..b.height {
+    for y in 0..h {
         for x in 0..w {
             let i = y * w + x;
             if a.data[i] == b.data[i] {
