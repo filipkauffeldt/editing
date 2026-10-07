@@ -14,6 +14,16 @@ use app::browse::CatalogScanPayload;
 use app::ingest_job::handle_job;
 use app::views::Browser;
 
+/// Worker threads draining the durable job queue.
+///
+/// The pool is created before volume detection, so it cannot be sized to the
+/// live card count. Three is the common card count (and comfortably covers one
+/// or two), so up to three cards ingest in parallel; a fourth card's job stays
+/// `queued` and starts as soon as a worker frees up. The copy stage, not the
+/// database, is the bottleneck, and each worker holds its own SQLite
+/// connection, so raising this is a one-line change when more cards are common.
+const WORKER_THREADS: usize = 3;
+
 fn catalog_path() -> PathBuf {
     let base = std::env::var_os("EDITING_CATALOG")
         .map(PathBuf::from)
@@ -84,10 +94,8 @@ fn main() {
     let worker_catalog = Arc::clone(&catalog);
     let handler: edit_catalog::JobHandler =
         Arc::new(move |job, tx| handle_job(worker_catalog.clone(), job, tx));
-    // Two workers cap parallel card copies at two; extra cards queue behind
-    // them (the copy stage, not the DB, is the bottleneck). Raising the cap
-    // is a one-line change here.
-    let pool = edit_catalog::spawn_workers(&catalog, 2, handler).expect("spawn workers");
+    let pool =
+        edit_catalog::spawn_workers(&catalog, WORKER_THREADS, handler).expect("spawn workers");
     let events = pool.events().clone();
     let browser_events = events.clone();
     // The pool owns the worker threads; leak it so background jobs keep
