@@ -7,6 +7,7 @@
 //! [`ingest_job`] runs the durable ingest copy job.
 
 pub mod browse;
+pub mod develop;
 pub mod ingest_job;
 pub mod preview;
 pub mod views;
