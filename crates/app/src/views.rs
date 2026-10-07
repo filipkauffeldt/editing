@@ -136,11 +136,21 @@ pub struct Browser {
     meta_jobs: HashMap<JobId, i64>,
     develop: DevelopSession,
     develop_sliders: Vec<(SliderId, Entity<SliderState>)>,
-    /// Cooperative cancellation for develop renders: a new request cancels
+    /// Cooperative cancellation for develop renders: a newer request cancels
     /// the prior one's mid-flight stages.
     develop_token: CancelToken,
-    /// Last develop render request, for tests and the UI status line.
-    develop_render: Option<RenderSize>,
+    /// The worker's takeover: the render one latest request wants.
+    develop_wanted: Option<RenderSize>,
+    /// Whether the latest-request render worker loop is running.
+    develop_worker: bool,
+    /// Items whose develop render failed terminally (the paint-time kick
+    /// excludes them; a new edit or navigation retries).
+    develop_failed: HashSet<i64>,
+    /// Monotonic serial and the serialized per-item sidecar write (review M1).
+    persist_seq: u64,
+    persist_inflight: Option<(i64, u64)>,
+    /// Items whose neighbor prewarm render already ran once.
+    prewarmed: HashSet<i64>,
     /// The resolved develop output, swapped with the store on completion
     /// (plan section 1.5). DisplaySrgb path — the canvas paints it.
     develop_image: Option<Arc<RenderImage>>,
@@ -169,6 +179,7 @@ impl Browser {
     pub fn new(
         catalog: Arc<Catalog>,
         events: flume::Receiver<JobEvent>,
+        renderer: Arc<RenderService>,
         cx: &mut Context<Self>,
     ) -> Self {
         let focus = cx.focus_handle();
@@ -251,13 +262,18 @@ impl Browser {
             develop: DevelopSession::new(DevelopSettings::default()),
             develop_sliders,
             develop_token: CancelToken::new(),
-            develop_render: None,
+            develop_wanted: None,
+            develop_worker: false,
+            develop_failed: HashSet::new(),
+            persist_seq: 0,
+            persist_inflight: None,
+            prewarmed: HashSet::new(),
             develop_image: None,
             develop_image_item: None,
             develop_pending: None,
             develop_dirty: false,
             develop_status: "Ready".to_string(),
-            renderer: Arc::new(RenderService::new()),
+            renderer,
             scan_jobs: Vec::new(),
             template_status: String::new(),
             drag_from: None,
@@ -660,6 +676,10 @@ impl Browser {
         self.selection.move_cursor(delta, extend, len);
         self.current = self.selection.cursor;
         self.zoom.reset();
+        // Navigation restores retries and the render/pending slot: the past
+        // item's failure and the worker's slot no longer anchor here.
+        self.develop_failed.clear();
+        self.develop_pending = None;
         self.preload_neighbors(cx);
         self.strip_scroll.scroll_to_item(self.current);
         cx.notify();
@@ -674,6 +694,10 @@ impl Browser {
         self.selection.select_single(index, self.rows.len());
         self.current = self.selection.cursor;
         self.zoom.reset();
+        // Navigation restores retries and the render/pending slot: the past
+        // item's failure and the worker's slot no longer anchor here.
+        self.develop_failed.clear();
+        self.develop_pending = None;
         self.preload_neighbors(cx);
         self.strip_scroll.scroll_to_item(self.current);
         cx.notify();
@@ -764,30 +788,59 @@ impl Browser {
         self.thumb_pending.remove(&item_id);
     }
 
-    /// Read the current item's edit row into the develop session. A photo
-    /// with no row yet seeds its raw buffer with the source's as-shot white
-    /// point, so the first slider drag persists settings that re-render
-    /// identically after a restart.
-    fn load_current_edit(&mut self) {
-        let Some(row) = self.current_item() else {
+    /// Read the current item's edit row into the develop session on the
+    /// background executor. A photo with no row yet seeds its raw buffer with
+    /// the source's as-shot white point, so the first slider drag persists
+    /// settings that re-render identically after a restart. Failures keep the
+    /// previous buffer and surface in the panel (reviews M2/M6).
+    fn schedule_current_edit_load(&mut self, cx: &mut Context<Self>) {
+        let Some(item) = self.current_item() else {
             return;
         };
-        let row_buffer = self
-            .catalog
-            .get_edit(row.item_id)
-            .ok()
-            .flatten()
-            .and_then(|edit| serde_json::from_str::<DevelopSettings>(&edit.develop_json).ok());
-        let buffer = match row_buffer {
-            Some(buffer) => buffer,
-            None => match RenderService::source_facts(Path::new(&row.display_path)) {
-                Some(facts) if facts.raw => {
-                    DevelopSettings::for_raw(facts.as_shot_temp, facts.as_shot_tint)
+        self.develop_pending = Some(item.item_id);
+        let catalog = Arc::clone(&self.catalog);
+        let item_id = item.item_id;
+        let path = item.display_path.clone();
+        cx.spawn(async move |this, cx| {
+            let outcome = cx
+                .background_executor()
+                .spawn(async move {
+                    match catalog.get_edit(item_id) {
+                        Err(e) => Err(format!("edit read failed: {e}")),
+                        Ok(None) => Ok(match RenderService::source_facts(Path::new(&path)) {
+                            Some(facts) if facts.raw => {
+                                DevelopSettings::for_raw(facts.as_shot_temp, facts.as_shot_tint)
+                            }
+                            _ => DevelopSettings::default(),
+                        }),
+                        Ok(Some(edit)) => {
+                            serde_json::from_str::<DevelopSettings>(&edit.develop_json)
+                                .map_err(|e| format!("corrupt edit row: {e}"))
+                        }
+                    }
+                })
+                .await;
+            this.update(cx, |this, cx| {
+                match outcome {
+                    Ok(buffer) => {
+                        this.develop.load_edit(buffer);
+                        this.schedule_develop_render(
+                            RenderSize::Proxy(edit_render::PROXY_RELEASE_LONG_EDGE as u16),
+                            cx,
+                        );
+                        this.develop_status = "Ready".to_string();
+                    }
+                    Err(diagnostic) => {
+                        this.develop_status = diagnostic;
+                        this.develop_failed.insert(item_id);
+                        this.develop_pending = None;
+                    }
                 }
-                _ => DevelopSettings::default(),
-            },
-        };
-        self.develop.load_edit(buffer);
+                cx.notify();
+            })
+            .ok();
+        })
+        .detach();
     }
 
     /// The develop panel (plan sections 2.1 and 2.3): Presets placeholder on
@@ -866,9 +919,13 @@ impl Browser {
 
     /// Subscribe-backed live slider change (`SliderEvent::Change`): write the
     /// change to the edit buffer, then render the downscaled proxy live.
+    /// Subscribe-backed live slider change (`SliderEvent::Change`): write the
+    /// change to the edit buffer, then render the downscaled proxy live via
+    /// the coalescing worker.
     pub fn on_develop_change(&mut self, id: SliderId, value: f32, cx: &mut Context<Self>) {
         self.develop.set_slider(id, value as f64);
         self.develop_dirty = true;
+        self.develop_failed.remove(&self.develop_item_id());
         self.schedule_develop_render(
             RenderSize::Proxy(edit_render::PROXY_DRAG_LONG_EDGE as u16),
             cx,
@@ -876,55 +933,106 @@ impl Browser {
     }
 
     /// Drag released (`SliderEvent::Release`): final value in the buffer, the
-    /// full proxy renders in the background, and the edit persists.
+    /// bounded release proxy renders in the background, and the edit persists.
     pub fn on_develop_release(&mut self, id: SliderId, value: f32, cx: &mut Context<Self>) {
         self.develop.end_drag(id, value as f64);
         self.develop_dirty = true;
-        self.schedule_develop_render(RenderSize::Full, cx);
+        self.develop_failed.remove(&self.develop_item_id());
+        self.schedule_develop_render(
+            RenderSize::Proxy(edit_render::PROXY_RELEASE_LONG_EDGE as u16),
+            cx,
+        );
         self.persist_current_edit(cx);
     }
 
-    /// One develop render on the background executor; a newer request cancels
-    /// this one's mid-flight stages through the token.
-    fn schedule_develop_render(&mut self, size: RenderSize, cx: &mut Context<Self>) {
-        let Some(item) = self.current_item() else {
-            return;
-        };
-        let token = CancelToken::new();
-        self.develop_token.cancel();
-        self.develop_token = token.clone();
-        self.develop_render = Some(size);
-        self.develop_pending = Some(item.item_id);
-        let renderer = Arc::clone(&self.renderer);
-        let path = item.display_path.clone();
-        let develop = self.develop.buffer().clone();
+    /// The catalog row id of the item the develop panel is editing.
+    fn develop_item_id(&self) -> i64 {
+        self.current_item().map(|row| row.item_id).unwrap_or(-1)
+    }
 
+    /// Request a render; the worker takes the latest request only, so a
+    /// slider drag coalesces into one render at a time (review B2).
+    fn schedule_develop_render(&mut self, size: RenderSize, cx: &mut Context<Self>) {
+        self.develop_wanted = Some(size);
+        self.ensure_render_worker(cx);
+    }
+
+    /// Spawn the latest-request worker loop if none is running. Between
+    /// frames the worker re-reads `develop_wanted`, so slider changes during
+    /// a render supersede it instead of piling up.
+    fn ensure_render_worker(&mut self, cx: &mut Context<Self>) {
+        if self.develop_worker {
+            return;
+        }
+        self.develop_worker = true;
+        let renderer = Arc::clone(&self.renderer);
         cx.spawn(async move |this, cx| {
-            let frame = cx
-                .background_executor()
-                .spawn(async move {
-                    renderer.render_path(Path::new(&path), size, &develop, None, &token)
-                })
-                .await;
-            this.update(cx, |this, cx| {
-                match frame {
-                    Ok(frame) => this.insert_develop_frame(item.item_id, frame, cx),
-                    // A newer request owns the pending slot; leave it.
-                    Err(edit_core::Error::Cancelled) => {}
-                    Err(e) => {
-                        this.develop_status = format!("Render failed: {e}");
-                        this.develop_pending = None;
-                    }
+            loop {
+                let snapshot = this
+                    .update(cx, |this, _| {
+                        let size = this.develop_wanted.take()?;
+                        let item = this.current_item()?;
+                        this.develop_pending = Some(item.item_id);
+                        let token = CancelToken::new();
+                        this.develop_token.cancel();
+                        this.develop_token = token.clone();
+                        Some((
+                            item.item_id,
+                            item.display_path.clone(),
+                            size,
+                            this.develop.buffer().clone(),
+                            token,
+                        ))
+                    })
+                    .ok()
+                    .flatten();
+                let (item_id, path, size, develop, token) = match snapshot {
+                    Some(snapshot) => snapshot,
+                    None => break,
+                };
+                let frame = {
+                    let renderer = Arc::clone(&renderer);
+                    cx.background_executor()
+                        .spawn(async move {
+                            renderer.render_path(Path::new(&path), size, &develop, None, &token)
+                        })
+                        .await
+                };
+                let applied = this
+                    .update(cx, |this, cx| {
+                        match frame {
+                            Ok(frame) => this.insert_develop_frame(item_id, frame, cx),
+                            // A superseded render: the worker's next frame
+                            // reads whatever superseded it.
+                            Err(edit_core::Error::Cancelled) => {
+                                this.develop_pending = None;
+                            }
+                            Err(e) => {
+                                this.develop_status = format!("Render failed: {e}");
+                                this.develop_failed.insert(item_id);
+                                this.develop_pending = None;
+                            }
+                        }
+                        cx.notify();
+                    })
+                    .is_ok();
+                if !applied {
+                    break;
                 }
-                cx.notify();
+            }
+            // Nothing superseded the last render: the worker rests.
+            this.update(cx, |this, _| {
+                this.develop_worker = false;
             })
             .ok();
         })
         .detach();
     }
 
-    /// Insert the resolved develop output (already BGRA) and repaint.
-    pub fn insert_develop_frame(
+    /// Failures are terminal for the paint-time kick (review B1): the panel
+    /// shows the error and a paint frame does not re-kick the request; a new
+    /// edit, navigation away/back, or an explicit reload retries.
+    fn insert_develop_frame(
         &mut self,
         item_id: i64,
         frame: edit_core::Frame,
@@ -934,13 +1042,91 @@ impl Browser {
             self.develop_image = Some(Arc::new(RenderImage::new([image::Frame::new(rgba)])));
             self.develop_image_item = Some(item_id);
             self.develop_pending = None;
+            self.develop_failed.remove(&item_id);
             self.develop_status = "Ready".to_string();
             cx.notify();
         }
+        self.preload_develop_neighbors(cx);
     }
 
-    /// Best-effort edit persistence (catalog row + `crs:` sidecar; B2's
-    /// `persist_edit` never fails the edit on sidecar I/O).
+    /// Warm the drag-edge proxy for the current item's neighbors (plan
+    /// section 2.3) so Left/Right never waits on disk. One prewarm per item.
+    fn preload_develop_neighbors(&mut self, cx: &mut Context<Self>) {
+        let rows = Arc::clone(&self.rows);
+        for offset in 1..=2 {
+            for neighbor in [
+                self.current.checked_add(offset),
+                self.current.checked_sub(offset),
+            ]
+            .into_iter()
+            .flatten()
+            {
+                let Some(item) = rows.get(neighbor) else {
+                    continue;
+                };
+                let warm = self.prewarmed.insert(item.item_id);
+                if warm && !self.thumbs.contains_key(&item.item_id) {
+                    let size = RenderSize::Proxy(edit_render::PROXY_DRAG_LONG_EDGE as u16);
+                    self.schedule_neighbor_prewarm(
+                        item.item_id,
+                        item.display_path.clone(),
+                        size,
+                        cx,
+                    );
+                }
+            }
+        }
+    }
+
+    /// One neighbor prewarm render into the shared thumbnail cache.
+    fn schedule_neighbor_prewarm(
+        &mut self,
+        item_id: i64,
+        path: String,
+        size: RenderSize,
+        cx: &mut Context<Self>,
+    ) {
+        let renderer = Arc::clone(&self.renderer);
+        cx.spawn(async move |this, cx| {
+            let frame = cx
+                .background_executor()
+                .spawn(async move {
+                    let token = CancelToken::new();
+                    renderer.render_path(
+                        Path::new(&path),
+                        size,
+                        &DevelopSettings::default(),
+                        None,
+                        &token,
+                    )
+                })
+                .await;
+            let ok_frame = frame.ok().and_then(|frame| {
+                image::RgbaImage::from_raw(frame.width, frame.height, frame.pixels)
+            });
+            if let Some(rgba) = ok_frame {
+                let _ = this.update(cx, |this, cx| {
+                    this.thumbs.insert(
+                        item_id,
+                        Arc::new(RenderImage::new([image::Frame::new(rgba)])),
+                    );
+                    cx.notify();
+                });
+            } else {
+                let _ = this.update(cx, |this, cx| {
+                    this.prewarmed.remove(&item_id);
+                    cx.notify();
+                });
+            }
+        })
+        .detach();
+    }
+
+    /// Edit persistence: the catalog row commits synchronously on release and
+    /// on navigation (dirty until ack; a failed write stays dirty and
+    /// surfaces); the `crs:` sidecar write fans out best-effort, serialized
+    /// per item. Quit flushes nothing: every commit point is already durable
+    /// (review M1).
     fn persist_current_edit(&mut self, cx: &mut Context<Self>) {
         if !self.develop_dirty {
             return;
@@ -948,35 +1134,62 @@ impl Browser {
         let Some(item) = self.current_item() else {
             return;
         };
-        self.develop_dirty = false;
-        let catalog = Arc::clone(&self.catalog);
-        let develop = self.develop.buffer().clone();
+        let json =
+            serde_json::to_string(self.develop.buffer()).unwrap_or_else(|_| "{}".to_string());
+        match self.catalog.upsert_edit(item.item_id, &json, None) {
+            Ok(()) => {
+                self.develop_dirty = false;
+                self.spawn_sidecar_write(item.item_id, json, cx);
+            }
+            Err(e) => self.develop_status = format!("Edit save failed: {e}"),
+        }
+        cx.notify();
+    }
+
+    /// Best-effort `crs:` sidecar write; serialized per item, the outcome
+    /// surfaces in the panel status line.
+    fn spawn_sidecar_write(&mut self, item_id: i64, develop_json: String, cx: &mut Context<Self>) {
+        if self.persist_inflight.is_some() {
+            return;
+        }
+        let Some(item) = self
+            .items
+            .iter()
+            .find(|row| row.item_id == item_id)
+            .cloned()
+        else {
+            return;
+        };
+        self.persist_seq += 1;
+        let seq = self.persist_seq;
+        self.persist_inflight = Some((item_id, seq));
         let sidecar = PathBuf::from(item.display_path.clone()).with_extension("xmp");
-        cx.spawn(async move |_this, cx| {
+        let catalog = Arc::clone(&self.catalog);
+        cx.spawn(async move |this, cx| {
             let outcome = cx
                 .background_executor()
                 .spawn(async move {
-                    let json = serde_json::to_string(&develop).unwrap_or_else(|_| "{}".to_string());
-                    edit_metadata::persist_edit(&catalog, item.item_id, &json, None, &sidecar)
+                    edit_metadata::persist_edit(&catalog, item_id, &develop_json, None, &sidecar)
                 })
                 .await;
-            if let Ok(outcome) = outcome {
-                let status = match outcome {
-                    edit_metadata::PersistOutcome::Written => "Edit saved".to_string(),
-                    edit_metadata::PersistOutcome::SidecarSkipped(reason) => {
+            this.update(cx, |this, cx| {
+                if this.persist_inflight == Some((item_id, seq)) {
+                    this.persist_inflight = None;
+                }
+                this.develop_status = match outcome {
+                    Ok(edit_metadata::PersistOutcome::Written) => "Edit saved".to_string(),
+                    Ok(edit_metadata::PersistOutcome::SidecarSkipped(reason)) => {
                         format!("Edit saved (sidecar skipped: {reason})")
                     }
+                    Err(e) => format!("Edit save failed (sidecar): {e}"),
                 };
-                _this
-                    .update(cx, |this, cx| {
-                        this.develop_status = status;
-                        cx.notify();
-                    })
-                    .ok();
-            }
+                cx.notify();
+            })
+            .ok();
         })
         .detach();
     }
+
     fn set_rating(&mut self, rating: i64, cx: &mut Context<Self>) {
         let rating = rating.clamp(0, 5);
         let current = match self.rows.get(self.current) {
@@ -1168,12 +1381,12 @@ impl Browser {
             // art yet (navigation kept the art per item id).
             if self.develop_image_item != Some(row.item_id)
                 && self.develop_pending != Some(row.item_id)
+                && !self.develop_failed.contains(&row.item_id)
             {
                 self.develop_image = None;
                 self.develop_image_item = None;
                 self.develop_pending = Some(row.item_id);
-                self.load_current_edit();
-                self.schedule_develop_render(RenderSize::Full, cx);
+                self.schedule_current_edit_load(cx);
             }
         }
         let image = item.as_ref().and_then(|row| {

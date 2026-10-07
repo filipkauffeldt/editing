@@ -8,9 +8,6 @@
 use edit_core::DevelopSettings;
 use lightcraft_develop::ControlSpec;
 
-/// Long edge of the downscaled proxy rendered during a drag.
-pub const PROXY_DRAG_LONG_EDGE: u32 = edit_render::PROXY_DRAG_LONG_EDGE;
-
 /// The six LR-style tone sliders in develop-panel order.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum SliderId {

@@ -11,10 +11,9 @@ license = "Apache-2.0"
 [workspace.dependencies]
 # storytold/lightcraft @ f2f449611d248a907f755d6e18f3701db5755f03 (2026-10-07,
 # see docs/research/retouch-r0-memo.md). Not on crates.io, so git-pinned.
-# Pinned here so every service can wrap its own upstream crates in one bridge
-# module; the raw code path (decode, or embedded preview when unsupported) and
-# the develop path (lightcraft-pipeline + DevelopSettings) are C1's only
-# consumers of the LightCraft tree. A revision bump is one small PR.
+# Pinned here so every service can wrap its own upstream crates inside one
+# bridge module; consumers live in their own service crate, the app never
+# links the LightCraft tree directly. A revision bump is one small PR.
 lightcraft-develop = { git = "https://github.com/storytold/lightcraft", rev = "f2f449611d248a907f755d6e18f3701db5755f03" }
 lightcraft-raw = { git = "https://github.com/storytold/lightcraft", rev = "f2f449611d248a907f755d6e18f3701db5755f03" }
 lightcraft-pipeline = { git = "https://github.com/storytold/lightcraft", rev = "f2f449611d248a907f755d6e18f3701db5755f03" }
