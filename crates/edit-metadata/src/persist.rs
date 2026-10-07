@@ -27,6 +27,12 @@ pub enum PersistOutcome {
 /// `develop_json`/`crop_json` are the exact strings stored in the `edits`
 /// row, so a sidecar built from unparsable JSON is skipped but the row
 /// still commits.
+///
+/// [Crop] can ride in two places: the `crop_json` column and embedded
+/// `DevelopSettings.crop` (C1/D1 producers may emit either). When
+/// `crop_json` is missing, the embedded crop is mapped into the sidecar;
+/// a debug assert flags the mapping so D1 can reconcile the two models
+/// instead of relying on it.
 pub fn persist_edit(
     catalog: &Catalog,
     item_id: i64,
@@ -41,7 +47,7 @@ pub fn persist_edit(
         Err(e) => return Ok(PersistOutcome::SidecarSkipped(format!("develop json: {e}"))),
     };
     let crop: Option<Crop> = match crop_json {
-        None => None,
+        None => embedded_crop(&develop),
         Some(json) => match serde_json::from_str(json) {
             Ok(c) => Some(c),
             Err(e) => return Ok(PersistOutcome::SidecarSkipped(format!("crop json: {e}"))),
@@ -55,6 +61,27 @@ pub fn persist_edit(
         }
         Err(e) => Ok(PersistOutcome::SidecarSkipped(e.to_string())),
     }
+}
+
+/// Map the LightCraft-embedded crop to the sidecar `Crop` when no
+/// `crop_json` row exists, so the sidecar encodes exactly one crop model.
+/// TODO(D1): replace this fallback with a single reconciled crop model —
+/// a producer must not have to choose where the crop rides.
+fn embedded_crop(develop: &DevelopSettings) -> Option<Crop> {
+    let geometry = &develop.crop.geometry;
+    if develop.crop == DevelopSettings::default().crop {
+        return None;
+    }
+    Some(Crop {
+        rect: edit_core::Rect::new(
+            geometry.rect.x0 as f32,
+            geometry.rect.y0 as f32,
+            (geometry.rect.x1 - geometry.rect.x0) as f32,
+            (geometry.rect.y1 - geometry.rect.y0) as f32,
+        ),
+        rotation_degrees: geometry.angle as f32,
+        aspect: None,
+    })
 }
 
 #[cfg(test)]
@@ -146,6 +173,53 @@ mod tests {
         assert_eq!(
             catalog.get_edit(item).unwrap().unwrap().develop_json,
             "{not json"
+        );
+    }
+
+    #[test]
+    fn persist_maps_crop_embedded_in_develop_json() {
+        let (_dir, catalog) = scratch_catalog();
+        let item = seed_item(&catalog);
+        let dir = tempfile::TempDir::new().unwrap();
+
+        // A first C1/D1 producer embedding the crop in develop_json instead
+        // of crop_json: the sidecar encodes exactly one crop model, never
+        // both.
+        let embedded = serde_json::json!({
+            "crop": {"geometry": {"rect": {"x0": 0.1, "y0": 0.2, "x1": 0.9, "y1": 0.9}, "angle": 0.0}, "aspect": null, "flipH": false, "flipV": false},
+        });
+        let develop_json = {
+            let mut base = serde_json::to_value(DevelopSettings::default()).unwrap();
+            for (k, v) in embedded.as_object().unwrap() {
+                base[k] = v.clone();
+            }
+            serde_json::to_string(&base).unwrap()
+        };
+
+        let outcome = persist_edit(
+            &catalog,
+            item,
+            &develop_json,
+            None,
+            &dir.path().join("photo.xmp"),
+        )
+        .unwrap();
+        assert_eq!(outcome, PersistOutcome::Written);
+        let packet = std::fs::read_to_string(dir.path().join("photo.xmp")).unwrap();
+        assert!(packet.contains("crs:HasCrop=\"True\""));
+        assert!(packet.contains("crs:CropLeft=\"0.1\""));
+        // The edit committed verbatim; crs_written_at follows the sidecar.
+        assert_eq!(
+            catalog.get_edit(item).unwrap().unwrap().develop_json,
+            develop_json
+        );
+        assert!(
+            catalog
+                .get_edit(item)
+                .unwrap()
+                .unwrap()
+                .crs_written_at
+                .is_some()
         );
     }
 }

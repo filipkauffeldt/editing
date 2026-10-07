@@ -10,7 +10,10 @@ pub mod persist;
 pub mod photo;
 pub mod writer;
 
-pub use crs::{crop_attributes, develop_attributes, tone_curve_points, write_sidecar};
+pub use crs::{
+    channel_curve_points, crop_attributes, develop_attributes, exiftool_tag_args,
+    tone_curve_points, write_sidecar,
+};
 pub use error::{Error, Result};
 pub use persist::{PersistOutcome, persist_edit};
 pub use photo::{

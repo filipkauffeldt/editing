@@ -13,6 +13,7 @@ test-transport = []
 [dependencies]
 edit-core.workspace = true
 edit-catalog.workspace = true
+lightcraft-develop.workspace = true
 kamadak-exif.workspace = true
 quick-xml.workspace = true
 serde.workspace = true

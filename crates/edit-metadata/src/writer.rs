@@ -265,12 +265,11 @@ impl Writer {
     }
 }
 
-/// Exiftool prints `N image files updated` per successful write block.
+/// Exiftool prints `N image files updated` per write block. The count
+/// matters: a failure summary reads `0 image files updated`, which must
+/// not report success.
 fn check_updated(output: &str) -> Result<()> {
-    if output
-        .lines()
-        .any(|l| l.trim().contains("image files updated"))
-    {
+    if updated_count(output) >= 1 {
         return Ok(());
     }
     Err(Error::ExifTool(
@@ -281,6 +280,15 @@ fn check_updated(output: &str) -> Result<()> {
             .collect::<Vec<_>>()
             .join("; "),
     ))
+}
+
+fn updated_count(output: &str) -> usize {
+    output
+        .lines()
+        .filter(|l| l.contains("image files updated"))
+        .filter_map(|l| l.split_whitespace().next())
+        .filter_map(|n| n.parse::<usize>().ok())
+        .sum()
 }
 
 /// POSIX `wait_timeout_or_kill`: wait up to `timeout`, then kill.
@@ -349,6 +357,28 @@ mod tests {
     }
 
     #[test]
+    fn write_tags_rejects_zero_updated_count() {
+        let writer = Writer::with_transport(ScriptTransport::new(vec![ScriptStep {
+            want_args: None,
+            reply: Ok(
+                "    0 image files updated\n    1 files weren't updated due to errors\n".into(),
+            ),
+        }]));
+        let err = writer
+            .write_tags(Path::new("photo.NEF"), &[("XMP-crs:Exposure2012", "+0.35")])
+            .unwrap_err();
+        assert!(err.to_string().contains("0 image files updated"), "{err}");
+    }
+
+    #[test]
+    fn updated_count_sums_only_success_lines() {
+        assert_eq!(updated_count("    1 image files updated\n"), 1);
+        assert_eq!(updated_count("    0 image files updated\n"), 0);
+        assert_eq!(updated_count("Error: Nothing to write\n"), 0);
+        assert_eq!(updated_count(""), 0);
+    }
+
+    #[test]
     fn write_tags_restarts_dead_process_and_retries_once() {
         struct Flaky {
             calls: usize,
@@ -371,26 +401,25 @@ mod tests {
     #[test]
     fn concurrent_writes_serialize_on_one_transport() {
         use std::sync::Arc;
+        use std::sync::atomic::{AtomicUsize, Ordering};
         struct Counting {
-            in_flight: std::sync::atomic::AtomicUsize,
-            max: std::sync::atomic::AtomicUsize,
+            in_flight: Arc<AtomicUsize>,
+            max: Arc<AtomicUsize>,
         }
         impl Transport for Counting {
             fn execute(&mut self, _args: &[String]) -> Result<String> {
-                let n = self
-                    .in_flight
-                    .fetch_add(1, std::sync::atomic::Ordering::SeqCst)
-                    + 1;
-                self.max.fetch_max(n, std::sync::atomic::Ordering::SeqCst);
+                let n = self.in_flight.fetch_add(1, Ordering::SeqCst) + 1;
+                self.max.fetch_max(n, Ordering::SeqCst);
                 std::thread::sleep(Duration::from_millis(5));
-                self.in_flight
-                    .fetch_sub(1, std::sync::atomic::Ordering::SeqCst);
+                self.in_flight.fetch_sub(1, Ordering::SeqCst);
                 Ok("    1 image files updated\n".into())
             }
         }
+        let in_flight = Arc::new(AtomicUsize::new(0));
+        let max = Arc::new(AtomicUsize::new(0));
         let writer = Arc::new(Writer::with_transport(Counting {
-            in_flight: std::sync::atomic::AtomicUsize::new(0),
-            max: std::sync::atomic::AtomicUsize::new(0),
+            in_flight: Arc::clone(&in_flight),
+            max: Arc::clone(&max),
         }));
         std::thread::scope(|s| {
             for _ in 0..8 {
@@ -402,6 +431,10 @@ mod tests {
                 });
             }
         });
-        let _ = writer;
+        assert_eq!(
+            max.load(Ordering::SeqCst),
+            1,
+            "writes overlapped on one transport"
+        );
     }
 }

@@ -1539,6 +1539,7 @@ dependencies = [
  "edit-catalog",
  "edit-core",
  "kamadak-exif",
+ "lightcraft-develop",
  "quick-xml",
  "serde",
  "serde_json",

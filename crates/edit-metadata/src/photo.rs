@@ -4,6 +4,10 @@
 //! with kamadak-exif and fills gaps from a same-name XMP sidecar with
 //! quick-xml. Both reads are best-effort — a missing or corrupt source
 //! yields empty fields, never an error.
+//!
+//! Future work: XMP embedded in the file's `App1` segment (JPEG/DNG with
+//! no sidecar) is not parsed yet; the sidecar path and EXIF cover the
+//! ingest loop for now.
 
 use std::path::{Path, PathBuf};
 
@@ -106,8 +110,8 @@ pub fn read_exif(path: &Path) -> Result<PhotoMetadata> {
     Ok(meta)
 }
 
-/// Read the XMP sidecar next to `photo` (`photo.xmp`, then `<stem>.xmp`).
-/// Missing or unparsable files yield empty metadata.
+/// Read the XMP sidecar next to `photo` (`<stem>.xmp`, then
+/// `photo.xmp`). Missing or unparsable files yield empty metadata.
 pub fn read_xmp_sidecar_for(photo: &Path) -> PhotoMetadata {
     for candidate in sidecar_candidates(photo) {
         if candidate.is_file() {
@@ -123,15 +127,16 @@ pub fn read_xmp_file(path: &Path) -> Result<PhotoMetadata> {
     Ok(photo_from_pairs(&xmp_pairs(&text)?))
 }
 
-/// Sidecar names in lookup order: `<photo>.xmp`, then `<stem>.xmp`.
+/// Sidecar names in lookup order: `<stem>.xmp` (Lightroom-canonical,
+/// research `lr-edit-math-and-roundtrip.md` 4.3.1), then `<photo>.xmp`.
 fn sidecar_candidates(photo: &Path) -> Vec<PathBuf> {
     let mut out = Vec::with_capacity(2);
-    let mut with_ext = photo.as_os_str().to_owned();
-    with_ext.push(".xmp");
-    out.push(PathBuf::from(with_ext));
     if let (Some(parent), Some(stem)) = (photo.parent(), photo.file_stem()) {
         out.push(parent.join(stem).with_extension("xmp"));
     }
+    let mut with_ext = photo.as_os_str().to_owned();
+    with_ext.push(".xmp");
+    out.push(PathBuf::from(with_ext));
     out
 }
 

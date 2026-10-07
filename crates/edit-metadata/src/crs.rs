@@ -11,10 +11,17 @@
 //! ExifTool naming gotcha: the WB temperature attribute is `crs:Temperature`
 //! in the file; exiftool *displays* it as `ColorTemperature` and only
 //! accepts `-XMP-crs:ColorTemperature=` on the command line.
+//!
+//! One mapping for both outputs: [`develop_attributes`] plus
+//! [`crop_attributes`] build the tag set; [`sidecar_packet`] serializes it
+//! to XML, while [`exiftool_tag_args`] translates it to `-TAG=value` args
+//! for in-file writes. C3 (IPTC templates) must reuse these instead of
+//! growing a second mapping.
 
 use std::path::Path;
 
 use edit_core::{Crop, DevelopSettings};
+use lightcraft_develop::WbMode;
 
 use crate::error::Result;
 
@@ -22,32 +29,77 @@ use crate::error::Result;
 pub const PROCESS_VERSION: &str = "11.0";
 
 /// Scalar `crs:` attributes for one edit, in write order.
+///
+/// `Temperature`/`Tint` are Custom-WB only: stamping the 6500 K default
+/// over an as-shot file would lie about the illuminant.
 pub fn develop_attributes(develop: &DevelopSettings) -> Vec<(String, String)> {
     let light = &develop.light;
     let effects = &develop.effects;
-    vec![
+    let curve = &develop.curve;
+    let mut attrs = vec![
         ("ProcessVersion".into(), PROCESS_VERSION.into()),
+        ("HasSettings".into(), "True".into()),
         ("WhiteBalance".into(), develop.wb.mode.label().to_owned()),
-        (
+    ];
+    if develop.wb.mode == WbMode::Custom {
+        attrs.push((
             "Temperature".into(),
             format!("{}", develop.wb.temp.round() as i64),
-        ),
-        ("Tint".into(), format!("{:+.0}", develop.wb.tint)),
-        ("Exposure2012".into(), format!("{:+.2}", light.exposure)),
-        ("Contrast2012".into(), int_tag(light.contrast)),
-        ("Highlights2012".into(), int_tag(light.highlights)),
-        ("Shadows2012".into(), int_tag(light.shadows)),
-        ("Whites2012".into(), int_tag(light.whites)),
-        ("Blacks2012".into(), int_tag(light.blacks)),
-        ("Clarity2012".into(), int_tag(effects.clarity)),
-        ("Texture".into(), int_tag(effects.texture)),
-        ("Dehaze".into(), int_tag(effects.dehaze)),
-    ]
+        ));
+        attrs.push(("Tint".into(), format!("{:+.0}", develop.wb.tint)));
+    }
+    attrs.extend(
+        [
+            ("Exposure2012", format!("{:+.2}", light.exposure)),
+            ("Contrast2012", int_tag(light.contrast)),
+            ("Highlights2012", int_tag(light.highlights)),
+            ("Shadows2012", int_tag(light.shadows)),
+            ("Whites2012", int_tag(light.whites)),
+            ("Blacks2012", int_tag(light.blacks)),
+            ("Clarity2012", int_tag(effects.clarity)),
+            ("Texture", int_tag(effects.texture)),
+            ("Dehaze", int_tag(effects.dehaze)),
+            ("ParametricShadows", int_tag(curve.shadows)),
+            ("ParametricDarks", int_tag(curve.darks)),
+            ("ParametricLights", int_tag(curve.lights)),
+            ("ParametricHighlights", int_tag(curve.highlights)),
+            ("ParametricShadowSplit", int_tag(curve.split_shadows)),
+            ("ParametricMidtoneSplit", int_tag(curve.split_mid)),
+            ("ParametricHighlightSplit", int_tag(curve.split_highlights)),
+        ]
+        .into_iter()
+        .map(|(k, v)| (k.to_owned(), v)),
+    );
+    attrs
+}
+
+/// Translate [`develop_attributes`] + [`crop_attributes`] into exiftool
+/// `-TAG=value` args for in-file writes (C3). The only name that differs
+/// from the file form is `Temperature`, which exiftool wants as
+/// `ColorTemperature`.
+pub fn exiftool_tag_args(develop: &DevelopSettings, crop: Option<&Crop>) -> Vec<String> {
+    develop_attributes(develop)
+        .into_iter()
+        .chain(crop_attributes(crop))
+        .map(|(name, value)| {
+            let name = if name == "Temperature" {
+                "ColorTemperature"
+            } else {
+                name.as_str()
+            };
+            format!("-XMP-crs:{name}={value}")
+        })
+        .collect()
 }
 
 /// `crs:` crop attributes. Always includes `HasCrop`; edges and angle only
-/// when cropped. `CropAngle` carries the app rotation as-is — the sign
-/// convention against Lightroom is still unverified (M2 crop work owns it).
+/// when cropped.
+///
+/// `CropAngle` carries the app rotation (clockwise-positive) as-is. The
+/// sign against Lightroom is unverified: darktable's importer negates the
+/// angle (lightroom.c:494-503), which suggests LR and darktable disagree on
+/// direction. A ±15° straighten round-tripped through real Lightroom must
+/// verify the sign before D1 ships crop UI on this mapping.
 pub fn crop_attributes(crop: Option<&Crop>) -> Vec<(String, String)> {
     let Some(crop) = crop else {
         return vec![("HasCrop".into(), "False".into())];
@@ -68,23 +120,36 @@ pub fn crop_attributes(crop: Option<&Crop>) -> Vec<(String, String)> {
 }
 
 /// Point-curve points in LR `0, 0` … `255, 255` form, or `None` when the
-/// master curve is identity (empty or a no-op diagonal).
+/// curve is identity (empty or a no-op diagonal).
 pub fn tone_curve_points(develop: &DevelopSettings) -> Option<Vec<(u8, u8)>> {
-    let master = &develop.curve.master;
-    if master.is_empty() || master.iter().all(|p| (p.x - p.y).abs() < 1e-9) {
+    curve_points(develop.curve.master.iter().map(|p| (p.x, p.y)))
+}
+
+/// Per-channel curves, in `crs:` element order. Entries are `None` for
+/// identity channels.
+pub fn channel_curve_points(develop: &DevelopSettings) -> [Option<Vec<(u8, u8)>>; 3] {
+    [
+        curve_points(develop.curve.red.iter().map(|p| (p.x, p.y))),
+        curve_points(develop.curve.green.iter().map(|p| (p.x, p.y))),
+        curve_points(develop.curve.blue.iter().map(|p| (p.x, p.y))),
+    ]
+}
+
+fn curve_points(points: impl Iterator<Item = (f64, f64)>) -> Option<Vec<(u8, u8)>> {
+    let points: Vec<_> = points.collect();
+    if points.is_empty() || points.iter().all(|(x, y)| (x - y).abs() < 1e-9) {
         return None;
     }
     Some(
-        master
+        points
             .iter()
-            .map(|p| {
-                (
-                    (p.x * 255.0).round().clamp(0.0, 255.0) as u8,
-                    (p.y * 255.0).round().clamp(0.0, 255.0) as u8,
-                )
-            })
+            .map(|(x, y)| (scale_curve(x), scale_curve(y)))
             .collect(),
     )
+}
+
+fn scale_curve(v: &f64) -> u8 {
+    (v * 255.0).round().clamp(0.0, 255.0) as u8
 }
 
 fn int_tag(value: f64) -> String {
@@ -111,7 +176,19 @@ pub fn sidecar_packet(develop: &DevelopSettings, crop: Option<&Crop>) -> String 
 
     let mut attributes = develop_attributes(develop);
     attributes.extend(crop_attributes(crop));
-    if tone_curve_points(develop).is_some() {
+    let master = tone_curve_points(develop);
+    let channels = channel_curve_points(develop);
+    let channel_names = [
+        "ToneCurvePV2012Red",
+        "ToneCurvePV2012Green",
+        "ToneCurvePV2012Blue",
+    ];
+    let channel_curves: Vec<(&str, Vec<(u8, u8)>)> = channel_names
+        .into_iter()
+        .zip(channels)
+        .filter_map(|(name, points)| points.map(|p| (name, p)))
+        .collect();
+    if master.is_some() || !channel_curves.is_empty() {
         attributes.push(("ToneCurveName2012".into(), "Custom".into()));
     }
 
@@ -137,27 +214,15 @@ pub fn sidecar_packet(develop: &DevelopSettings, crop: Option<&Crop>) -> String 
     for (name, value) in &attributes {
         desc.push_attribute((format!("crs:{name}").as_str(), value.as_str()));
     }
-    let with_curve = tone_curve_points(develop);
-    if let Some(points) = with_curve {
+    if master.is_some() || !channel_curves.is_empty() {
         out.write_event(Event::Start(desc))
             .expect("in-memory write");
-        let curve = BytesStart::new("crs:ToneCurvePV2012");
-        out.write_event(Event::Start(curve))
-            .expect("in-memory write");
-        let seq = BytesStart::new("rdf:Seq");
-        out.write_event(Event::Start(seq)).expect("in-memory write");
-        for (x, y) in points {
-            let li = BytesStart::new("rdf:li");
-            out.write_event(Event::Start(li)).expect("in-memory write");
-            out.write_event(Event::Text(BytesText::new(&format!("{x}, {y}"))))
-                .expect("in-memory write");
-            out.write_event(Event::End(BytesEnd::new("rdf:li")))
-                .expect("in-memory write");
+        if let Some(points) = &master {
+            write_seq_curve(&mut out, "crs:ToneCurvePV2012", points);
         }
-        out.write_event(Event::End(BytesEnd::new("rdf:Seq")))
-            .expect("in-memory write");
-        out.write_event(Event::End(BytesEnd::new("crs:ToneCurvePV2012")))
-            .expect("in-memory write");
+        for (name, points) in &channel_curves {
+            write_seq_curve(&mut out, &format!("crs:{name}"), points);
+        }
         out.write_event(Event::End(BytesEnd::new("rdf:Description")))
             .expect("in-memory write");
     } else {
@@ -176,11 +241,36 @@ pub fn sidecar_packet(develop: &DevelopSettings, crop: Option<&Crop>) -> String 
     packet
 }
 
+/// One `crs:` point-curve element with an `rdf:Seq` of `x, y` items.
+fn write_seq_curve(out: &mut quick_xml::writer::Writer<Vec<u8>>, name: &str, points: &[(u8, u8)]) {
+    use quick_xml::events::{BytesEnd, BytesStart, BytesText, Event};
+    let curve = BytesStart::new(name);
+    out.write_event(Event::Start(curve))
+        .expect("in-memory write");
+    let seq = BytesStart::new("rdf:Seq");
+    out.write_event(Event::Start(seq)).expect("in-memory write");
+    for (x, y) in points {
+        let li = BytesStart::new("rdf:li");
+        out.write_event(Event::Start(li)).expect("in-memory write");
+        out.write_event(Event::Text(BytesText::new(&format!("{x}, {y}"))))
+            .expect("in-memory write");
+        out.write_event(Event::End(BytesEnd::new("rdf:li")))
+            .expect("in-memory write");
+    }
+    out.write_event(Event::End(BytesEnd::new("rdf:Seq")))
+        .expect("in-memory write");
+    out.write_event(Event::End(BytesEnd::new(name)))
+        .expect("in-memory write");
+}
+
 /// Write `bytes` to `path` via temp-file + rename so a crash never leaves a
 /// half-written sidecar.
 fn write_atomic(path: &Path, bytes: &[u8]) -> Result<()> {
     let tmp = path.with_extension("xmp.tmp");
-    std::fs::write(&tmp, bytes)?;
+    if let Err(e) = std::fs::write(&tmp, bytes) {
+        let _ = std::fs::remove_file(&tmp);
+        return Err(crate::error::Error::Io(e));
+    }
     std::fs::rename(&tmp, path).map_err(|e| {
         let _ = std::fs::remove_file(&tmp);
         crate::error::Error::Io(e)
@@ -225,6 +315,50 @@ mod tests {
         assert_eq!(attrs["Clarity2012"], "15");
         assert_eq!(attrs["Texture"], "20");
         assert_eq!(attrs["Dehaze"], "5");
+        assert_eq!(attrs["HasSettings"], "True");
+        assert_eq!(attrs["ParametricShadows"], "0");
+        assert_eq!(attrs["ParametricShadowSplit"], "25");
+        // As-shot default: no absolute temperature stamped.
+        assert!(!attrs.contains_key("Temperature"));
+        assert!(!attrs.contains_key("Tint"));
+    }
+
+    #[test]
+    fn custom_white_balance_emits_temperature_and_tint() {
+        let d = develop_with(json!({"wb": {"mode": "custom", "temp": 5600.0, "tint": 5.0}}));
+        let attrs: std::collections::HashMap<_, _> = develop_attributes(&d).into_iter().collect();
+        assert_eq!(attrs["WhiteBalance"], "Custom");
+        assert_eq!(attrs["Temperature"], "5600");
+        assert_eq!(attrs["Tint"], "+5");
+    }
+
+    #[test]
+    fn exiftool_args_translate_temperature_for_the_command_line() {
+        let d = develop_with(json!({"wb": {"mode": "custom", "temp": 5600.0, "tint": 5.0}}));
+        let args = exiftool_tag_args(&d, None);
+        assert!(args.contains(&"-XMP-crs:ColorTemperature=5600".to_owned()));
+        assert!(args.contains(&"-XMP-crs:Exposure2012=+0.00".to_owned()));
+        assert!(args.iter().all(|a| a.starts_with("-XMP-crs:")));
+        assert!(
+            args.iter()
+                .all(|a| !a.contains("Temperature=") || a.contains("ColorTemperature="))
+        );
+    }
+
+    #[test]
+    fn channel_curves_emit_per_channel_elements() {
+        let d = develop_with(json!({"curve": {"red": [
+            {"x": 0.0, "y": 0.0},
+            {"x": 1.0, "y": 0.5},
+        ]}}));
+        let [red, green, blue] = channel_curve_points(&d);
+        assert_eq!(red, Some(vec![(0, 0), (255, 128)]));
+        assert_eq!(green, None);
+        assert_eq!(blue, None);
+        let packet = sidecar_packet(&d, None);
+        assert!(packet.contains("<crs:ToneCurvePV2012Red>"));
+        assert!(!packet.contains("ToneCurvePV2012Green"));
+        assert!(!packet.contains("crs:ToneCurvePV2012>"));
     }
 
     #[test]
