@@ -38,7 +38,8 @@ Open source. Linux first, cross-platform (Windows, macOS) after.
 | Metadata writer | Resident `exiftool -stay_open` process (only full IIM+XMP writer) |
 | Code replacements | Photo Mechanic-compatible replacement files (TSV, `=code=` syntax, hot codes) |
 | IPTC fields | Full PM stationery-pad set (phased, see M3) |
-| Presets | Lightroom `.xmp` (crs: namespace) only |
+| Presets | Lightroom `.xmp` (crs: namespace) only; user presets saved in the same format |
+| Settings transfer | Copy/Paste with field checkboxes, Apply Previous, Sync to selection, Create preset |
 | Crop | Free crop + aspect presets + rotate/straighten |
 | Ingest | Manual trigger only; multi-card parallel; one verified backup destination |
 | Ingest naming | User-defined folder/filename rules with variables (PM-style subset) |
@@ -149,8 +150,8 @@ surfaces can use the same behaviors without fighting a styled component.
 2. Contact sheet opens while ingest still runs (photos appear as they land).
 3. Alt+→ to first photo. Type caption using code replacements (`\h1\` →
    "SHL", `{f:2}` … PM syntax), add keywords; set WB, +0.7 EV, crop 3:2, rotate
-   1.2°; maybe apply an LR .xmp preset. Sliders drive DevelopSettings through
-   the proxy pipeline.
+   1.2°; maybe apply an LR .xmp preset, paste copied settings, or press
+   Previous. Sliders drive DevelopSettings through the proxy pipeline.
 4. Alt+S (send): current recipe export (render + retouch, resize/quality/sRGB/
    embedded IPTC/renamed file) enqueued → render service runs → FTP or SFTP
    upload starts in background → cursor auto-advances to next photo.
@@ -175,8 +176,10 @@ Each milestone is a vertical slice that runs end-to-end on Linux.
   keyboard nav.
 - **M2 — Quick edit.** Exposure/WB/highlights/shadows/whites/blacks as
   `DevelopSettings` on a live proxy via lightcraft-pipeline; LR .xmp preset
-  import + apply; free crop + aspect presets + rotate; edit state persisted
-  (catalog + crs sidecar best-effort).
+  import + apply and save current settings as a preset; copy/paste settings
+  with group checkboxes, Apply Previous, Sync to a selection; free crop +
+  aspect presets + rotate; edit state persisted (catalog + crs sidecar
+  best-effort).
 - **M3 — Metadata.** IPTC template editor (phase 1: caption, keywords, headline,
   byline/title, credit, source, copyright, instructions, edit status, rights;
   phase 2: full PM set incl. location, contact, categories, custom fields);

@@ -142,6 +142,15 @@ CREATE TABLE retouch_versions (
   created_at INTEGER NOT NULL
 );
 
+CREATE TABLE presets (
+  id INTEGER PRIMARY KEY,
+  name TEXT NOT NULL,
+  group_name TEXT,
+  path TEXT NOT NULL UNIQUE,      -- crs:XMP file
+  source TEXT NOT NULL,           -- user | imported | lightroom
+  updated_at INTEGER NOT NULL
+);
+
 CREATE TABLE detections (
   id INTEGER PRIMARY KEY,
   item_id INTEGER NOT NULL REFERENCES items(id),
@@ -366,6 +375,7 @@ Component mapping, from `PLAN.md`:
 | Film strip | horizontal `List` of thumbnail cells with badge overlays |
 | Single view, crop, retouch | `canvas()` + `paint_image` / `paint_path` overlays |
 | Template editor, recipes | `Form`, `Input`, `Textarea`, `Select`, `Combobox` |
+| Copy and Sync dialogs | `Dialog` with a `Checkbox` group list |
 | Ingest dialog | `Dialog`, per-card `Progress`, file `Table` |
 | Menus and keys | `Menu`, gpui actions, JSON keymaps, `Kbd` cheat sheet |
 
@@ -388,21 +398,39 @@ Component mapping, from `PLAN.md`:
   resets to fit.
 - Left and Right walk the item list. The view preloads the proxy for neighbors.
 - Left panel edits metadata for the current item through the same `EditSession`.
-- Right column: Presets, then develop sliders and tone curve. Crop and Retouch
-  replace the column content while their mode is active.
+- Right column: Presets, then the develop panel with sliders and tone curve.
+  The panel header carries Copy, Paste, Previous, Sync, and Create preset.
+  Crop and Retouch replace the column content while their mode is active.
 - Bottom film strip: thumbnails of the item list, current item outlined, badge
   overlays, click to navigate, scrolls with the selection. Retouch versions
   stack on the cell with a pen icon, and the top version is marked.
 - All slider changes write to the edit buffer, then debounce to the catalog.
 
-### 2.4 Crop mode
+### 2.4 Settings transfer and presets
+
+- Develop panel header carries `Copy`, `Paste`, `Previous`, `Sync`, and
+  `Create preset`.
+- `Copy` opens a dialog with one checkbox per group: white balance, basic
+  tone, tone curve, crop and rotate, retouch recipes. `Paste` applies the
+  checked groups to the current item.
+- `Previous` applies the full setting set of the last edited item without a
+  dialog. The app tracks the last edit commit.
+- `Sync` is enabled with a multi-selection and uses the same checkbox dialog.
+  Each item commits its own settings and enqueues its own re-render job.
+- `Create preset` saves the current settings as a Lightroom-compatible `.xmp`
+  in the user preset folder. The Presets panel lists user, imported, and
+  Lightroom presets from the index.
+- Copy and paste use the same group structs that serialize to `crs:` XMP, so
+  the clipboard and the preset files share one mapping.
+
+### 2.5 Crop mode
 
 - The canvas draws the full proxy, dimmed outside the crop rect.
 - Overlays: crop border, thirds grid, eight handles, aspect lock list.
 - Straighten slider rotates the image under a fixed crop frame.
 - Aspect presets: free, original, 1:1, 3:2, 2:3, 4:3, 16:9.
 
-### 2.5 Retouch mode
+### 2.6 Retouch mode
 
 - Entering retouch mode creates a versioned copy over the edited source. The
   stack shows in the film strip with a pen icon. Export uses the top version
@@ -416,7 +444,7 @@ Component mapping, from `PLAN.md`:
   a drawn rectangle.
 - Applying a recipe to a multi-selection runs batch jobs with per-photo status.
 
-### 2.6 Metadata
+### 2.7 Metadata
 
 - Left panel edits the current item: multi-column form, one row per IPTC field.
 - The template editor opens from the panel as a `Dialog` and applies a template
@@ -429,7 +457,7 @@ Component mapping, from `PLAN.md`:
 - Code replacement preview under each field shows the resolved text before
   apply.
 
-### 2.7 Ingest dialog
+### 2.8 Ingest dialog
 
 - Card list with label, capacity, free space, and per-card progress bar.
 - Destination folder and filename rules with variable pickers.
@@ -438,7 +466,7 @@ Component mapping, from `PLAN.md`:
 - A live file table during ingest with per-file state: copying, verifying,
   renaming, backup, cataloged, failed.
 
-### 2.8 Finish, recipes, and the queue
+### 2.9 Finish, recipes, and the queue
 
 - Recipe list, one active recipe marked.
 - Recipe action is configurable: local export only, or local export and then
@@ -450,7 +478,7 @@ Component mapping, from `PLAN.md`:
 - Status strip shows the upload queue. Per-photo badges: amber queued, blue
   uploading, green done, red failed. A failed item offers retry with resume.
 
-### 2.9 State model
+### 2.10 State model
 
 - `AppState` root entity: roots, current root, item list, selection set,
   current item, job registry, transfer registry.
@@ -459,9 +487,11 @@ Component mapping, from `PLAN.md`:
   `TemplateEditor`, `SendPanel`, `StatusStrip`.
 - One `EditSession` for the current item: `DevelopSettings`, `Crop`, retouch
   recipes, dirty flag. Commits to the catalog on debounce and on navigation.
+- A settings clipboard holds the last copied group set. `Previous` reads the
+  last edit commit from the catalog.
 - Job progress events update views through the flume drain loop.
 
-### 2.10 Keyboard map, proposal
+### 2.11 Keyboard map, proposal
 
 | Keys | Action |
 |---|---|
@@ -476,6 +506,10 @@ Component mapping, from `PLAN.md`:
 | `P` / `X` | pick / reject |
 | `[` / `]` | rotate 90 degrees |
 | `Z` | fit to window |
+| `Ctrl+Shift+C` / `Ctrl+Shift+V` | copy / paste develop settings |
+| `Ctrl+Alt+V` | apply previous settings |
+| `Ctrl+Shift+S` | sync settings to the selection |
+| `Ctrl+Shift+N` | create preset from current settings |
 | `Ctrl+Z` / `Ctrl+Shift+Z` | undo / redo |
 | `Ctrl+A` | select all |
 
@@ -547,7 +581,7 @@ crate.
 | PR | Branch | Base | Scope | Demo after merge |
 |---|---|---|---|---|
 | D1 | `feature/m2-crop-rotate` | C1 | Free crop, aspect presets, rotate and straighten on the canvas. | Crop and straighten an item, state persists. |
-| D2 | `feature/m2-presets-persistence` | C1 | LR `.xmp` import and apply, edit persistence through B2. | Apply a preset, reopen the app, edits remain. |
+| D2 | `feature/m2-presets-transfer` | C1 | LR `.xmp` import and export, user preset folder and index, copy/paste with group checkboxes, Apply Previous, Sync to selection, edit persistence through B2. | Copy a subset of settings, paste into three photos, sync across a selection, save a preset, restart with edits intact. |
 | D3 | `feature/m4-ingest-complete` | main after C2, C3 | Ingest IPTC snapshot, live contact sheet during ingest. | Ingest a card, photos appear as they land. |
 | D4 | `feature/r1-selection-tools` | D1 | `edit-retouch` crate, rect/ellipse, lasso with RDP, quick-select brush, mask cache. | Draw a lasso, see the mask overlay. |
 
@@ -634,8 +668,8 @@ with an integrator thread. Fix regressions before the next stage starts.
 
 - M1 after B1: open a folder, grid appears with previews, arrows walk items,
   pairing shows one cell per pair.
-- M2 after D2: sliders, crop, rotate, and presets apply to the proxy, and the
-  state survives a restart.
+- M2 after D2: sliders, crop, rotate, and presets apply to the proxy; copy,
+  paste, Previous, and Sync work on a selection; the state survives a restart.
 - M3 after D3: a template applied at ingest lands in the file and the contact
   sheet, and codes expand in captions.
 - M4 after D3: two cards ingest in parallel with per-card progress, one backup
@@ -657,6 +691,10 @@ with an integrator thread. Fix regressions before the next stage starts.
 - D1: rotate. Fine straighten only, or 90 degree steps plus straighten.
 - D4: quick-select determinism. Freeze the rasterized mask for export, keep
   dabs for editing, hash as cache key.
+- D2: copy groups. White balance, basic tone, tone curve, crop and rotate.
+  Retouch recipes off by default.
+- D2: preset format. One `crs:` XMP file per preset in a user folder, indexed
+  at startup, Lightroom can read the files.
 - E1: per-recipe filename templates. Start with one global rule plus the
   recipe-level override.
 - E3: retouch version semantics. Non-destructive recipe stack, top version
