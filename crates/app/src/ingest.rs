@@ -10,9 +10,12 @@
 use std::collections::HashMap;
 use std::sync::Arc;
 
-use edit_catalog::models::{IngestFile, NewIngestBatch};
+use edit_catalog::models::IngestFile;
 use edit_catalog::{Catalog, JobEvent, JobEventKind, JobId, JobKind};
-use edit_ingest::{IngestCopyPayload, Volume, static_prefix, validate};
+use edit_core::IngestFileState;
+use edit_ingest::{
+    IngestCopyPayload, IngestPlanRequest, Volume, batch_volume_identity, plan_ingest,
+};
 use gpui_kit::component::button::Button;
 use gpui_kit::component::dialog::DialogTitle;
 use gpui_kit::component::input::{Input, InputState};
@@ -23,55 +26,10 @@ use gpui_kit::*;
 
 actions!(ingest, [OpenIngest]);
 
-/// Per-file ingest state shown in the live file table.
-///
-/// Written by the C2 copy pipeline through the `ingest_files.state` column;
-/// [`IngestFileState::from_db`] maps it back for rendering.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum IngestFileState {
-    Queued,
-    Copying,
-    Verifying,
-    Renaming,
-    Backup,
-    Cataloged,
-    Duplicate,
-    Failed,
-}
-
-impl IngestFileState {
-    /// Map an `ingest_files.state` string to the display state.
-    pub fn from_db(state: &str) -> Self {
-        match state {
-            "copying" => Self::Copying,
-            "verifying" => Self::Verifying,
-            "renaming" => Self::Renaming,
-            "backup" => Self::Backup,
-            "cataloged" => Self::Cataloged,
-            "duplicate" => Self::Duplicate,
-            "failed" => Self::Failed,
-            _ => Self::Queued,
-        }
-    }
-}
-
-impl std::fmt::Display for IngestFileState {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        let text = match self {
-            Self::Queued => "queued",
-            Self::Copying => "copying",
-            Self::Verifying => "verifying",
-            Self::Renaming => "renaming",
-            Self::Backup => "backup",
-            Self::Cataloged => "cataloged",
-            Self::Duplicate => "duplicate",
-            Self::Failed => "failed",
-        };
-        f.write_str(text)
-    }
-}
-
 /// One row of the live file table, built from an `ingest_files` row.
+///
+/// The state is `edit-core`'s [`IngestFileState`], the same type the catalog
+/// stores and the worker writes.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct IngestFileRow {
     pub name: String,
@@ -85,7 +43,7 @@ impl IngestFileRow {
         Self {
             name: file.original_name.clone(),
             bytes: file.bytes.max(0) as u64,
-            state: IngestFileState::from_db(&file.state),
+            state: file.state,
         }
     }
 }
@@ -245,6 +203,39 @@ impl AppState {
         self.files_by_batch.insert(batch_id, rows);
         cx.notify();
     }
+
+    /// Rebuild the card/job routing from durable state on startup, so an
+    /// ingest that was `running` when the app died shows up and its batch
+    /// leaves `running` when the resumed job finishes.
+    pub fn resume_batches(&mut self, catalog: &Catalog, cx: &mut Context<Self>) {
+        let jobs = match catalog.list_active_ingest_jobs() {
+            Ok(jobs) => jobs,
+            Err(_) => return,
+        };
+        let mut changed = false;
+        for job in jobs {
+            if self.job_batches.contains_key(&job.id) {
+                continue;
+            }
+            let Ok(payload) = serde_json::from_str::<IngestCopyPayload>(&job.payload_json) else {
+                continue;
+            };
+            let (identity, label) = batch_card_label(catalog, payload.batch_id);
+            self.job_batches.insert(job.id, payload.batch_id);
+            self.batches.push(IngestBatchProgress {
+                batch_id: payload.batch_id,
+                volume_identity: identity,
+                label,
+                done: 0,
+                total: 0,
+                state: BatchState::Running,
+            });
+            changed = true;
+        }
+        if changed {
+            cx.notify();
+        }
+    }
 }
 
 impl Default for AppState {
@@ -253,29 +244,77 @@ impl Default for AppState {
     }
 }
 
-/// Apply one durable job event to the ingest UI: per-card progress and the
-/// live file table are re-read from `ingest_files`, so the dialog shows the
-/// durable worker state even after a crash-resume.
+/// Apply one durable job event to the ingest UI.
+///
+/// An unknown ingest job (a crash-resumed job from a previous process) is
+/// registered here from its durable payload, so a resumed ingest is visible
+/// without a startup scan. `ingest_files` is only re-read on Started, on the
+/// first and final progress event, and on the terminal event, never on every
+/// progress tick.
 pub fn apply_ingest_event(
     state: &mut AppState,
     catalog: &Catalog,
     event: &JobEvent,
     cx: &mut Context<AppState>,
 ) {
-    let Some(batch_id) = state.batch_for_job(event.id) else {
+    let Some(batch_id) = batch_for_event(state, catalog, event.id, cx) else {
         return;
     };
-    match &event.kind {
-        JobEventKind::Started { .. } => {}
+    let reload = match &event.kind {
+        JobEventKind::Started { .. } => true,
         JobEventKind::Progress { done, total } => {
             state.set_progress(batch_id, *done as usize, *total as usize, cx);
+            *done == 0 || done == total
         }
-        JobEventKind::Succeeded => state.finish_batch(batch_id, false, cx),
-        JobEventKind::Failed { .. } => state.finish_batch(batch_id, true, cx),
-    }
-    if let Ok(files) = catalog.list_ingest_files(batch_id) {
+        JobEventKind::Succeeded => {
+            state.finish_batch(batch_id, false, cx);
+            true
+        }
+        JobEventKind::Failed { .. } => {
+            state.finish_batch(batch_id, true, cx);
+            true
+        }
+    };
+    if reload && let Ok(files) = catalog.list_ingest_files(batch_id) {
         let rows: Vec<IngestFileRow> = files.iter().map(IngestFileRow::from_db).collect();
         state.set_files(batch_id, rows, cx);
+    }
+}
+
+/// The batch a job event belongs to, registering an ingest job seen for the
+/// first time (e.g. resumed from a previous process).
+fn batch_for_event(
+    state: &mut AppState,
+    catalog: &Catalog,
+    job_id: JobId,
+    cx: &mut Context<AppState>,
+) -> Option<i64> {
+    if let Some(batch_id) = state.batch_for_job(job_id) {
+        return Some(batch_id);
+    }
+    let job = catalog.job(job_id).ok()?;
+    if job.kind != JobKind::IngestCopy {
+        return None;
+    }
+    let payload: IngestCopyPayload = serde_json::from_str(&job.payload_json).ok()?;
+    let (identity, label) = batch_card_label(catalog, payload.batch_id);
+    state.register_batch(payload.batch_id, job_id, identity, label, cx);
+    Some(payload.batch_id)
+}
+
+/// Volume identity and display label for a batch, used when registering a
+/// resumed job.
+fn batch_card_label(catalog: &Catalog, batch_id: i64) -> (String, String) {
+    match catalog.get_ingest_batch(batch_id) {
+        Ok(batch) => (
+            batch_volume_identity(&batch),
+            batch
+                .session_name
+                .clone()
+                .or_else(|| batch.volume_label.clone())
+                .unwrap_or_else(|| "card".to_string()),
+        ),
+        Err(_) => (String::new(), "card".to_string()),
     }
 }
 
@@ -344,83 +383,98 @@ impl IngestDialog {
             cx.notify();
             return;
         };
+        let volume = self
+            .state
+            .read(cx)
+            .volumes()
+            .iter()
+            .find(|volume| volume.identity == identity)
+            .cloned();
+        let Some(volume) = volume else {
+            self.status = Some("That card is gone.".to_string());
+            cx.notify();
+            return;
+        };
+        if self.start_card(&volume, cx) {
+            self.status = Some(format!("Ingesting {}…", volume.display_name()));
+        }
+        cx.notify();
+    }
+
+    /// Open one batch per detected card, so every card ingests in parallel.
+    fn start_all(&mut self, cx: &mut Context<Self>) {
+        let volumes = self.state.read(cx).volumes().to_vec();
+        if volumes.is_empty() {
+            self.status = Some("No cards detected.".to_string());
+            cx.notify();
+            return;
+        }
+        let mut started = 0;
+        for volume in &volumes {
+            if self.start_card(volume, cx) {
+                started += 1;
+            }
+        }
+        if started > 0 {
+            self.status = Some(format!("Ingesting {started}/{} cards…", volumes.len()));
+        }
+        cx.notify();
+    }
+
+    /// Validate the inputs, open the batch, and queue its `ingest_copy` job.
+    /// Returns false (with `status` set) when the card cannot be started.
+    fn start_card(&mut self, volume: &Volume, cx: &mut Context<Self>) -> bool {
         let dest = self.dest_dir.read(cx).value().to_string();
         let file_rule = self.file_rule.read(cx).value().to_string();
         let backup = self.backup_dir.read(cx).value().to_string();
-        if dest.trim().is_empty() {
-            self.status = Some("Destination folder is empty.".to_string());
-            cx.notify();
-            return;
-        }
-        if let Err(error) = validate(dest.trim()).and_then(|_| validate(file_rule.trim())) {
-            self.status = Some(format!("Bad naming rule: {error}"));
-            cx.notify();
-            return;
-        }
-
-        let volume = {
-            let state = self.state.read(cx);
-            match state.volumes().iter().find(|v| v.identity == identity) {
-                Some(volume) => volume.clone(),
-                None => {
-                    self.status = Some("That card is gone.".to_string());
-                    cx.notify();
-                    return;
-                }
+        let session = volume.display_name();
+        let plan = match plan_ingest(&IngestPlanRequest {
+            volume_uuid: volume.fs_uuid.as_deref(),
+            volume_label: volume.label.as_deref(),
+            source_root: &volume.mount_point,
+            dest_dir_template: &dest,
+            filename_template: &file_rule,
+            backup_dir: Some(backup.as_str()),
+            session: &session,
+            start_seq: 1,
+        }) {
+            Ok(plan) => plan,
+            Err(error) => {
+                self.status = Some(format!("Bad naming rule: {error}"));
+                return false;
             }
         };
-
-        let backup_dir = {
-            let trimmed = backup.trim();
-            (!trimmed.is_empty()).then(|| trimmed.to_string())
-        };
-        let session = volume.display_name();
-        let batch = NewIngestBatch {
-            volume_uuid: volume.fs_uuid.clone(),
-            volume_label: volume.label.clone(),
-            session_name: Some(session.clone()),
-            dest_dir: static_prefix(dest.trim()),
-            backup_dir: backup_dir.clone(),
-            template_id: None,
-            state: "running".to_string(),
-        };
-        let batch_id = match self.catalog.create_ingest_batch(&batch) {
+        let batch_id = match self.catalog.create_ingest_batch(&plan.batch) {
             Ok(id) => id,
             Err(error) => {
                 self.status = Some(format!("Could not open batch: {error}"));
-                cx.notify();
-                return;
+                return false;
             }
         };
         let payload = IngestCopyPayload {
             batch_id,
-            source_root: volume.mount_point.to_string_lossy().into_owned(),
-            dest_dir_template: dest.trim().to_string(),
-            filename_template: file_rule.trim().to_string(),
-            backup_dir,
-            session: session.clone(),
-            start_seq: 1,
+            ..plan.payload
         };
         let encoded = match serde_json::to_string(&payload) {
             Ok(encoded) => encoded,
             Err(error) => {
                 self.status = Some(format!("Could not encode ingest job: {error}"));
-                cx.notify();
-                return;
+                return false;
             }
         };
         match self.catalog.enqueue_job(JobKind::IngestCopy, &encoded) {
             Ok(job_id) => {
+                let identity = volume.identity.clone();
                 self.state.update(cx, |state, cx| {
-                    state.register_batch(batch_id, job_id, identity, session.clone(), cx);
+                    state.register_batch(batch_id, job_id, identity, session, cx);
                 });
-                self.status = Some(format!("Ingesting {session}…"));
+                true
             }
             Err(error) => {
                 self.status = Some(format!("Could not queue ingest: {error}"));
+                false
             }
         }
-        cx.notify();
     }
 
     fn render_cards(&self, cx: &mut Context<Self>) -> impl IntoElement {
@@ -573,7 +627,9 @@ impl Render for IngestDialog {
         }
         let volume_count = volumes.len();
         let dest = self.dest_dir.read(cx).value().to_string();
-        let ready = self.selected.is_some() && !dest.trim().is_empty();
+        let dest_ready = !dest.trim().is_empty();
+        let ready = self.selected.is_some() && dest_ready;
+        let all_ready = volume_count > 0 && dest_ready;
         let status = self.status.clone();
         div()
             .id("ingest-dialog")
@@ -616,6 +672,16 @@ impl Render for IngestDialog {
                             .justify_end()
                             .gap_2()
                             .child(
+                                Button::new("ingest-start-all")
+                                    .label("Ingest all cards")
+                                    .disabled(!all_ready)
+                                    .on_click(cx.listener(
+                                        |this, _event: &ClickEvent, _window, cx| {
+                                            this.start_all(cx);
+                                        },
+                                    )),
+                            )
+                            .child(
                                 Button::new("ingest-start")
                                     .label("Start ingest")
                                     .disabled(!ready)
@@ -640,8 +706,9 @@ mod tests {
     // NOTE: import items explicitly, never `super::*` — the `gpui_kit::*`
     // glob re-exported above includes GPUI's `test` macro, which would shadow
     // the built-in `#[test]` attribute inside this module.
-    use super::{BatchState, IngestFileRow, IngestFileState, format_bytes};
+    use super::{BatchState, IngestFileRow, format_bytes};
     use edit_catalog::models::IngestFile;
+    use edit_core::IngestFileState;
 
     #[test]
     fn byte_counts_format_with_binary_units() {
@@ -649,29 +716,6 @@ mod tests {
         assert_eq!(format_bytes(512), "512 B");
         assert_eq!(format_bytes(1024), "1.0 KiB");
         assert_eq!(format_bytes(48 * 1024 * 1024 * 1024), "48.0 GiB");
-    }
-
-    #[test]
-    fn file_states_render_expected_labels() {
-        assert_eq!(IngestFileState::Copying.to_string(), "copying");
-        assert_eq!(IngestFileState::Cataloged.to_string(), "cataloged");
-        assert_eq!(IngestFileState::Duplicate.to_string(), "duplicate");
-        assert_eq!(IngestFileState::Failed.to_string(), "failed");
-    }
-
-    #[test]
-    fn db_states_map_to_display_states() {
-        assert_eq!(IngestFileState::from_db("queued"), IngestFileState::Queued);
-        assert_eq!(IngestFileState::from_db("backup"), IngestFileState::Backup);
-        assert_eq!(
-            IngestFileState::from_db("duplicate"),
-            IngestFileState::Duplicate
-        );
-        // Unknown states degrade to queued instead of panicking.
-        assert_eq!(
-            IngestFileState::from_db("nonsense"),
-            IngestFileState::Queued
-        );
     }
 
     #[test]
@@ -687,7 +731,7 @@ mod tests {
             backup_path: None,
             blake3: None,
             photo_id: None,
-            state: "duplicate".into(),
+            state: IngestFileState::Duplicate,
             error: None,
             created_at: 0,
         });

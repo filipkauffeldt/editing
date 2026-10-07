@@ -9,42 +9,60 @@
 use std::sync::Arc;
 
 use edit_catalog::{Catalog, ClaimedJob, JobEvent, JobEventKind, JobKind};
-use edit_ingest::{IngestCopyPayload, run_ingest_copy};
+use edit_ingest::{FileMetadata, IngestCopyPayload, run_ingest_copy};
 
-/// Handle one durable job. Returns `Ok(())` for kinds this worker does not
-/// own, so the app can chain it with the browse handler.
-pub fn ingest_job_handler(
+/// The single durable-job dispatch for the app: browse, thumbnail, and
+/// ingest kinds in one place. Unknown kinds are a no-op.
+pub fn handle_job(
     catalog: Arc<Catalog>,
     job: &ClaimedJob,
     tx: &flume::Sender<JobEvent>,
 ) -> Result<(), String> {
     match job.kind {
-        JobKind::IngestCopy => {
-            let payload: IngestCopyPayload = serde_json::from_str(&job.payload_json)
-                .map_err(|e| format!("bad ingest payload: {e}"))?;
-            let id = job.id;
-            let tx_progress = tx.clone();
-            run_ingest_copy(
-                &catalog,
-                &payload,
-                |path| edit_metadata::read_photo_metadata(path).taken_at,
-                &|done, total| {
-                    tx_progress
-                        .send(JobEvent {
-                            id,
-                            kind: JobEventKind::Progress {
-                                done: done as u64,
-                                total: total as u64,
-                            },
-                        })
-                        .ok();
-                },
-            )
-            .map(|_| ())
-            .map_err(|e| format!("ingest failed: {e}"))
-        }
+        JobKind::CatalogScan | JobKind::Thumb => crate::views::browse_job_handler(catalog, job, tx),
+        JobKind::IngestCopy => ingest_job_handler(catalog, job, tx),
         _ => Ok(()),
     }
+}
+
+/// Handle one `ingest_copy` job. Returns `Ok(())` for other kinds so the
+/// dispatcher can route them elsewhere.
+pub fn ingest_job_handler(
+    catalog: Arc<Catalog>,
+    job: &ClaimedJob,
+    tx: &flume::Sender<JobEvent>,
+) -> Result<(), String> {
+    if job.kind != JobKind::IngestCopy {
+        return Ok(());
+    }
+    let payload: IngestCopyPayload =
+        serde_json::from_str(&job.payload_json).map_err(|e| format!("bad ingest payload: {e}"))?;
+    let id = job.id;
+    let tx_progress = tx.clone();
+    run_ingest_copy(
+        &catalog,
+        &payload,
+        |path| {
+            let meta = edit_metadata::read_photo_metadata(path);
+            FileMetadata {
+                taken_at: meta.taken_at,
+                camera: meta.camera,
+            }
+        },
+        &|done, total| {
+            tx_progress
+                .send(JobEvent {
+                    id,
+                    kind: JobEventKind::Progress {
+                        done: done as u64,
+                        total: total as u64,
+                    },
+                })
+                .ok();
+        },
+    )
+    .map(|_| ())
+    .map_err(|e| format!("ingest failed: {e}"))
 }
 
 #[cfg(test)]
@@ -118,7 +136,10 @@ mod tests {
 
         let rows = catalog.list_ingest_files(batch).unwrap();
         assert_eq!(rows.len(), 2);
-        assert!(rows.iter().all(|row| row.state == "cataloged"));
+        assert!(
+            rows.iter()
+                .all(|row| row.state == edit_core::IngestFileState::Cataloged)
+        );
         assert_eq!(catalog.get_ingest_batch(batch).unwrap().state, "done");
         std::fs::remove_dir_all(&base).ok();
     }

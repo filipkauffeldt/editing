@@ -11,8 +11,8 @@ use gpui_kit::*;
 use ingest::{AppState, IngestDialog, OpenIngest, apply_ingest_event};
 
 use app::browse::CatalogScanPayload;
-use app::ingest_job::ingest_job_handler;
-use app::views::{Browser, browse_job_handler};
+use app::ingest_job::handle_job;
+use app::views::Browser;
 
 fn catalog_path() -> PathBuf {
     let base = std::env::var_os("EDITING_CATALOG")
@@ -82,13 +82,11 @@ fn main() {
     catalog.recover_running().expect("recover running jobs");
 
     let worker_catalog = Arc::clone(&catalog);
-    let handler: edit_catalog::JobHandler = Arc::new(move |job, tx| match job.kind {
-        JobKind::CatalogScan | JobKind::Thumb => {
-            browse_job_handler(worker_catalog.clone(), job, tx)
-        }
-        JobKind::IngestCopy => ingest_job_handler(worker_catalog.clone(), job, tx),
-        _ => Ok(()),
-    });
+    let handler: edit_catalog::JobHandler =
+        Arc::new(move |job, tx| handle_job(worker_catalog.clone(), job, tx));
+    // Two workers cap parallel card copies at two; extra cards queue behind
+    // them (the copy stage, not the DB, is the bottleneck). Raising the cap
+    // is a one-line change here.
     let pool = edit_catalog::spawn_workers(&catalog, 2, handler).expect("spawn workers");
     let events = pool.events().clone();
     let browser_events = events.clone();
@@ -124,8 +122,10 @@ fn main() {
         let (window_handle, shell) = gpui_kit::open_window(window_options, cx, |window, cx| {
             let browser_catalog = Arc::clone(&catalog);
             let browser = cx.new(|cx| Browser::new(browser_catalog, browser_events.clone(), cx));
-            // Ingest dialog state + inputs.
+            // Ingest dialog state + inputs. Rebuild the card/job routing from
+            // durable state so a crash-resumed ingest is visible.
             let state = cx.new(|_| AppState::new());
+            state.update(cx, |state, cx| state.resume_batches(&catalog, cx));
             let dest_dir = cx.new(|cx| {
                 InputState::new(window, cx)
                     .placeholder("~/Photos")
