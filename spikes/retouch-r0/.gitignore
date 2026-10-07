@@ -1,0 +1,20 @@
+# Downloads stay out of the repo: datasets, models, rendered outputs.
+downloads/
+data/
+models/
+out/
+*.onnx
+*.nef
+*.NEF
+*.zip
+WIDER_val.zip
+wider_face_split.zip
+out.png
+cli.png
+mine.png
+retouch_out/
+
+# Build output.
+target/
+target-cli/
+
