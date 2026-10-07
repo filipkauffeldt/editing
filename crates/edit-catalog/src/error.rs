@@ -19,3 +19,16 @@ pub enum Error {
 
 /// Convenience alias for catalog operations.
 pub type Result<T> = std::result::Result<T, Error>;
+
+impl Error {
+    /// True for SQLite UNIQUE constraint violations: the caller tried to
+    /// insert a row whose unique key already exists. Folder scans use this
+    /// to skip an already-cataloged file instead of aborting the whole scan.
+    pub fn is_unique_violation(&self) -> bool {
+        matches!(
+            self,
+            Self::Sqlite(rusqlite::Error::SqliteFailure(err, _))
+                if err.code == rusqlite::ErrorCode::ConstraintViolation
+        )
+    }
+}
