@@ -265,7 +265,6 @@ mod tests {
 
     #[test]
     fn run_metadata_write_expands_and_sends_progress_per_path() {
-        use crate::writer::{ScriptStep, ScriptTransport};
         use tempfile::TempDir;
 
         let dir = TempDir::new().unwrap();

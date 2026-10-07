@@ -13,6 +13,7 @@ use std::process::Command;
 use std::sync::Arc;
 use std::time::Duration;
 
+use edit_catalog::db::now_unix;
 use edit_catalog::{Catalog, ClaimedJob, JobKind, JobState, WorkerPool, models::NewPhoto};
 use edit_metadata::{MetadataWritePayload, Writer};
 
@@ -123,6 +124,7 @@ fn template_apply_recipe_writes_the_selection() {
             item_id: *item_id,
             paths: vec![catalog.get_photo(*photo_id).unwrap().path],
             sequence: *sequence,
+            captured_at: now_unix(),
             fields_json: catalog.get_iptc_template(template_id).unwrap().fields_json,
         })
         .unwrap();
