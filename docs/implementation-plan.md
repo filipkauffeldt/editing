@@ -133,6 +133,15 @@ CREATE TABLE retouch_recipes (
   created_at INTEGER NOT NULL
 );
 
+CREATE TABLE retouch_versions (
+  id INTEGER PRIMARY KEY,
+  item_id INTEGER NOT NULL REFERENCES items(id),
+  parent_id INTEGER REFERENCES retouch_versions(id),
+  recipe_json TEXT NOT NULL,
+  is_top INTEGER NOT NULL DEFAULT 0,
+  created_at INTEGER NOT NULL
+);
+
 CREATE TABLE detections (
   id INTEGER PRIMARY KEY,
   item_id INTEGER NOT NULL REFERENCES items(id),
@@ -314,7 +323,7 @@ re-reads the card for the backup.
 One window. The single view layout follows this sketch:
 
 ```
-┌ TitleBar: editing            [Open Folder] [Ingest] [Send] ───────────────┐
+┌ TitleBar: editing        [Open Folder] [Ingest] [Finish & next ▾] ────────┐
 ├ Status strip: upload state · edit state · template changes ────────────────┤
 ├ Metadata editor ──┬ Photo canvas ─────────────────────────┬ Develop ───────┤
 │ Caption           │                                       │ Presets        │
@@ -323,7 +332,8 @@ One window. The single view layout follows this sketch:
 │ Byline            │                                       │ Tone curve     │
 │ ...               │                                       │ Crop · Retouch │
 ├───────────────────┴───────────────────────────────────────┴────────────────┤
-│ Film strip  [▣][▣][▣][▣][▣][▣][▣][▣][▣][▣][▣][▣]                           │
+│           filters and stuff                    │       [Finish & next ▾]  │
+│ Film strip [▣][▣][▣][▣][▣][▣][▣][▣][▣][▣][▣][▣]                            │
 └────────────────────────────────────────────────────────────────────────────┘
 ```
 
@@ -337,7 +347,15 @@ contact sheet mode. The left metadata editor stays in both modes.
 - Center: photo canvas, crop canvas, or retouch canvas.
 - Right: Presets list at the top, then the develop panel with LR-style sliders
   and tone curve. Crop and Retouch swap into this column.
+- Strip toolbar above the film strip: quick filters and rating on the left,
+  `Finish & next` on the right.
 - Bottom: film strip of the current item list with badge overlays.
+- `Finish & next` runs the active send recipe and advances. The recipe decides
+  the action: export only, or export to a folder and then upload. The dropdown
+  selects the recipe for this run.
+- Retouch opens from the right column and works on a versioned copy stacked
+  over the edited source. The film strip shows the stack with a pen icon.
+  Export uses the top version by default.
 
 Component mapping, from `PLAN.md`:
 
@@ -373,7 +391,8 @@ Component mapping, from `PLAN.md`:
 - Right column: Presets, then develop sliders and tone curve. Crop and Retouch
   replace the column content while their mode is active.
 - Bottom film strip: thumbnails of the item list, current item outlined, badge
-  overlays, click to navigate, scrolls with the selection.
+  overlays, click to navigate, scrolls with the selection. Retouch versions
+  stack on the cell with a pen icon, and the top version is marked.
 - All slider changes write to the edit buffer, then debounce to the catalog.
 
 ### 2.4 Crop mode
@@ -385,6 +404,9 @@ Component mapping, from `PLAN.md`:
 
 ### 2.5 Retouch mode
 
+- Entering retouch mode creates a versioned copy over the edited source. The
+  stack shows in the film strip with a pen icon. Export uses the top version
+  unless the user selects another one.
 - Tool palette: rectangle, ellipse, lasso, quick-select brush.
 - Selection list on the right with visible and delete controls.
 - Operation settings: mosaic cell size, gaussian radius, feather.
@@ -416,12 +438,15 @@ Component mapping, from `PLAN.md`:
 - A live file table during ingest with per-file state: copying, verifying,
   renaming, backup, cataloged, failed.
 
-### 2.8 Send panel and queue
+### 2.8 Finish, recipes, and the queue
 
 - Recipe list, one active recipe marked.
+- Recipe action is configurable: local export only, or local export and then
+  upload. Plain FTP is v1. SFTP follows the FTP queue work.
 - Recipe form: file format, quality, resize long edge, output color, filename
-  rule, FTP profile, remote directory.
-- `Alt+S` sends the current item with the active recipe, then advances.
+  rule, destination folder, FTP profile, remote directory.
+- `Finish & next` and `Alt+S` run the active recipe on the current item, then
+  advance. The dropdown next to the button picks a different recipe for one run.
 - Status strip shows the upload queue. Per-photo badges: amber queued, blue
   uploading, green done, red failed. A failed item offers retry with resume.
 
@@ -441,7 +466,7 @@ Component mapping, from `PLAN.md`:
 | Keys | Action |
 |---|---|
 | `Alt+Left` / `Alt+Right` | previous / next item |
-| `Alt+S` | send current item, then advance |
+| `Alt+S` | finish current item with the active recipe, then advance |
 | `G` | toggle contact sheet and single view |
 | `I` | open ingest dialog |
 | `T` | open template editor |
@@ -532,7 +557,7 @@ crate.
 |---|---|---|---|---|
 | E1 | `feature/m5-render-export` | D1 | Export path: full-res render, retouch hook, JPEG encode, resize, quality, sRGB, IPTC embed, filename recipe. | Export one edited item to JPEG. |
 | E2 | `feature/m5-ftp-queue` | main after A2 | suppaftp worker, keyring secrets, resume and retry, status badges. | Upload to a test FTP server, kill the app, resume. |
-| E3 | `feature/r2-retouch-ops` | E1 | Retouch stage in the render path, mosaic and gaussian, strength presets, golden tests for preview and export parity. | Mosaic a region, export, pixels match the preview. |
+| E3 | `feature/r2-retouch-ops` | E1 | Retouch stage in the render path, mosaic and gaussian, strength presets, retouch version stack in the film strip, golden tests for preview and export parity. | Mosaic a region, export, pixels match the preview, the version stacks with a pen icon. |
 
 ### 3.8 Stage F
 
@@ -634,4 +659,6 @@ with an integrator thread. Fix regressions before the next stage starts.
   dabs for editing, hash as cache key.
 - E1: per-recipe filename templates. Start with one global rule plus the
   recipe-level override.
+- E3: retouch version semantics. Non-destructive recipe stack, top version
+  exported by default. Store pixels only if the recipe re-render is too slow.
 - E2: IIM dual-write default for agency compatibility.
