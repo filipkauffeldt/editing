@@ -15,7 +15,7 @@ use gpui_kit::component::button::Button;
 use gpui_kit::component::dialog::DialogTitle;
 use gpui_kit::component::input::{Input, InputState};
 use gpui_kit::component::progress::Progress;
-use gpui_kit::component::{Disableable as _, StyledExt as _, h_flex, v_flex};
+use gpui_kit::component::{ActiveTheme as _, Disableable as _, StyledExt as _, h_flex, v_flex};
 use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::*;
 
@@ -81,7 +81,6 @@ impl AppState {
             iptc_template: None,
         }
     }
-
     pub fn volumes(&self) -> &[Volume] {
         &self.volumes
     }
@@ -111,9 +110,15 @@ impl AppState {
     }
 }
 
-/// Format a byte count for the card list and file table.
+impl Default for AppState {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+/// Format a byte count for the card list and file table (binary units).
 pub fn format_bytes(bytes: u64) -> String {
-    const UNITS: &[&str] = &["B", "KB", "MB", "GB", "TB"];
+    const UNITS: &[&str] = &["B", "KiB", "MiB", "GiB", "TiB"];
     let mut value = bytes as f64;
     let mut unit = 0;
     while value >= 1024.0 && unit + 1 < UNITS.len() {
@@ -265,14 +270,22 @@ impl IngestDialog {
 
 impl Render for IngestDialog {
     fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
-        let volume_count = self.state.read(cx).volumes().len();
+        let volumes = self.state.read(cx).volumes().to_vec();
+        // Drop a selection whose card is gone so the highlight never points
+        // at a removed volume.
+        if let Some(selected) = self.selected.as_deref()
+            && !volumes.iter().any(|volume| volume.identity == selected)
+        {
+            self.selected = None;
+        }
+        let volume_count = volumes.len();
         div()
             .id("ingest-dialog")
             .w_full()
             .rounded_lg()
             .border_1()
             .p_4()
-            .bg(rgb(0x1E1E1E))
+            .bg(cx.theme().tokens.popover)
             .child(
                 v_flex()
                     .gap_3()
@@ -329,8 +342,8 @@ mod tests {
     fn byte_counts_format_with_binary_units() {
         assert_eq!(format_bytes(0), "0 B");
         assert_eq!(format_bytes(512), "512 B");
-        assert_eq!(format_bytes(1024), "1.0 KB");
-        assert_eq!(format_bytes(48 * 1024 * 1024 * 1024), "48.0 GB");
+        assert_eq!(format_bytes(1024), "1.0 KiB");
+        assert_eq!(format_bytes(48 * 1024 * 1024 * 1024), "48.0 GiB");
     }
 
     #[test]
