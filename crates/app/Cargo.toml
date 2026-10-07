@@ -8,5 +8,12 @@ license.workspace = true
 [dependencies]
 gpui_platform.workspace = true
 gpui-kit.workspace = true
+edit-core.workspace = true
+edit-catalog.workspace = true
 edit-ingest.workspace = true
+serde.workspace = true
+serde_json.workspace = true
 flume.workspace = true
+lightcraft-raw.workspace = true
+lightcraft-codecs.workspace = true
+image.workspace = true
