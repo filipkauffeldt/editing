@@ -8,3 +8,5 @@ license.workspace = true
 [dependencies]
 gpui_platform.workspace = true
 gpui-kit.workspace = true
+edit-ingest.workspace = true
+flume.workspace = true
