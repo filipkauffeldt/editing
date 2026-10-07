@@ -3,8 +3,8 @@
 A minimal, fast, keyboard-first photo workflow app: Photo Mechanic's ingest and
 metadata muscle combined with Lightroom's quick-edit feel, built with Rust +
 GPUI. One integrated loop: tag, quick-edit, retouch, send, advance — rendering,
-face detection and FTP upload happen in the background while you move to the
-next photo.
+face detection and FTP/SFTP upload happen in the background while you move to
+the next photo.
 
 Open source. Linux first, cross-platform (Windows, macOS) after.
 
@@ -43,7 +43,7 @@ Open source. Linux first, cross-platform (Windows, macOS) after.
 | Ingest | Manual trigger only; multi-card parallel; one verified backup destination |
 | Ingest naming | User-defined folder/filename rules with variables (PM-style subset) |
 | RAW+JPEG | Paired by base filename, treated as one item; caption/edit the JPEG, stamp both |
-| Transfer | Plain FTP v1 (suppaftp, REST resume); FTPS/SFTP later |
+| Transfer | FTP (suppaftp, REST resume) and SFTP (russh-sftp) in v1; FTPS later |
 | Send model | Multiple saved send recipes, one active; explicit send key then auto-advance |
 | State | SQLite catalog (ratings, tags, upload status, ingest history, queue, selections, retouch recipes, detections) |
 | Secrets | OS keychain via `keyring` crate |
@@ -84,7 +84,7 @@ Open source. Linux first, cross-platform (Windows, macOS) after.
                                    │
                       ┌────────────▼────────────┐
                       │ Transfer queue          │
-                      │ suppaftp (plain FTP)    │
+                      │ suppaftp + russh-sftp   │
                       │ resume, retry, status   │
                       └─────────────────────────┘
 ```
@@ -152,8 +152,8 @@ surfaces can use the same behaviors without fighting a styled component.
    1.2°; maybe apply an LR .xmp preset. Sliders drive DevelopSettings through
    the proxy pipeline.
 4. Alt+S (send): current recipe export (render + retouch, resize/quality/sRGB/
-   embedded IPTC/renamed file) enqueued → render service runs → FTP upload
-   starts in background → cursor auto-advances to next photo.
+   embedded IPTC/renamed file) enqueued → render service runs → FTP or SFTP
+   upload starts in background → cursor auto-advances to next photo.
 5. Green badge appears on the sent photo; a failed upload turns red and is
    retried with resume.
 
@@ -187,8 +187,8 @@ Each milestone is a vertical slice that runs end-to-end on Linux.
   detection, IPTC snapshot on ingest, contact sheet live-updates mid-ingest.
 - **M5 — Send.** Render service (lightcraft-pipeline + retouch stage + JPEG
   encode, resize/quality/sRGB, IPTC embed, filename recipe); send recipes
-  (multiple saved, one active); FTP transfer queue with resume/retry/status
-  badges; Alt+S send + auto-advance. Core loop demo done.
+  (multiple saved, one active); FTP and SFTP transfer queue with
+  resume/retry/status badges; Alt+S send + auto-advance. Core loop demo done.
 - **M6 — Retouch & face blur.** Selection tools on the canvas, mosaic/blur ops
   with privacy presets, detect-in-region with manual toggle, batch recipes and
   sticky regions (R0–R4 below).
@@ -233,7 +233,7 @@ render path.
 | Color | lightcraft-pipeline; moxcms only if app-side ICC is needed |
 | Metadata I/O | exiftool `-stay_open`; read: kamadak-exif + quick-xml |
 | Export | in-process render service (no subprocess) |
-| Transfer | suppaftp (plain FTP, REST resume) |
+| Transfer | suppaftp (FTP, REST resume) + russh-sftp (SFTP) |
 | Catalog/queue | rusqlite (bundled) + worker threads + flume |
 | Volumes | sysinfo polling + udev / GetVolumeInformationW / diskarbitration |
 | Secrets | keyring |
@@ -261,8 +261,10 @@ render path.
   module; vendor the kernels we use if it churns.
 - **MSRV** — LightCraft needs edition 2024 / Rust 1.90, photocraft-algo 1.95,
   libfacedetection_rs 1.85; workspace MSRV is 1.95.
-- **Plain FTP credentials on the wire** — keychain-stored, but document the
-  risk; FTPS/SFTP on the roadmap.
+- **FTP credentials on the wire** — FTPS is not in v1. Prefer SFTP for
+  sensitive work. Keychain storage protects credentials at rest only.
+- **SFTP host key trust** — pin the host key on first use, warn on change, and
+  never accept a changed key silently.
 
 ## Open questions
 

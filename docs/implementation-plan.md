@@ -24,7 +24,7 @@ crates/
   edit-retouch    Shape model, mask rasterization, mosaic/gaussian, face boxes
   edit-metadata   exiftool resident writer, XMP/EXIF read, templates, codes
   edit-ingest     Volume detection, copy pipeline, naming rules, backup
-  edit-transfer   FTP queue with resume and retry
+  edit-transfer   FTP and SFTP queue with resume and retry
 ```
 
 Rules:
@@ -45,7 +45,7 @@ The GPUI main thread owns views and entities. Long work never runs there.
 
 - Cancellable work runs on `BackgroundExecutor` tasks. The view keeps the
   `Task` handle so it drops cleanly.
-- Ingest copy, FTP upload, and the exiftool resident process use dedicated
+- Ingest copy, uploads, and the exiftool resident process use dedicated
   `std::thread` workers.
 - Every durable task is a row in the `jobs` table. N worker threads claim jobs
   with one SQL transaction. On launch, `running` rows return to `queued`. A
@@ -442,9 +442,9 @@ Component mapping, from `PLAN.md`:
 
 - Recipe list, one active recipe marked.
 - Recipe action is configurable: local export only, or local export and then
-  upload. Plain FTP is v1. SFTP follows the FTP queue work.
+  upload. FTP and SFTP are v1. FTPS follows.
 - Recipe form: file format, quality, resize long edge, output color, filename
-  rule, destination folder, FTP profile, remote directory.
+  rule, destination folder, FTP/SFTP profile, remote directory.
 - `Finish & next` and `Alt+S` run the active recipe on the current item, then
   advance. The dropdown next to the button picks a different recipe for one run.
 - Status strip shows the upload queue. Per-photo badges: amber queued, blue
@@ -556,7 +556,7 @@ crate.
 | PR | Branch | Base | Scope | Demo after merge |
 |---|---|---|---|---|
 | E1 | `feature/m5-render-export` | D1 | Export path: full-res render, retouch hook, JPEG encode, resize, quality, sRGB, IPTC embed, filename recipe. | Export one edited item to JPEG. |
-| E2 | `feature/m5-ftp-queue` | main after A2 | suppaftp worker, keyring secrets, resume and retry, status badges. | Upload to a test FTP server, kill the app, resume. |
+| E2 | `feature/m5-transfer-queue` | main after A2 | suppaftp and russh-sftp workers, keyring secrets, resume and retry, status badges. | Upload to a test FTP server and a test SFTP server, kill the app, resume. |
 | E3 | `feature/r2-retouch-ops` | E1 | Retouch stage in the render path, mosaic and gaussian, strength presets, retouch version stack in the film strip, golden tests for preview and export parity. | Mosaic a region, export, pixels match the preview, the version stacks with a pen icon. |
 
 ### 3.8 Stage F
@@ -662,3 +662,6 @@ with an integrator thread. Fix regressions before the next stage starts.
 - E3: retouch version semantics. Non-destructive recipe stack, top version
   exported by default. Store pixels only if the recipe re-render is too slow.
 - E2: IIM dual-write default for agency compatibility.
+- E2: SFTP host key policy. Pin on first use, warn on change, never accept a
+  changed key silently. FTP stays unencrypted in v1, so prefer SFTP for
+  sensitive work.
