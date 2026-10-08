@@ -171,8 +171,24 @@ pub fn ingest_job_handler(
                 .ok();
         },
     )
-    .map(|_| ())
     .map_err(|e| format!("ingest failed: {e}"))
+    .and_then(|summary| {
+        // Same rule as the batch row: nothing landed, so the job did not
+        // succeed either (the first reason travels in the failure event).
+        let landed = summary.copied + summary.recovered + summary.duplicates;
+        if summary.failed > 0 && landed == 0 {
+            let reason = catalog
+                .list_ingest_files(payload.batch_id)
+                .ok()
+                .and_then(|rows| rows.into_iter().find_map(|row| row.error))
+                .unwrap_or_default();
+            return Err(format!(
+                "none of {} files could be ingested: {reason}",
+                summary.failed
+            ));
+        }
+        Ok(())
+    })
 }
 
 #[cfg(test)]
@@ -464,6 +480,37 @@ mod tests {
         assert_eq!(
             payload.iptc_fields_json.as_deref(),
             Some(r#"{"credit":"SHL"}"#)
+        );
+        std::fs::remove_dir_all(&base).ok();
+    }
+
+    #[test]
+    fn a_job_where_every_file_failed_fails_with_the_first_reason() {
+        let base = scratch("all-failed");
+        let card = base.join("card");
+        let dcim = card.join("DCIM/100NIKON");
+        std::fs::create_dir_all(&dcim).unwrap();
+        std::fs::write(dcim.join("DSC_0001.NEF"), b"raw one").unwrap();
+        std::fs::write(dcim.join("DSC_0002.NEF"), b"raw two").unwrap();
+        let dest = base.join("Photos").to_string_lossy().into_owned();
+        let catalog = Arc::new(Catalog::open(&base.join("catalog.sqlite")).unwrap());
+        let started = start_ingest(&catalog, &start_request(&card, &dest, "")).unwrap();
+
+        // Corrupt the durable rule the way the old empty-rule bug did.
+        let job = catalog.claim_job().unwrap().unwrap();
+        let mut payload: IngestCopyPayload = serde_json::from_str(&job.payload_json).unwrap();
+        payload.filename_template = String::new();
+        let job = ClaimedJob {
+            payload_json: serde_json::to_string(&payload).unwrap(),
+            ..job
+        };
+        let (tx, _rx) = flume::unbounded();
+        let error = ingest_job_handler(Arc::clone(&catalog), &job, &tx).unwrap_err();
+        assert!(error.contains("none of 2 files"), "{error}");
+        assert!(error.contains("empty name"), "{error}");
+        assert_eq!(
+            catalog.get_ingest_batch(started.batch_id).unwrap().state,
+            "failed"
         );
         std::fs::remove_dir_all(&base).ok();
     }
