@@ -11,13 +11,15 @@
 //! Fields may contain `{…}` variables. The Preview rows expand every
 //! field against the focused photo's capture metadata off the UI thread
 //! ([`edit_metadata::preview_fields`]) before apply, so users see the
-//! resolved text (plan section 2.7).
+//! resolved text (plan section 2.7). A loaded Photo Mechanic code
+//! replacement file adds `=code=` / hot-code expansion to Preview and to
+//! the durable apply payloads.
 
 use std::sync::Arc;
 
 use edit_catalog::Catalog;
 use edit_catalog::models::IptcTemplate;
-use edit_metadata::TemplateFields;
+use edit_metadata::{CodeReplacements, TemplateFields};
 use gpui_kit::component::button::Button;
 use gpui_kit::component::form::{Field, Form};
 use gpui_kit::component::input::{Input, InputState, Textarea, TextareaState};
@@ -31,6 +33,9 @@ use crate::ingest::AppState;
 use app::views::Browser;
 
 actions!(templates, [OpenTemplates]);
+
+/// Catalog setting holding the last loaded code replacement file path.
+const REPLACEMENTS_SETTING: &str = "code_replacements_path";
 
 /// The overlay dialog. Owns the form and the catalog rows; the browser
 /// owns the job queue and badges, so apply is a thin read + enqueue.
@@ -55,6 +60,11 @@ pub struct TemplateEditor {
     instructions: Entity<InputState>,
     edit_status: Entity<InputState>,
     rights: Entity<InputState>,
+    /// Path input for the PM-format code replacement file.
+    replacement_path: Entity<InputState>,
+    /// Parsed codes used by Preview and baked into Apply payloads.
+    replacements: CodeReplacements,
+    replacement_status: String,
     /// Resolved `(label, text)` rows for the focused photo.
     preview: Vec<(&'static str, String)>,
     status: String,
@@ -100,6 +110,22 @@ impl TemplateEditor {
         let edit_status = cx.new(|cx| InputState::new(window, cx).placeholder("New"));
         let rights =
             cx.new(|cx| InputState::new(window, cx).placeholder("free use, credit required"));
+        let replacement_path =
+            cx.new(|cx| InputState::new(window, cx).placeholder("/path/to/code-replacements.tsv"));
+        // Restore the last replacement file and parse it now, so Preview
+        // and Apply have codes before the user touches the picker.
+        let mut replacements = CodeReplacements::default();
+        let mut replacement_status = "No code replacement file loaded.".to_string();
+        if let Some(path) = catalog.get_setting(REPLACEMENTS_SETTING).ok().flatten() {
+            replacement_path.update(cx, |state, cx| state.set_value(path.clone(), window, cx));
+            match CodeReplacements::from_file(std::path::Path::new(&path)) {
+                Ok(loaded) => {
+                    replacement_status = format!("Loaded {} code(s) from {path}.", loaded.len());
+                    replacements = loaded;
+                }
+                Err(e) => replacement_status = format!("Could not read {path}: {e}"),
+            }
+        }
 
         let mut editor = Self {
             state,
@@ -120,6 +146,9 @@ impl TemplateEditor {
             instructions,
             edit_status,
             rights,
+            replacement_path,
+            replacements,
+            replacement_status,
             preview: Vec::new(),
             status: "Fill the fields, Save, then pick and Apply to selection.".to_string(),
         };
@@ -342,10 +371,39 @@ impl TemplateEditor {
             return;
         }
         let name = value_of(&self.name, cx).unwrap_or_else(|| "unsaved".to_string());
+        let replacements = (!self.replacements.is_empty()).then(|| self.replacements.clone());
         self.browser.update(cx, |browser, cx| {
-            browser.apply_template(fields, &name, cx);
+            browser.apply_template_with(fields, &name, replacements, cx);
         });
         self.status = self.browser.read(cx).template_status();
+        cx.notify();
+    }
+
+    /// Read the PM-format file at the path input, keep the parsed codes
+    /// for Preview and Apply, and remember the path for the next start.
+    fn load_replacements(&mut self, cx: &mut Context<Self>) {
+        let path = value_of(&self.replacement_path, cx).unwrap_or_default();
+        if path.is_empty() {
+            self.replacements = CodeReplacements::default();
+            self.replacement_status = "No code replacement file loaded.".to_string();
+            cx.notify();
+            return;
+        }
+        match CodeReplacements::from_file(std::path::Path::new(&path)) {
+            Ok(loaded) => {
+                let count = loaded.len();
+                self.replacements = loaded;
+                self.replacement_status = format!("Loaded {count} code(s) from {path}.");
+                if let Err(e) = self.catalog.set_setting(REPLACEMENTS_SETTING, &path) {
+                    self.replacement_status =
+                        format!("Loaded {count} code(s); saving the path failed: {e}");
+                }
+            }
+            Err(e) => {
+                self.replacements = CodeReplacements::default();
+                self.replacement_status = format!("Could not read {path}: {e}");
+            }
+        }
         cx.notify();
     }
 
@@ -360,13 +418,15 @@ impl TemplateEditor {
             cx.notify();
             return;
         };
+        let replacements = self.replacements.clone();
         cx.spawn(async move |this, cx| {
             let resolved = cx.background_executor().spawn(async move {
-                edit_metadata::preview_fields(
+                edit_metadata::preview_fields_with(
                     std::path::Path::new(&path),
                     &fields,
                     1,
                     edit_catalog::db::now_unix(),
+                    Some(&replacements),
                 )
             });
             let resolved = resolved.await;
@@ -397,6 +457,41 @@ impl TemplateEditor {
                 .text_color(rgb(0x999999))
                 .child(picker_label),
         )
+    }
+
+    /// Path input for the replacement file plus its load status. The
+    /// parsed set feeds Preview and the Apply payloads.
+    fn render_code_replacements(&self, cx: &mut Context<Self>) -> impl IntoElement {
+        v_flex()
+            .gap_1()
+            .child(
+                div()
+                    .text_xs()
+                    .text_color(rgb(0x999999))
+                    .child("Code replacement file (PM TSV; =code= and hot codes):".to_string()),
+            )
+            .child(
+                h_flex()
+                    .gap_2()
+                    .child(
+                        div()
+                            .flex_1()
+                            .child(Input::new(&self.replacement_path).id("template-code-file")),
+                    )
+                    .child(
+                        Button::new("template-code-load")
+                            .label("Load codes")
+                            .on_click(cx.listener(|this, _: &ClickEvent, _window, cx| {
+                                this.load_replacements(cx);
+                            })),
+                    ),
+            )
+            .child(
+                div()
+                    .text_xs()
+                    .text_color(rgb(0xDDC999))
+                    .child(self.replacement_status.clone()),
+            )
     }
 
     fn render_preview(&self) -> impl IntoElement {
@@ -523,6 +618,7 @@ impl Render for TemplateEditor {
                             )),
                     )
                     .child(self.render_template_picker())
+                    .child(self.render_code_replacements(cx))
                     .child(self.render_form())
                     .child(self.render_preview())
                     .child(div().text_sm().child(status))

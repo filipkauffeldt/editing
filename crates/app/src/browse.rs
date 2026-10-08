@@ -803,6 +803,17 @@ pub fn template_apply_payloads(
     fields_json: &str,
     captured_at: i64,
 ) -> Vec<String> {
+    template_apply_payloads_with(plan, fields_json, captured_at, None)
+}
+
+/// [`template_apply_payloads`] with the code replacement set baked into
+/// each payload, so the worker expands codes without the source file.
+pub fn template_apply_payloads_with(
+    plan: &[TemplateApplyPlan],
+    fields_json: &str,
+    captured_at: i64,
+    replacements: Option<edit_metadata::CodeReplacements>,
+) -> Vec<String> {
     plan.iter()
         .map(|step| {
             serde_json::to_string(&edit_metadata::MetadataWritePayload {
@@ -811,6 +822,7 @@ pub fn template_apply_payloads(
                 sequence: step.sequence,
                 captured_at,
                 fields_json: fields_json.to_owned(),
+                replacements: replacements.clone(),
             })
             .unwrap_or_else(|_| "{}".to_string())
         })
@@ -1282,6 +1294,19 @@ mod meta_paths_tests {
             assert_eq!(parsed.captured_at, 1_791_374_400);
             assert_eq!(parsed.fields_json, r#"{"credit":"x"}"#);
         }
+
+        // The parsed code replacement set rides each payload, so the
+        // worker expands codes without re-reading the source file.
+        let codes = edit_metadata::CodeReplacements::parse("h1\tSHL\n");
+        let with_codes = template_apply_payloads_with(
+            &planned,
+            r#"{"caption":"\\h1\\"}"#,
+            1_791_374_400,
+            Some(codes.clone()),
+        );
+        let parsed: edit_metadata::MetadataWritePayload =
+            serde_json::from_str(&with_codes[0]).unwrap();
+        assert_eq!(parsed.replacements, Some(codes));
         std::fs::remove_dir_all(&dir).ok();
     }
 }
