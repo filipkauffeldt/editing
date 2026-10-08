@@ -54,6 +54,20 @@ impl IngestFileRow {
     }
 }
 
+/// Plain wording for a file's state in the table.
+pub fn state_label(state: IngestFileState) -> &'static str {
+    match state {
+        IngestFileState::Queued => "Waiting",
+        IngestFileState::Copying => "Copying",
+        IngestFileState::Verifying => "Checking",
+        IngestFileState::Backup => "Backing up",
+        IngestFileState::Renaming => "Finishing",
+        IngestFileState::Cataloged => "Copied",
+        IngestFileState::Duplicate => "Duplicate",
+        IngestFileState::Failed => "Failed",
+    }
+}
+
 /// Lifecycle of one card's ingest batch, for the per-card progress bar.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum BatchState {
@@ -752,7 +766,7 @@ impl IngestDialog {
                     .text_sm()
                     .child(Label::new(row.name.clone()).w_1_2())
                     .child(Label::new(format_bytes(row.bytes)).w_1_4())
-                    .child(Label::new(row.state.to_string()).w_1_4())
+                    .child(Label::new(state_label(row.state)).w_1_4())
             }))
             .when(files.is_empty(), |table| {
                 table.child(Label::new("No files yet.").text_sm())
@@ -874,7 +888,9 @@ mod tests {
     // NOTE: import items explicitly, never `super::*` — the `gpui_kit::*`
     // glob re-exported above includes GPUI's `test` macro, which would shadow
     // the built-in `#[test]` attribute inside this module.
-    use super::{BatchState, FileTally, IngestBatchProgress, IngestFileRow, format_bytes};
+    use super::{
+        BatchState, FileTally, IngestBatchProgress, IngestFileRow, format_bytes, state_label,
+    };
     use edit_catalog::models::IngestFile;
     use edit_core::IngestFileState;
 
@@ -906,6 +922,15 @@ mod tests {
         assert_eq!(row.name, "DSC0001.NEF");
         assert_eq!(row.bytes, 2048);
         assert_eq!(row.state, IngestFileState::Duplicate);
+    }
+
+    #[test]
+    fn every_file_state_has_a_plain_label() {
+        for state in IngestFileState::all() {
+            let label = state_label(*state);
+            assert!(label.chars().next().unwrap().is_uppercase(), "{label}");
+        }
+        assert_eq!(state_label(IngestFileState::Cataloged), "Copied");
     }
 
     #[test]

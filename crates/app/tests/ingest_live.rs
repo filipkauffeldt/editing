@@ -220,3 +220,107 @@ fn an_ingest_switches_the_sheet_once_and_does_not_fight_the_user(
     });
     std::fs::remove_dir_all(&base).ok();
 }
+
+/// The whole live flow: worker threads run the ingest and the stamp jobs,
+/// every event goes to the browser in arrival order, and when it is over the
+/// sheet shows every photo as stamped.
+#[gpui_kit::test]
+fn the_sheet_counts_every_stamped_photo_after_a_live_ingest(cx: &mut gpui_kit::TestAppContext) {
+    use app::browse::MetaBadge;
+    use app::ingest_job::handle_job;
+    use edit_catalog::{ClaimedJob, JobHandler, JobState};
+    use edit_metadata::{Writer, run_metadata_write};
+
+    let Some(bin) = Writer::binary_for_tests() else {
+        return;
+    };
+    cx.update(gpui_kit::init);
+    let base = scratch();
+    let names = [
+        "DSC_0001.JPG",
+        "DSC_0002.JPG",
+        "DSC_0003.JPG",
+        "DSC_0004.JPG",
+    ];
+    let card = card(&base, &names);
+    // The stamp jobs open the files, so these must be real JPEGs.
+    let mut jpeg = Vec::new();
+    image::RgbImage::from_pixel(8, 8, image::Rgb([200, 40, 40]))
+        .write_to(
+            &mut std::io::Cursor::new(&mut jpeg),
+            image::ImageFormat::Jpeg,
+        )
+        .unwrap();
+    for name in names {
+        std::fs::write(card.join("DCIM/100NIKON").join(name), &jpeg).unwrap();
+    }
+    let dest = base.join("Photos");
+    let catalog = Arc::new(Catalog::open(&base.join("catalog.sqlite")).unwrap());
+    let browser = open_browser(cx, Arc::clone(&catalog));
+    // The production refresh gap, not the zero gap the other tests use.
+    cx.update(|cx| {
+        browser.update(cx, |browser, _| {
+            browser.set_ingest_refresh_gap(Duration::from_millis(250));
+        })
+    });
+    let template = catalog
+        .get_iptc_template(
+            catalog
+                .insert_iptc_template("press", r#"{"credit":"SHL"}"#, "ingest")
+                .unwrap(),
+        )
+        .unwrap();
+    start_ingest(
+        &catalog,
+        &IngestStart {
+            volume_uuid: None,
+            volume_label: None,
+            source_root: &card,
+            dest_rule: &dest.to_string_lossy(),
+            filename_rule: "",
+            backup_dir: "",
+            session: "shoot",
+            template: Some(&template),
+            replacements: None,
+        },
+    )
+    .unwrap();
+
+    let writer = Arc::new(Writer::resident(&bin).unwrap());
+    let worker_catalog = Arc::clone(&catalog);
+    let handler: JobHandler = Arc::new(move |job: &ClaimedJob, tx| match job.kind {
+        JobKind::MetadataWrite => run_metadata_write(job, &writer, tx),
+        _ => handle_job(Arc::clone(&worker_catalog), job, tx),
+    });
+    let pool = edit_catalog::spawn_workers(&catalog, 3, handler).unwrap();
+    let events = pool.events().clone();
+    let begun = std::time::Instant::now();
+    while catalog.count_jobs_by_state(JobState::Queued).unwrap()
+        + catalog.count_jobs_by_state(JobState::Running).unwrap()
+        > 0
+    {
+        assert!(
+            begun.elapsed() < Duration::from_secs(60),
+            "jobs did not drain"
+        );
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    pool.shutdown();
+    while let Ok(event) = events.try_recv() {
+        cx.update(|cx| browser.update(cx, |browser, _| browser.on_job_event(&event)));
+    }
+
+    cx.update(|cx| {
+        let browser = browser.read(cx);
+        let root = browser.root_id().unwrap();
+        let stamped = app::browse::list_browse_items(&catalog, root)
+            .unwrap()
+            .iter()
+            .filter(|item| browser.item_meta(item.item_id) == Some(MetaBadge::Done))
+            .count();
+        assert_eq!(browser.row_count(), 4);
+        assert_eq!(stamped, 4);
+        assert_eq!(browser.template_status(), "Template applied: 4 photos.");
+    });
+    std::fs::remove_dir_all(&base).ok();
+}
