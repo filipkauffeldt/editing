@@ -44,9 +44,11 @@ use crate::browse::{
     list_browse_items, pair_key, plan_template_apply, run_catalog_scan,
     template_apply_payloads_with,
 };
-use crate::develop::{DevelopSession, RenderQueue, SidecarQueue, SliderId};
+use crate::develop::{
+    DevelopSession, EditJson, LoadedEdit, RenderQueue, SidecarQueue, SliderId, edit_json,
+};
 use crate::preview::BrowsePreviewProvider;
-use edit_core::{CancelToken, DevelopSettings, RenderSize};
+use edit_core::{CancelToken, Crop, DevelopSettings, RenderSize};
 use edit_metadata::{CodeReplacements, MetadataWritePayload, TemplateFields};
 use edit_render::{PROXY_DRAG_LONG_EDGE, PROXY_RELEASE_LONG_EDGE, RenderService};
 use gpui_kit::component::slider::{
@@ -115,6 +117,16 @@ pub enum Mode {
     Single,
 }
 
+/// One develop render the worker takes: what to draw and how.
+struct RenderJob {
+    item_id: i64,
+    path: String,
+    size: RenderSize,
+    develop: DevelopSettings,
+    crop: Option<Crop>,
+    token: CancelToken,
+}
+
 /// Root browse entity: snapshot rows plus the interaction state around them.
 pub struct Browser {
     catalog: Arc<Catalog>,
@@ -158,7 +170,7 @@ pub struct Browser {
     sidecars: SidecarQueue,
     /// Edits whose catalog write failed, retried at every commit point and
     /// at quit; a newer commit of the same item supersedes the entry.
-    unsaved: BTreeMap<i64, String>,
+    unsaved: BTreeMap<i64, EditJson>,
     /// The resolved develop output, swapped with the store on completion
     /// (plan section 1.5). DisplaySrgb path — the canvas paints it.
     develop_image: Option<Arc<RenderImage>>,
@@ -884,16 +896,18 @@ impl Browser {
                 .background_executor()
                 .spawn(async move {
                     let stored = match unsaved {
-                        Some(json) => Some(json),
+                        Some(edit) => Some((edit.develop, edit.crop)),
                         None => match catalog.get_edit(item_id) {
-                            Ok(edit) => edit.map(|edit| edit.develop_json),
+                            Ok(edit) => edit.map(|edit| (edit.develop_json, edit.crop_json)),
                             Err(e) => return Err(format!("Edit read failed: {e}")),
                         },
                     };
                     match stored {
-                        None => Ok(DevelopSettings::default()),
-                        Some(json) => serde_json::from_str::<DevelopSettings>(&json)
-                            .map_err(|e| format!("Edit is unreadable: {e}")),
+                        None => Ok(LoadedEdit {
+                            develop: DevelopSettings::default(),
+                            crop: None,
+                        }),
+                        Some((develop, crop)) => LoadedEdit::parse(&develop, crop.as_deref()),
                     }
                 })
                 .await;
@@ -909,7 +923,7 @@ impl Browser {
     fn apply_edit_load(
         &mut self,
         item_id: i64,
-        outcome: std::result::Result<DevelopSettings, String>,
+        outcome: std::result::Result<LoadedEdit, String>,
         cx: &mut Context<Self>,
     ) {
         // The cursor moved on while the row was being read.
@@ -918,10 +932,10 @@ impl Browser {
             return;
         }
         match outcome {
-            Ok(buffer) => {
+            Ok(edit) => {
                 // A buffer already owned by this item may hold live edits.
                 if self.develop.owner() != Some(item_id) {
-                    self.develop.load_edit(item_id, buffer);
+                    self.develop.load_edit(item_id, edit);
                     self.develop_dirty = false;
                 }
                 self.develop_status.clear();
@@ -1093,19 +1107,18 @@ impl Browser {
     }
 
     /// The worker's next job against the current item, or `None` to rest.
-    fn take_render_job(
-        &mut self,
-    ) -> Option<(i64, String, RenderSize, DevelopSettings, CancelToken)> {
+    fn take_render_job(&mut self) -> Option<RenderJob> {
         loop {
             let (size, token) = self.queue.take()?;
             if let Some(item) = self.current_item() {
-                return Some((
-                    item.item_id,
-                    item.display_path.clone(),
+                return Some(RenderJob {
+                    item_id: item.item_id,
+                    path: item.display_path.clone(),
                     size,
-                    self.develop.buffer().clone(),
+                    develop: self.develop.buffer().clone(),
+                    crop: self.develop.crop().cloned(),
                     token,
-                ));
+                });
             }
             self.queue.complete(false);
         }
@@ -1122,14 +1135,28 @@ impl Browser {
                     .update(cx, |this, _| this.take_render_job())
                     .ok()
                     .flatten();
-                let Some((item_id, path, size, develop, token)) = job else {
+                let Some(RenderJob {
+                    item_id,
+                    path,
+                    size,
+                    develop,
+                    crop,
+                    token,
+                }) = job
+                else {
                     break;
                 };
                 let frame = {
                     let renderer = Arc::clone(&renderer);
                     cx.background_executor()
                         .spawn(async move {
-                            renderer.render_path(Path::new(&path), size, &develop, None, &token)
+                            renderer.render_path(
+                                Path::new(&path),
+                                size,
+                                &develop,
+                                crop.as_ref(),
+                                &token,
+                            )
                         })
                         .await
                 };
@@ -1241,8 +1268,8 @@ impl Browser {
     /// `crs:` sidecar fans out best-effort in the background, serialized per
     /// item (review M1).
     fn persist_current_edit(&mut self, cx: &mut Context<Self>) {
-        for (item_id, json) in self.commit_catalog() {
-            self.write_sidecar(item_id, json, cx);
+        for (item_id, edit) in self.commit_catalog() {
+            self.write_sidecar(item_id, edit, cx);
         }
         cx.notify();
     }
@@ -1251,25 +1278,28 @@ impl Browser {
     /// the dirty buffer. Returns what landed. A failed write stays recorded
     /// (retried at the next commit point and at quit) and surfaces in the
     /// panel; nothing is marked clean before the catalog acknowledged it.
-    fn commit_catalog(&mut self) -> Vec<(i64, String)> {
+    fn commit_catalog(&mut self) -> Vec<(i64, EditJson)> {
         if self.develop_dirty
             && let Some(item_id) = self.develop.owner()
         {
-            match serde_json::to_string(self.develop.buffer()) {
-                Ok(json) => {
-                    self.unsaved.insert(item_id, json);
+            match edit_json(self.develop.buffer(), self.develop.crop()) {
+                Ok(edit) => {
+                    self.unsaved.insert(item_id, edit);
                     self.develop_dirty = false;
                 }
                 Err(e) => self.develop_status = format!("Edit save failed: {e}"),
             }
         }
         let mut landed = Vec::new();
-        for (item_id, json) in std::mem::take(&mut self.unsaved) {
-            match self.catalog.upsert_edit(item_id, &json, None) {
-                Ok(()) => landed.push((item_id, json)),
+        for (item_id, edit) in std::mem::take(&mut self.unsaved) {
+            match self
+                .catalog
+                .upsert_edit(item_id, &edit.develop, edit.crop.as_deref())
+            {
+                Ok(()) => landed.push((item_id, edit)),
                 Err(e) => {
                     self.develop_status = format!("Edit save failed: {e}");
-                    self.unsaved.insert(item_id, json);
+                    self.unsaved.insert(item_id, edit);
                 }
             }
         }
@@ -1282,15 +1312,15 @@ impl Browser {
     }
 
     /// Best-effort `crs:` sidecar write; the newest edit per item wins.
-    fn write_sidecar(&mut self, item_id: i64, develop_json: String, cx: &mut Context<Self>) {
-        if let Some(json) = self.sidecars.submit(item_id, develop_json) {
-            self.spawn_sidecar(item_id, json, cx);
+    fn write_sidecar(&mut self, item_id: i64, edit: EditJson, cx: &mut Context<Self>) {
+        if let Some(edit) = self.sidecars.submit(item_id, edit) {
+            self.spawn_sidecar(item_id, edit, cx);
         }
     }
 
     /// One sidecar write on the background executor. Its ack starts the
     /// item's queued write, if any, and the outcome surfaces in the panel.
-    fn spawn_sidecar(&mut self, item_id: i64, json: String, cx: &mut Context<Self>) {
+    fn spawn_sidecar(&mut self, item_id: i64, edit: EditJson, cx: &mut Context<Self>) {
         let Some(sidecar) = self.sidecar_path(item_id) else {
             if let Some(next) = self.sidecars.ack(item_id) {
                 self.spawn_sidecar(item_id, next, cx);
@@ -1302,7 +1332,13 @@ impl Browser {
             let outcome = cx
                 .background_executor()
                 .spawn(async move {
-                    edit_metadata::persist_sidecar(&catalog, item_id, &json, None, &sidecar)
+                    edit_metadata::persist_sidecar(
+                        &catalog,
+                        item_id,
+                        &edit.develop,
+                        edit.crop.as_deref(),
+                        &sidecar,
+                    )
                 })
                 .await;
             this.update(cx, |this, cx| {
@@ -1334,14 +1370,21 @@ impl Browser {
     ) -> impl Future<Output = ()> + 'static + use<> {
         let mut writes = self.commit_catalog();
         writes.extend(self.sidecars.drain_queued());
-        let jobs: Vec<(i64, String, PathBuf)> = writes
+        let jobs: Vec<(i64, EditJson, PathBuf)> = writes
             .into_iter()
-            .filter_map(|(item_id, json)| Some((item_id, json, self.sidecar_path(item_id)?)))
+            .filter_map(|(item_id, edit)| Some((item_id, edit, self.sidecar_path(item_id)?)))
             .collect();
         let catalog = Arc::clone(&self.catalog);
         cx.background_executor().spawn(async move {
-            for (item_id, json, sidecar) in jobs {
-                edit_metadata::persist_sidecar(&catalog, item_id, &json, None, &sidecar).ok();
+            for (item_id, edit, sidecar) in jobs {
+                edit_metadata::persist_sidecar(
+                    &catalog,
+                    item_id,
+                    &edit.develop,
+                    edit.crop.as_deref(),
+                    &sidecar,
+                )
+                .ok();
             }
         })
     }
