@@ -29,7 +29,7 @@ use edit_core::cancel::CancelToken;
 use edit_core::error::{Error, Result};
 use edit_core::render::{Frame, OutputColor, RenderRequest, RenderSize};
 use edit_core::traits::{DevelopEngine, RetouchStage};
-use edit_core::{Aspect, Crop, DevelopSettings, ItemId, MaskPlane, RetouchRecipe};
+use edit_core::{Crop, DevelopSettings, ItemId, MaskPlane, RetouchRecipe};
 use lightcraft_pipeline::Quality;
 
 /// Long edge of the downscaled proxy rendered during a slider drag. The
@@ -317,17 +317,17 @@ impl RenderService {
 
         // The develop settings are user buffer state; the crop rides in them
         // so the develop math applies it identically at every size. The output
-        // box is the decoded source's own size: no upscaling at any size.
+        // box is the crop's own size in decoded source pixels: no upscaling
+        // at any size, and the same framing at every size.
         let mut develop = develop.clone();
-        if let Some(crop) = crop {
-            apply_crop(&mut develop, crop);
-        }
+        apply_crop(&mut develop, crop);
+        let (box_w, box_h) = crop_box(&develop, source.img.width, source.img.height);
         let pipeline_req = lightcraft_pipeline::RenderRequest {
             quality: match size {
                 RenderSize::Proxy(edge) if edge <= PROXY_DRAG_LONG_EDGE => Quality::Draft,
                 _ => Quality::Full,
             },
-            ..lightcraft_pipeline::RenderRequest::fit(source.img.width, source.img.height)
+            ..lightcraft_pipeline::RenderRequest::fit(box_w, box_h)
         };
         cancel.check()?;
         let rendered = lightcraft_pipeline::render_cached(
@@ -496,40 +496,50 @@ impl RetouchStage for NoopRetouch {
     }
 }
 
-/// Aspect-lock ratio (w, h) for a crop preset; `(0, 0)` is the free
-/// (original-ratio) case.
-fn aspect_w_h(aspect: Aspect) -> (u32, u32) {
-    match aspect {
-        Aspect::Original => (0, 0),
-        Aspect::Square => (1, 1),
-        Aspect::ThreeTwo => (3, 2),
-        Aspect::TwoThree => (2, 3),
-        Aspect::FourThree => (4, 3),
-        Aspect::SixteenNine => (16, 9),
-    }
-}
-
-/// Map a normalized crop (+ rotation) into the develop settings' own crop
-/// model.
+/// Map the app's crop into the develop settings' own crop model.
 ///
-/// TODO(D1): reconcile the angle models — `edit_core::Crop.rotation_degrees`
-/// and `DevelopSettings.crop.geometry.angle` (straighten, −45..45, and the
-/// crop rect shrunk symmetrically inside the rotated image) share one basis
-/// only for small angles.
-fn apply_crop(develop: &mut DevelopSettings, crop: &Crop) {
-    let rect = crop.rect.clamped();
+/// The two share one basis (see [`Crop`]): the engine turns the oriented
+/// image by `angle` clockwise about its centre on a canvas of the same size
+/// and crops the normalized `rect` out of that canvas. So the mapping is a
+/// copy, with no angle conversion. The crop is the only crop model: it
+/// replaces whatever the develop settings carry, and `None` means no crop.
+///
+/// The frame is not pulled inside the rotated image here, because the crop
+/// canvas renders the whole straightened frame on purpose. Callers editing a
+/// frame constrain it with [`edit_core::crop::constrain_rect`]. The aspect
+/// lock is app state; the engine does not read it.
+fn apply_crop(develop: &mut DevelopSettings, crop: Option<&Crop>) {
     let geometry = &mut develop.crop.geometry;
+    develop.crop.aspect = None;
+    let Some(crop) = crop else {
+        *geometry = Default::default();
+        return;
+    };
+    let min = edit_core::crop::MIN_EDGE;
+    let mut rect = crop.rect.clamped();
+    rect.w = rect.w.max(min).min(1.0);
+    rect.h = rect.h.max(min).min(1.0);
+    rect.x = rect.x.min(1.0 - rect.w);
+    rect.y = rect.y.min(1.0 - rect.h);
     geometry.rect = lightcraft_geom::Rect {
         x0: rect.x as f64,
         y0: rect.y as f64,
         x1: (rect.x + rect.w) as f64,
         y1: (rect.y + rect.h) as f64,
     };
-    geometry.angle = crop.rotation_degrees as f64;
-    develop.crop.aspect = crop
-        .aspect
-        .filter(|a| !matches!(a, Aspect::Original))
-        .map(aspect_w_h);
+    geometry.angle = (crop.rotation_degrees as f64).clamp(
+        -(edit_core::crop::MAX_ANGLE as f64),
+        edit_core::crop::MAX_ANGLE as f64,
+    );
+}
+
+/// The crop frame's size in pixels of a `width × height` source: the largest
+/// output the render may produce without upscaling. An uncropped render is
+/// the source's own size.
+fn crop_box(develop: &DevelopSettings, width: usize, height: usize) -> (usize, usize) {
+    let rect = develop.crop.geometry.rect;
+    let px = |span: f64, edge: usize| ((span * edge as f64).round() as usize).max(1);
+    (px(rect.x1 - rect.x0, width), px(rect.y1 - rect.y0, height))
 }
 
 /// Pipeline RGBA8 result → BGRA frame for `paint_image`.
@@ -625,55 +635,266 @@ mod tests {
         std::fs::remove_dir_all(&dir).ok();
     }
 
-    #[test]
-    fn crop_mapping_plumbs_rect_and_angle() {
-        let dir = std::env::temp_dir().join(format!("edit-render-crop-{}", std::process::id()));
-        std::fs::create_dir_all(&dir).unwrap();
-        let path = dir.join("crop.jpg");
-        // Non-uniform source: left half dark, right half bright.
-        let (w, h) = (48u32, 32u32);
-        let mut src = image::RgbImage::new(w, h);
-        for (x, _y, px) in src.enumerate_pixels_mut() {
-            let level = if x < w / 2 { 60u8 } else { 230u8 };
-            *px = image::Rgb([level, level, level]);
-        }
-        let mut bytes = Vec::new();
-        src.write_to(&mut Cursor::new(&mut bytes), image::ImageFormat::Jpeg)
-            .unwrap();
-        std::fs::write(&path, bytes).unwrap();
+    fn write_png(path: &Path, img: &image::RgbImage) {
+        img.save_with_format(path, image::ImageFormat::Png).unwrap();
+    }
 
+    /// Render `path` at full size with `crop`.
+    fn render_full(path: &Path, crop: Option<&Crop>) -> Frame {
+        RenderService::new()
+            .render_path(
+                path,
+                RenderSize::Full,
+                &DevelopSettings::default(),
+                crop,
+                &CancelToken::new(),
+            )
+            .unwrap()
+    }
+
+    /// Brightness of a BGRA pixel, 0..255.
+    fn bright(frame: &Frame, x: u32, y: u32) -> f32 {
+        let p = frame.pixel(x, y).unwrap();
+        (p[0] as f32 + p[1] as f32 + p[2] as f32) / 3.0
+    }
+
+    /// Mean y of the dark pixels in the columns `x0..x1`, weighted by how
+    /// dark they are against a bright background.
+    fn line_y(frame: &Frame, x0: u32, x1: u32) -> f32 {
+        let (mut sum, mut weight) = (0.0, 0.0);
+        for x in x0..x1 {
+            for y in 0..frame.height {
+                let w = (255.0 - bright(frame, x, y)).max(0.0);
+                sum += w * y as f32;
+                weight += w;
+            }
+        }
+        assert!(weight > 0.0, "no line in columns {x0}..{x1}");
+        sum / weight
+    }
+
+    #[test]
+    fn the_crop_rect_selects_the_source_region() {
+        let dir = scratch("crop-rect");
+        let path = dir.join("halves.png");
+        // Left half dark, right half bright.
+        let (w, h) = (48u32, 32u32);
+        let img = image::RgbImage::from_fn(w, h, |x, _| {
+            image::Rgb([if x < w / 2 { 40 } else { 220 }; 3])
+        });
+        write_png(&path, &img);
+
+        let full = render_full(&path, None);
+        assert_eq!((full.width, full.height), (48, 32));
+        let right = Crop {
+            rect: edit_core::Rect::new(0.5, 0.0, 0.5, 1.0),
+            ..Crop::default()
+        };
+        let cropped = render_full(&path, Some(&right));
+        assert_eq!((cropped.width, cropped.height), (24, 32));
+        assert!(bright(&cropped, 2, 16) > 180.0 && bright(&cropped, 21, 16) > 180.0);
+        let left = Crop {
+            rect: edit_core::Rect::new(0.0, 0.0, 0.5, 1.0),
+            ..Crop::default()
+        };
+        let cropped = render_full(&path, Some(&left));
+        assert!(bright(&cropped, 2, 16) < 90.0 && bright(&cropped, 21, 16) < 90.0);
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn no_crop_means_no_crop_even_when_the_develop_settings_carry_one() {
+        let dir = scratch("crop-none");
+        let path = dir.join("plain.png");
+        write_png(
+            &path,
+            &image::RgbImage::from_pixel(40, 30, image::Rgb([90; 3])),
+        );
+        let mut stale = DevelopSettings::default();
+        stale.crop.geometry.rect = lightcraft_geom::Rect {
+            x0: 0.25,
+            y0: 0.25,
+            x1: 0.5,
+            y1: 0.5,
+        };
+        stale.crop.geometry.angle = 9.0;
+        let frame = RenderService::new()
+            .render_path(&path, RenderSize::Full, &stale, None, &CancelToken::new())
+            .unwrap();
+        assert_eq!((frame.width, frame.height), (40, 30));
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn a_positive_angle_levels_a_horizon_that_rises_to_the_right() {
+        // A dark 3 px line on white, rising to the right at 6°. A clockwise
+        // (positive) straighten turns it level; a negative one doubles the
+        // tilt. This pins the engine's sign to the one `Crop` documents.
+        let dir = scratch("crop-sign");
+        let path = dir.join("horizon.png");
+        let (w, h) = (240u32, 160u32);
+        let slope = 6f32.to_radians().tan();
+        let img = image::RgbImage::from_fn(w, h, |x, y| {
+            let line_y = 80.0 - slope * (x as f32 - 120.0);
+            let dark = (y as f32 + 0.5 - line_y).abs() <= 1.5;
+            image::Rgb([if dark { 0 } else { 255 }; 3])
+        });
+        write_png(&path, &img);
+        let frame = |angle: f32| {
+            render_full(
+                &path,
+                Some(&Crop {
+                    rect: edit_core::Rect::new(0.2, 0.3, 0.6, 0.4),
+                    rotation_degrees: angle,
+                    aspect: None,
+                }),
+            )
+        };
+        // Left vs right end of the line, in output rows.
+        let tilt = |f: &Frame| line_y(f, f.width - 6, f.width - 2) - line_y(f, 2, 6);
+        let level = frame(6.0);
+        assert!(
+            tilt(&level).abs() < 2.0,
+            "+6° left a tilt of {}",
+            tilt(&level)
+        );
+        let flat = frame(0.0);
+        assert!(tilt(&flat) < -10.0, "0° keeps the rise: {}", tilt(&flat));
+        let worse = frame(-6.0);
+        assert!(
+            tilt(&worse) < -25.0,
+            "-6° doubles the rise: {}",
+            tilt(&worse)
+        );
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn the_rendered_frame_corners_are_the_ones_the_geometry_predicts() {
+        // Mark the source point behind each corner of a rotated frame, as
+        // `source_corners` predicts it, and look for the marks in the
+        // matching output corners. The rect, the angle and the corner order
+        // all have to agree between the pure model and the engine.
+        let dir = scratch("crop-corners");
+        let path = dir.join("corners.png");
+        let (w, h) = (240u32, 160u32);
+        let crop = Crop {
+            rect: edit_core::Rect::new(0.2, 0.25, 0.6, 0.5),
+            rotation_degrees: 12.0,
+            aspect: None,
+        };
+        let corners =
+            edit_core::crop::source_corners(crop.rect, crop.rotation_degrees, (w as f64, h as f64));
+        let colors = [[255u8, 0, 0], [0, 255, 0], [0, 0, 255], [255, 255, 0]];
+        let mut img = image::RgbImage::from_pixel(w, h, image::Rgb([30; 3]));
+        for (&(cx, cy), color) in corners.iter().zip(colors) {
+            for y in 0..h {
+                for x in 0..w {
+                    if (x as f64 + 0.5 - cx).abs() <= 6.0 && (y as f64 + 0.5 - cy).abs() <= 6.0 {
+                        img.put_pixel(x, y, image::Rgb(color));
+                    }
+                }
+            }
+        }
+        write_png(&path, &img);
+
+        let frame = render_full(&path, Some(&crop));
+        // The frame is 0.6 × 0.5 of the source, at the source's resolution.
+        assert_eq!((frame.width, frame.height), (144, 80));
+        let at = |x: u32, y: u32| {
+            let p = frame.pixel(x, y).unwrap();
+            [p[2], p[1], p[0]]
+        };
+        let near = |got: [u8; 3], want: [u8; 3]| {
+            got.iter()
+                .zip(want)
+                .all(|(g, w)| (*g as i32 - w as i32).abs() < 60)
+        };
+        let (fw, fh) = (frame.width - 3, frame.height - 3);
+        assert!(near(at(2, 2), colors[0]), "TL {:?}", at(2, 2));
+        assert!(near(at(fw, 2), colors[1]), "TR {:?}", at(fw, 2));
+        assert!(near(at(fw, fh), colors[2]), "BR {:?}", at(fw, fh));
+        assert!(near(at(2, fh), colors[3]), "BL {:?}", at(2, fh));
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn proxy_and_full_renders_of_a_rotated_crop_agree() {
+        // A soft gradient with one bright blob, cropped and straightened. The
+        // proxy and the final render run the same path at two sizes, so the
+        // frame aspect, the blob position and the pixels have to line up.
+        let dir = scratch("crop-proxy-full");
+        let path = dir.join("scene.png");
+        let (w, h) = (640u32, 400u32);
+        let img = image::RgbImage::from_fn(w, h, |x, y| {
+            let (dx, dy) = (x as f32 - 400.0, y as f32 - 150.0);
+            let blob = (1.0 - (dx * dx + dy * dy).sqrt() / 60.0).clamp(0.0, 1.0);
+            let base = 60.0 + 60.0 * x as f32 / w as f32 + 30.0 * y as f32 / h as f32;
+            image::Rgb([(base + 140.0 * blob).min(255.0) as u8; 3])
+        });
+        write_png(&path, &img);
+        let crop = Crop {
+            rect: edit_core::Rect::new(0.25, 0.15, 0.6, 0.6),
+            rotation_degrees: 7.0,
+            aspect: Some(edit_core::Aspect::ThreeTwo),
+        };
         let service = RenderService::new();
         let cancel = CancelToken::new();
         let develop = DevelopSettings::default();
         let full = service
-            .render_path(&path, RenderSize::Full, &develop, None, &cancel)
-            .unwrap();
-        // Normalized crop rect x 0..0.5: the crop render mirrors the *left* half.
-        let crop = Crop {
-            rect: edit_core::Rect::new(0.0, 0.0, 0.5, 1.0),
-            rotation_degrees: 0.0,
-            aspect: None,
-        };
-        let cropped = service
             .render_path(&path, RenderSize::Full, &develop, Some(&crop), &cancel)
             .unwrap();
-        let full_mean = mean_channels(&full);
-        let cropped_mean = mean_channels(&cropped);
-        assert!(
-            (cropped_mean[0] - full_mean[0]).abs() > 30.0,
-            "crop rect did not select the source region: {full_mean:?} vs {cropped_mean:?}"
-        );
-        // A straighten angle flows (the pinned engine clamps the crop rect
-        // symmetrically about the centre, so the sign inside is not provable
-        // alone; D1 reconciles the straighten model).
-        let mut plus = crop.clone();
-        plus.rotation_degrees = 12.0;
-        let plus_frame = service
-            .render_path(&path, RenderSize::Full, &develop, Some(&plus), &cancel)
+        let proxy = service
+            .render_path(
+                &path,
+                RenderSize::Proxy(200),
+                &develop,
+                Some(&crop),
+                &cancel,
+            )
             .unwrap();
-        let plus_mean = mean_channels(&plus_frame);
-        assert_ne!(plus_mean, cropped_mean, "angle did not plumb");
+        assert_eq!((full.width, full.height), (384, 240));
+        assert!(proxy.width.max(proxy.height) <= 200);
 
+        let ratio = |f: &Frame| f.width as f32 / f.height as f32;
+        assert!((ratio(&full) - ratio(&proxy)).abs() < 0.03);
+
+        // Brightness-weighted centroid of the blob, as a share of the frame.
+        let centroid = |f: &Frame| {
+            let (mut sx, mut sy, mut weight) = (0.0, 0.0, 0.0);
+            for y in 0..f.height {
+                for x in 0..f.width {
+                    let v = (bright(f, x, y) - 190.0).max(0.0);
+                    sx += v * (x as f32 + 0.5);
+                    sy += v * (y as f32 + 0.5);
+                    weight += v;
+                }
+            }
+            assert!(weight > 0.0, "no blob in a {}x{} frame", f.width, f.height);
+            (sx / weight / f.width as f32, sy / weight / f.height as f32)
+        };
+        let (fc, pc) = (centroid(&full), centroid(&proxy));
+        assert!(
+            (fc.0 - pc.0).abs() < 0.02 && (fc.1 - pc.1).abs() < 0.02,
+            "blob moved between sizes: {fc:?} vs {pc:?}"
+        );
+
+        // Pixel agreement once the final render is brought down to proxy size.
+        let rgba =
+            image::RgbaImage::from_raw(full.width, full.height, full.pixels.clone()).unwrap();
+        let down = image::imageops::resize(
+            &rgba,
+            proxy.width,
+            proxy.height,
+            image::imageops::FilterType::Triangle,
+        );
+        let diff: f32 = down
+            .pixels()
+            .zip(proxy.pixels.as_chunks::<4>().0)
+            .map(|(a, b)| (a[0] as f32 - b[0] as f32).abs())
+            .sum::<f32>()
+            / (proxy.width * proxy.height) as f32;
+        assert!(diff < 6.0, "proxy and final differ by {diff} levels");
         std::fs::remove_dir_all(&dir).ok();
     }
 
