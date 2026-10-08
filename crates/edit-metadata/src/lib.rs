@@ -18,7 +18,7 @@ pub use crs::{
     tone_curve_points, write_sidecar,
 };
 pub use error::{Error, Result};
-pub use persist::{PersistOutcome, persist_edit};
+pub use persist::{PersistOutcome, persist_edit, persist_sidecar};
 pub use photo::{
     PhotoMetadata, read_exif, read_photo_metadata, read_xmp_file, read_xmp_sidecar_for,
 };
