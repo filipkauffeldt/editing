@@ -30,8 +30,8 @@ use serde::{Deserialize, Serialize};
 
 use crate::copy::{CopyError, CopyOutcome, CopyRequest, CopyStage, copy_verified_with, hash_file};
 use crate::naming::{
-    NamingContext, NamingError, expand_tilde, render_dir, render_filename, static_prefix, validate,
-    with_original_extension,
+    DEFAULT_FILENAME_RULE, NamingContext, NamingError, expand_tilde, render_dir, render_filename,
+    static_prefix, validate, validate_filename_rule, with_original_extension,
 };
 
 /// Raw extensions the ingest pipeline recognizes.
@@ -150,14 +150,21 @@ pub struct IngestPlan {
 
 /// Validate the rules and build the batch row plus job payload. Moving this
 /// out of the UI keeps naming rules and payload shape in `edit-ingest`.
+///
+/// A blank filename rule means "use the default" ([`DEFAULT_FILENAME_RULE`]);
+/// a rule that cannot produce a file name is rejected here, before a batch
+/// is created.
 pub fn plan_ingest(request: &IngestPlanRequest<'_>) -> Result<IngestPlan, NamingError> {
     let dest = request.dest_dir_template.trim();
-    let filename = request.filename_template.trim();
+    let filename = match request.filename_template.trim() {
+        "" => DEFAULT_FILENAME_RULE,
+        rule => rule,
+    };
     if dest.is_empty() {
         return Err(NamingError::EmptyName);
     }
     validate(dest)?;
-    validate(filename)?;
+    validate_filename_rule(filename)?;
     let backup_dir = request
         .backup_dir
         .map(str::trim)
@@ -1242,6 +1249,82 @@ mod tests {
             .unwrap_err(),
             NamingError::EmptyName
         ));
+    }
+
+    #[test]
+    fn a_blank_filename_rule_plans_the_default_and_lands_named_files_with_extensions() {
+        // The reported failure: the rule box was empty, so every file
+        // rendered an empty name and nothing was copied.
+        let card = card_with(&[
+            ("DSC0001.JPG", b"one jpg"),
+            ("DSC0001.NEF", b"one raw"),
+            ("DSC0002.NEF", b"two raw"),
+        ]);
+        let base = scratch("blank-rule");
+        let dest = base.join("Photos");
+        let catalog = Catalog::open(&base.join("catalog.sqlite")).unwrap();
+        let dest_rule = dest.join("{yyyy}-{mm}-{dd}").to_string_lossy().into_owned();
+        for blank in ["", "   ", "\t"] {
+            let plan = plan_ingest(&IngestPlanRequest {
+                source_root: &card,
+                dest_dir_template: &dest_rule,
+                filename_template: blank,
+                session: "shoot",
+                ..plan_request_defaults()
+            })
+            .unwrap();
+            assert_eq!(plan.payload.filename_template, DEFAULT_FILENAME_RULE);
+        }
+
+        let plan = plan_ingest(&IngestPlanRequest {
+            source_root: &card,
+            dest_dir_template: &dest_rule,
+            filename_template: "",
+            session: "shoot",
+            ..plan_request_defaults()
+        })
+        .unwrap();
+        let batch = catalog.create_ingest_batch(&plan.batch).unwrap();
+        let summary = run_ingest_copy(
+            &catalog,
+            &IngestCopyPayload {
+                batch_id: batch,
+                ..plan.payload
+            },
+            fixed_metadata,
+            &|_, _| {},
+        )
+        .unwrap();
+        assert_eq!((summary.copied, summary.failed), (3, 0));
+
+        // The RAW and the JPEG of one shot share a stem and differ by
+        // extension, so they do not collide; the second shot is numbered on.
+        let day = dest.join("2026-10-07");
+        let mut names: Vec<String> = fs::read_dir(&day)
+            .unwrap()
+            .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
+            .collect();
+        names.sort();
+        assert_eq!(
+            names,
+            ["shoot_0001.JPG", "shoot_0001.NEF", "shoot_0002.NEF"]
+        );
+        fs::remove_dir_all(&base).ok();
+        fs::remove_dir_all(&card).ok();
+    }
+
+    #[test]
+    fn a_rule_that_cannot_name_a_file_is_rejected_before_a_batch_exists() {
+        for bad in ["a/b", "{nope}", "{seq:0}"] {
+            assert!(
+                plan_ingest(&IngestPlanRequest {
+                    filename_template: bad,
+                    ..plan_request_defaults()
+                })
+                .is_err(),
+                "{bad}"
+            );
+        }
     }
 
     fn plan_request_defaults<'a>() -> IngestPlanRequest<'a> {

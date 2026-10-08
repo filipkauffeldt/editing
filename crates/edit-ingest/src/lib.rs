@@ -30,8 +30,8 @@ pub use ingest::{
     enumerate_card, plan_card, plan_ingest, run_ingest_copy, run_ingest_copy_with,
 };
 pub use naming::{
-    NamingContext, NamingError, expand_tilde, render_dir, render_filename, static_prefix, validate,
-    with_original_extension,
+    DEFAULT_DEST_RULE, DEFAULT_FILENAME_RULE, NamingContext, NamingError, expand_tilde, render_dir,
+    render_filename, static_prefix, validate, validate_filename_rule, with_original_extension,
 };
 pub use volumes::{
     DiskInfo, DiskSource, POLL_INTERVAL, SysinfoSource, UdevEntry, Volume, VolumeEvent, diff,

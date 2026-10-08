@@ -28,6 +28,14 @@
 
 use std::path::{Path, PathBuf};
 
+/// Folder rule the ingest dialog starts with (and an empty one falls back to).
+pub const DEFAULT_DEST_RULE: &str = "~/Photos/{yyyy}/{mm}-{dd}";
+
+/// Filename rule the ingest dialog starts with (and an empty one falls back
+/// to). The original extension is appended at landing, so a RAW+JPEG pair
+/// lands as `shoot_0001.NEF` / `shoot_0001.JPG`.
+pub const DEFAULT_FILENAME_RULE: &str = "{session}_{seq:4}";
+
 /// A rule that could not be resolved to a name.
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
 pub enum NamingError {
@@ -211,6 +219,24 @@ pub fn validate(template: &str) -> Result<(), NamingError> {
         camera: None,
     };
     render(template, &ctx).map(|_| ())
+}
+
+/// Reject a filename rule that cannot name a file, before any batch exists.
+///
+/// [`validate`] only checks the tokens; this also renders the rule against a
+/// sample file (with every optional value present) and applies the
+/// [`render_filename`] checks, so a rule that renders empty (`""`, spaces
+/// only) or with a path separator is caught up front rather than failing
+/// every file on the card.
+pub fn validate_filename_rule(template: &str) -> Result<(), NamingError> {
+    let ctx = NamingContext {
+        session: "session".to_string(),
+        original_name: "IMG_0001.JPG".to_string(),
+        seq: 1,
+        taken_at: Some(0),
+        camera: Some("camera".to_string()),
+    };
+    render_filename(template, &ctx).map(|_| ())
 }
 
 /// Resolve one `{name}` or `{name:width}` token.
@@ -466,6 +492,48 @@ mod tests {
         assert_eq!(static_prefix("/photos/2026"), "/photos/2026");
         assert_eq!(static_prefix("{yyyy}"), "");
         assert_eq!(static_prefix("/photos/"), "/photos");
+    }
+
+    #[test]
+    fn filename_rules_that_cannot_name_a_file_are_rejected_up_front() {
+        assert_eq!(validate_filename_rule(""), Err(NamingError::EmptyName));
+        assert_eq!(
+            validate_filename_rule("a/b"),
+            Err(NamingError::PathSeparator)
+        );
+        assert!(matches!(
+            validate_filename_rule("{nope}"),
+            Err(NamingError::UnknownVariable(_))
+        ));
+        assert!(validate_filename_rule(DEFAULT_FILENAME_RULE).is_ok());
+        // A rule that only renders for files that carry a camera still passes.
+        assert!(validate_filename_rule("{camera}_{seq}").is_ok());
+    }
+
+    #[test]
+    fn a_tilde_destination_resolves_under_home() {
+        let ctx = NamingContext {
+            session: "s".into(),
+            original_name: "A.NEF".into(),
+            seq: 1,
+            taken_at: Some(0),
+            camera: None,
+        };
+        assert_eq!(
+            static_prefix("~/Downloads/test_app"),
+            "~/Downloads/test_app"
+        );
+        let dir = render_dir("~/Downloads/test_app", &ctx).unwrap();
+        assert_eq!(dir, expand_tilde("~/Downloads/test_app"));
+        if std::env::var_os("HOME").is_some() {
+            assert!(!dir.starts_with("~"), "{dir:?}");
+            assert!(dir.ends_with("Downloads/test_app"));
+        }
+        assert!(
+            render_dir(DEFAULT_DEST_RULE, &ctx)
+                .unwrap()
+                .ends_with("Photos/1970/01-01")
+        );
     }
 
     #[test]
