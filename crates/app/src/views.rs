@@ -19,6 +19,8 @@
 //! | Drag | pan while zoomed |
 //! | `0`–`5` | rating |
 //! | `O` | open a folder (native picker) |
+//! | `C` | crop mode: enter, or apply and leave |
+//! | `Enter` / `Esc` | apply / cancel the crop draft |
 
 use std::cell::Cell;
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet, VecDeque};
@@ -273,9 +275,9 @@ impl Browser {
             KeyBinding::new("3", Rate3, None),
             KeyBinding::new("4", Rate4, None),
             KeyBinding::new("5", Rate5, None),
-            KeyBinding::new("c", ToggleCrop, None),
-            KeyBinding::new("enter", ApplyCrop, None),
-            KeyBinding::new("escape", CancelCrop, None),
+            KeyBinding::new("c", ToggleCrop, Some("!Input")),
+            KeyBinding::new("enter", ApplyCrop, Some("!Input")),
+            KeyBinding::new("escape", CancelCrop, Some("!Input")),
         ]);
         let browser = Self {
             catalog,
