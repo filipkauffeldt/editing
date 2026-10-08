@@ -27,9 +27,9 @@ use std::time::Duration;
 
 use edit_core::cancel::CancelToken;
 use edit_core::error::{Error, Result};
-use edit_core::render::{Aspect, Crop, Frame, OutputColor, RenderRequest, RenderSize};
+use edit_core::render::{Frame, OutputColor, RenderRequest, RenderSize};
 use edit_core::traits::{DevelopEngine, RetouchStage};
-use edit_core::{DevelopSettings, ItemId, MaskPlane, RetouchRecipe};
+use edit_core::{Aspect, Crop, DevelopSettings, ItemId, MaskPlane, RetouchRecipe};
 use lightcraft_pipeline::Quality;
 
 /// Long edge of the downscaled proxy rendered during a slider drag. The

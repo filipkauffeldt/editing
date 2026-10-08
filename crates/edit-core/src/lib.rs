@@ -9,6 +9,7 @@
 //! crates behind the traits in [`traits`].
 
 pub mod cancel;
+pub mod crop;
 pub mod error;
 pub mod faces;
 pub mod geometry;
@@ -19,12 +20,13 @@ pub mod retouch;
 pub mod traits;
 
 pub use cancel::CancelToken;
+pub use crop::{Aspect, Crop};
 pub use error::{Error, Result};
 pub use faces::FaceBox;
 pub use geometry::{Point, Rect};
 pub use ids::{ItemId, PhotoId};
 pub use ingest::IngestFileState;
-pub use render::{Crop, Frame, OutputColor, PreviewFrame, RenderRequest, RenderSize};
+pub use render::{Frame, OutputColor, PreviewFrame, RenderRequest, RenderSize};
 pub use retouch::{MaskPlane, RetouchOp, RetouchRecipe};
 
 /// LightCraft develop settings: the only tone/edit model.
