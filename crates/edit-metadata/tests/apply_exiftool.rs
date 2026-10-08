@@ -127,6 +127,7 @@ fn template_apply_recipe_writes_the_selection() {
             sequence: *sequence,
             captured_at: now_unix(),
             fields_json: catalog.get_iptc_template(template_id).unwrap().fields_json,
+            replacements: None,
         })
         .unwrap();
         catalog
@@ -177,6 +178,74 @@ fn template_apply_recipe_writes_the_selection() {
     assert_eq!(
         read_tag(&exiftool, &paths[2], "IPTC:EditStatus").as_deref(),
         Some("New")
+    );
+    std::fs::remove_dir_all(dir.path()).ok();
+}
+
+#[test]
+fn code_replacements_expand_into_the_written_caption() {
+    let Some(exiftool) = Writer::binary_for_tests() else {
+        return;
+    };
+    let dir = tempfile::TempDir::new().unwrap();
+    let path = dir.path().join("AHQ.JPG");
+    std::fs::copy(fixture(), &path).unwrap();
+    let catalog = Catalog::open(&dir.path().join("catalog.sqlite")).unwrap();
+    let root_id = catalog
+        .insert_root(dir.path().to_str().unwrap(), "folder")
+        .unwrap();
+    let photo_id = catalog
+        .insert_photo(&NewPhoto {
+            root_id,
+            path: path.to_string_lossy().into_owned(),
+            dir: dir.path().to_string_lossy().into_owned(),
+            base_name: "AHQ".into(),
+            ext: "JPG".into(),
+            kind: "jpeg".into(),
+            bytes: 5,
+            mtime: 0,
+            original_name: None,
+            taken_at: None,
+        })
+        .unwrap();
+    let item_id = catalog
+        .insert_item(dir.path().to_str().unwrap(), "ahq", Some(photo_id), None)
+        .unwrap();
+
+    // The caption uses the demo hot-code spelling, resolved from the
+    // parsed replacement set carried in the durable payload.
+    let fields = serde_json::json!({"caption": "Byline: \\h1\\"}).to_string();
+    let replacements = edit_metadata::CodeReplacements::parse("h1\tSHL\n");
+    let payload = serde_json::to_string(&MetadataWritePayload {
+        item_id,
+        paths: vec![path.to_string_lossy().into_owned()],
+        sequence: 1,
+        captured_at: now_unix(),
+        fields_json: fields,
+        replacements: Some(replacements),
+    })
+    .unwrap();
+    catalog
+        .enqueue_job(JobKind::MetadataWrite, &payload)
+        .unwrap();
+
+    let writer = Arc::new(Writer::resident(&exiftool).unwrap());
+    let handler: edit_catalog::JobHandler =
+        Arc::new(move |job: &ClaimedJob, tx| edit_metadata::run_metadata_write(job, &writer, tx));
+    let pool = spawn_pool(&catalog, handler);
+    wait_for(Duration::from_secs(60), || {
+        catalog.count_jobs_by_state(JobState::Done).unwrap_or(0) == 1
+    });
+    pool.shutdown();
+
+    assert_eq!(
+        read_tag(&exiftool, &path, "XMP-dc:Description").as_deref(),
+        Some("Byline: SHL"),
+        "hot code expanded in the written caption"
+    );
+    assert_eq!(
+        read_tag(&exiftool, &path, "IPTC:Caption-Abstract").as_deref(),
+        Some("Byline: SHL")
     );
     std::fs::remove_dir_all(dir.path()).ok();
 }

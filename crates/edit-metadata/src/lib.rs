@@ -5,6 +5,7 @@
 //! quick-xml `crs:` sidecar writer for Lightroom interop.
 
 pub mod apply;
+pub mod code_replacements;
 pub mod crs;
 pub mod error;
 pub mod persist;
@@ -12,7 +13,10 @@ pub mod photo;
 pub mod template;
 pub mod writer;
 
-pub use apply::{MetadataWritePayload, preview_fields, run_metadata_write, vars_for};
+pub use apply::{
+    MetadataWritePayload, preview_fields, preview_fields_with, run_metadata_write, vars_for,
+};
+pub use code_replacements::{CodeReplacements, HotNamespace};
 pub use crs::{
     channel_curve_points, crop_attributes, develop_attributes, exiftool_tag_args,
     tone_curve_points, write_sidecar,
@@ -22,5 +26,5 @@ pub use persist::{PersistOutcome, persist_edit, persist_sidecar};
 pub use photo::{
     PhotoMetadata, read_exif, read_photo_metadata, read_xmp_file, read_xmp_sidecar_for,
 };
-pub use template::{TemplateFields, TemplateVars, expand};
+pub use template::{TemplateFields, TemplateVars, expand, expand_with_codes};
 pub use writer::{ProcessTransport, Transport, Writer};

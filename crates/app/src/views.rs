@@ -34,12 +34,13 @@ use gpui_kit::*;
 use crate::browse::{
     BrowseFilter, BrowseItem, CatalogScanPayload, MetaBadge, SelectionModel, SortOrder,
     ThumbPayload, ThumbState, UploadBadge, ZoomMode, ZoomState, apply_filter_sort, canonical_root,
-    list_browse_items, pair_key, plan_template_apply, run_catalog_scan, template_apply_payloads,
+    list_browse_items, pair_key, plan_template_apply, run_catalog_scan,
+    template_apply_payloads_with,
 };
 use crate::develop::{DevelopSession, RenderQueue, SidecarQueue, SliderId};
 use crate::preview::BrowsePreviewProvider;
 use edit_core::{CancelToken, DevelopSettings, RenderSize};
-use edit_metadata::{MetadataWritePayload, TemplateFields};
+use edit_metadata::{CodeReplacements, MetadataWritePayload, TemplateFields};
 use edit_render::{PROXY_DRAG_LONG_EDGE, PROXY_RELEASE_LONG_EDGE, RenderService};
 use gpui_kit::component::slider::{
     Slider as DevelopSliderElement, SliderEvent, SliderState, SliderValue,
@@ -480,6 +481,18 @@ impl Browser {
         template_name: &str,
         cx: &mut Context<Self>,
     ) {
+        self.apply_template_with(fields, template_name, None, cx);
+    }
+
+    /// [`Self::apply_template`] with a parsed code replacement set baked
+    /// into each durable payload, so workers expand `=code=` / hot codes.
+    pub fn apply_template_with(
+        &mut self,
+        fields: TemplateFields,
+        template_name: &str,
+        replacements: Option<CodeReplacements>,
+        cx: &mut Context<Self>,
+    ) {
         if fields == TemplateFields::default() {
             self.template_status = "Apply skipped: template is empty.".into();
             cx.notify();
@@ -506,8 +519,12 @@ impl Browser {
         let fields_json = serde_json::to_string(&fields).unwrap_or_else(|_| "{}".to_string());
         cx.spawn(async move |this, cx| {
             let enqueue = cx.background_executor().spawn(async move {
-                let payloads =
-                    template_apply_payloads(&plan, &fields_json, edit_catalog::db::now_unix());
+                let payloads = template_apply_payloads_with(
+                    &plan,
+                    &fields_json,
+                    edit_catalog::db::now_unix(),
+                    replacements,
+                );
                 catalog.enqueue_jobs_batch(JobKind::MetadataWrite, &payloads)
             });
             if let Err(e) = enqueue.await {
