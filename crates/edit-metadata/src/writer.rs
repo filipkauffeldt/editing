@@ -13,8 +13,11 @@
 //!   would desync the `{ready}` protocol.
 //! - IIM writes run with `-charset iptc=UTF8`, embedded IIM without it
 //!   is Latin-1.
-//! - The target is guarded with `--`, so a path starting with `-` stays
-//!   a filename.
+//! - A target that could parse as an option (leading `-`), is not UTF-8
+//!   or contains a line break is rejected before send; `--` cannot guard
+//!   it, see [`Writer::write_tags`].
+//! - A raw original is never a target: `-overwrite_original` would
+//!   rewrite the container. Raws are stamped through their XMP sidecar.
 //! - Reads have a timeout on a watchdog thread; a wedged exiftool is
 //!   killed and the transport resets, reconnecting on the next command.
 //!
@@ -157,15 +160,26 @@ impl ProcessTransport {
 
 impl Transport for ProcessTransport {
     fn execute(&mut self, args: &[String]) -> Result<String> {
-        if self.child.is_none() {
+        // No child, or a child whose stdout the watchdog never gave back,
+        // is a broken transport: start over rather than fail the command.
+        if self.child.as_ref().is_none_or(|c| c.stdout.is_none()) {
             self.reconnect()?;
         }
-        match self.child.as_mut() {
-            Some(running) => Self::round_trip(running, args, self.read_timeout),
-            None => Err(Error::ExifTool(
+        let Some(running) = self.child.as_mut() else {
+            return Err(Error::ExifTool(
                 "exiftool child vanished between reconnect and write".into(),
-            )),
+            ));
+        };
+        let result = Self::round_trip(running, args, self.read_timeout);
+        if result.is_err() {
+            // A timed-out, closed or half-read child cannot be trusted
+            // with the next command; reap it so the retry starts fresh.
+            if let Some(mut dead) = self.child.take() {
+                let _ = dead.child.kill();
+                let _ = dead.child.wait();
+            }
         }
+        result
     }
 
     fn reconnect(&mut self) -> Result<()> {
@@ -287,7 +301,7 @@ impl Writer {
     }
 
     /// True when `bin -ver` runs. Gate integration tests on this.
-    pub fn is_available(bin: &str) -> bool {
+    pub fn is_available(bin: impl AsRef<std::ffi::OsStr>) -> bool {
         Command::new(bin)
             .arg("-ver")
             .stdout(Stdio::null())
@@ -301,7 +315,7 @@ impl Writer {
     pub fn find_binary() -> Option<PathBuf> {
         if let Some(bin) = std::env::var_os("EXIFTOOL") {
             let bin = PathBuf::from(bin);
-            if Self::is_available(&bin.to_string_lossy()) {
+            if Self::is_available(&bin) {
                 return Some(bin);
             }
         }
@@ -315,6 +329,10 @@ impl Writer {
     /// `-TAG<=tempfile`: an argfile line break would split the arg and
     /// desync the `{ready}` protocol. Temp files are removed when the
     /// command round-trip ends, success or not.
+    ///
+    /// Raw originals are refused (they are stamped through their XMP
+    /// sidecar, never rewritten in place), so `-overwrite_original` only
+    /// ever replaces a still master or a sidecar.
     ///
     /// No `--` target guard is possible: exiftool's argfile parser
     /// ignores `-execute` after `--` (end-of-options swallows the
@@ -331,6 +349,11 @@ impl Writer {
                 "{target:?} (not UTF-8 or contains a line break)"
             )));
         };
+        if crate::apply::is_raw(target) {
+            return Err(Error::InvalidPath(format!(
+                "{target_text:?} is a raw original; write its XMP sidecar instead"
+            )));
+        }
         if target_text.starts_with('-') {
             return Err(Error::InvalidPath(format!(
                 "{target_text:?} would parse as an exiftool option"
@@ -486,25 +509,24 @@ mod tests {
     }
 
     #[test]
-    fn write_tags_sends_charset_overwrite_and_target_guard() {
+    fn write_tags_sends_charset_overwrite_and_target() {
         let writer = Writer::with_transport(ScriptTransport::new(vec![ok_step(&[
             "-charset",
             "iptc=UTF8",
             "-overwrite_original",
             "-XMP-crs:Exposure2012=+0.35",
-            "photo.NEF",
+            "photo.JPG",
         ])]));
         writer
-            .write_tags(Path::new("photo.NEF"), &[("XMP-crs:Exposure2012", "+0.35")])
+            .write_tags(Path::new("photo.JPG"), &[("XMP-crs:Exposure2012", "+0.35")])
             .unwrap();
     }
 
     #[test]
     fn multiline_values_ride_out_of_band_through_a_value_file() {
         // A newline inside one arg would split the argfile line; the
-        // writer must emit `-TAG<=tmp` instead, one arg per line, with
-        // the `--` guard before the target, and delete the value file
-        // after the command.
+        // writer must emit `-TAG<=tmp` instead, one arg per line, and
+        // delete the value file after the command.
         let captured = Arc::new(Mutex::new(Vec::<String>::new()));
         struct Cap(Arc<Mutex<Vec<String>>>);
         impl Transport for Cap {
@@ -515,7 +537,7 @@ mod tests {
         }
         Writer::with_transport(Cap(Arc::clone(&captured)))
             .write_tags(
-                Path::new("p.NEF"),
+                Path::new("p.JPG"),
                 &[("IPTC:Caption-Abstract", "line one\nline two")],
             )
             .unwrap();
@@ -529,7 +551,7 @@ mod tests {
             tag_arg.starts_with("-IPTC:Caption-Abstract<="),
             "multiline value must ride a value file, got {tag_arg:?}"
         );
-        assert_eq!(args[4], "p.NEF");
+        assert_eq!(args[4], "p.JPG");
         let file = tag_arg
             .strip_prefix("-IPTC:Caption-Abstract<=")
             .expect("value file path");
@@ -554,7 +576,7 @@ mod tests {
         let writer = Writer::with_transport(Guard);
         writer
             .write_tags(
-                Path::new("photo.NEF"),
+                Path::new("photo.JPG"),
                 &[
                     ("XMP-dc:Description", "one\ntwo\rthree"),
                     ("IPTC:Keywords", "plain"),
@@ -568,7 +590,7 @@ mod tests {
         #[cfg(unix)]
         {
             use std::os::unix::ffi::OsStrExt;
-            let bad = std::ffi::OsStr::from_bytes(b"photo-\xff.NEF");
+            let bad = std::ffi::OsStr::from_bytes(b"photo-\xff.JPG");
             let writer = Writer::with_transport(ScriptTransport::new(vec![]));
             let err = writer
                 .write_tags(Path::new(bad), &[("XMP-dc:Description", "x")])
@@ -581,9 +603,22 @@ mod tests {
     fn dash_leading_targets_are_rejected() {
         let writer = Writer::with_transport(ScriptTransport::new(vec![]));
         let err = writer
-            .write_tags(Path::new("-weird.NEF"), &[("XMP-dc:Description", "x")])
+            .write_tags(Path::new("-weird.JPG"), &[("XMP-dc:Description", "x")])
             .unwrap_err();
         assert!(err.to_string().contains("an exiftool option"), "{err}");
+    }
+
+    #[test]
+    fn raw_originals_are_never_a_write_target() {
+        // `-overwrite_original` would rewrite the raw container; the
+        // sidecar path is the only way a raw side gets stamped.
+        let writer = Writer::with_transport(ScriptTransport::new(vec![]));
+        for raw in ["A.NEF", "b.cr3", "/x/C.DNG"] {
+            let err = writer
+                .write_tags(Path::new(raw), &[("XMP-dc:Description", "x")])
+                .unwrap_err();
+            assert!(err.to_string().contains("raw original"), "{raw}: {err}");
+        }
     }
 
     #[test]
@@ -596,7 +631,7 @@ mod tests {
             reply: Ok("    0 image files updated\n    1 image files unchanged\n".into()),
         }]));
         writer
-            .write_tags(Path::new("photo.NEF"), &[("XMP-dc:Description", "x")])
+            .write_tags(Path::new("photo.JPG"), &[("XMP-dc:Description", "x")])
             .unwrap();
     }
 
@@ -609,7 +644,7 @@ mod tests {
             ),
         }]));
         let err = writer
-            .write_tags(Path::new("photo.NEF"), &[("XMP-dc:Description", "x")])
+            .write_tags(Path::new("photo.JPG"), &[("XMP-dc:Description", "x")])
             .unwrap_err();
         assert!(err.to_string().contains("0 image files updated"), "{err}");
     }
@@ -638,7 +673,7 @@ mod tests {
             },
         ]));
         let err = writer
-            .write_tags(Path::new("photo.NEF"), &[("XMP-crs:Exposure2012", "+0.35")])
+            .write_tags(Path::new("photo.JPG"), &[("XMP-crs:Exposure2012", "+0.35")])
             .unwrap_err();
         assert!(err.to_string().contains("Nothing to write"), "{err}");
     }
@@ -652,7 +687,7 @@ mod tests {
             ),
         }]));
         let err = writer
-            .write_tags(Path::new("photo.NEF"), &[("XMP-crs:Exposure2012", "+0.35")])
+            .write_tags(Path::new("photo.JPG"), &[("XMP-crs:Exposure2012", "+0.35")])
             .unwrap_err();
         assert!(err.to_string().contains("0 image files updated"), "{err}");
     }
@@ -673,7 +708,7 @@ mod tests {
         }
         let writer = Writer::with_transport(Flaky { calls: 0 });
         writer
-            .write_tags(Path::new("photo.NEF"), &[("XMP-crs:Exposure2012", "+0.35")])
+            .write_tags(Path::new("photo.JPG"), &[("XMP-crs:Exposure2012", "+0.35")])
             .unwrap();
     }
 
@@ -705,7 +740,7 @@ mod tests {
                 let writer = Arc::clone(&writer);
                 s.spawn(move || {
                     writer
-                        .write_tags(Path::new("p.NEF"), &[("XMP-crs:Exposure2012", "0")])
+                        .write_tags(Path::new("p.JPG"), &[("XMP-crs:Exposure2012", "0")])
                         .unwrap();
                 });
             }
@@ -721,6 +756,49 @@ mod tests {
 #[cfg(test)]
 mod process_tests {
     use super::*;
+
+    /// Fake `exiftool -stay_open` over `sh`: answers every block with an
+    /// updated-count line, except that the very first real command (the
+    /// second block of the first process) hangs once, marked by a file.
+    #[cfg(unix)]
+    fn flaky_exiftool(dir: &Path) -> PathBuf {
+        use std::os::unix::fs::PermissionsExt as _;
+        let bin = dir.join("flaky-exiftool");
+        let marker = dir.join("hung-once");
+        let script = format!(
+            "#!/bin/sh\nn=0\nwhile IFS= read -r line; do\n  \
+             if [ \"$line\" = \"-execute\" ]; then\n    n=$((n+1))\n    \
+             if [ $n -eq 2 ] && [ ! -e '{marker}' ]; then : > '{marker}'; exec sleep 300; fi\n    \
+             echo '    1 image files updated'\n    echo '{{ready}}'\n  fi\ndone\n",
+            marker = marker.display()
+        );
+        std::fs::write(&bin, script).unwrap();
+        std::fs::set_permissions(&bin, std::fs::Permissions::from_mode(0o755)).unwrap();
+        bin
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn mid_life_wedge_is_killed_and_the_write_retries_on_a_fresh_process() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let bin = flaky_exiftool(dir.path());
+        let writer = Writer::with_transport(
+            ProcessTransport::spawn_with_timeout(&bin, Duration::from_millis(400)).unwrap(),
+        );
+        let start = std::time::Instant::now();
+        writer
+            .write_tags(Path::new("p.JPG"), &[("XMP-dc:Description", "x")])
+            .expect("the retry after the kill succeeds on a new process");
+        assert!(dir.path().join("hung-once").exists(), "the wedge happened");
+        assert!(
+            start.elapsed() < Duration::from_secs(15),
+            "a wedged read must not block for long"
+        );
+        // And the reconnected process keeps serving commands.
+        writer
+            .write_tags(Path::new("p.JPG"), &[("XMP-dc:Description", "y")])
+            .unwrap();
+    }
 
     #[cfg(unix)]
     #[test]

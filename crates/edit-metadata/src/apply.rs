@@ -87,9 +87,17 @@ fn ready_sidecar(path: &Path) -> Result<PathBuf, String> {
     let Some(sidecar) = sidecar_for(path) else {
         return Err(format!("{path:?} has no sidecar name"));
     };
-    if !sidecar.exists() {
-        std::fs::write(&sidecar, IPTC_SIDECAR_STUB)
-            .map_err(|e| format!("sidecar {}: {e}", sidecar.display()))?;
+    // `create_new` so a sidecar another writer made in the meantime (a
+    // `crs:` edit sidecar, say) is never overwritten with the stub.
+    match std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(&sidecar)
+    {
+        Ok(mut file) => std::io::Write::write_all(&mut file, IPTC_SIDECAR_STUB.as_bytes())
+            .map_err(|e| format!("sidecar {}: {e}", sidecar.display()))?,
+        Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {}
+        Err(e) => return Err(format!("sidecar {}: {e}", sidecar.display())),
     }
     Ok(sidecar)
 }
