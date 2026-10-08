@@ -16,8 +16,6 @@
 pub mod lightcraft;
 pub mod plain;
 
-pub use lightcraft::SourceFacts;
-
 use std::borrow::Cow;
 use std::collections::{HashMap, VecDeque};
 use std::io::Cursor;
@@ -403,17 +401,6 @@ impl RenderService {
                     stage: "decode",
                     message,
                 })
-        }
-    }
-    /// Seed-relevant facts about a source, derived with a container parse
-    /// (never rendering pixels), for the develop session's white-point seed.
-    pub fn source_facts(path: &Path) -> Option<SourceFacts> {
-        let bytes = std::fs::read(path).ok()?;
-        if lightcraft_raw::probe(&bytes).is_some() {
-            lightcraft::source_facts(&bytes)
-        } else {
-            // Plain files carry relative WB; no seed needed.
-            Some(SourceFacts::default())
         }
     }
 }

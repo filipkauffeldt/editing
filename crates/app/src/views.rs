@@ -789,10 +789,10 @@ impl Browser {
     }
 
     /// Read the current item's edit row into the develop session on the
-    /// background executor. A photo with no row yet seeds its raw buffer with
-    /// the source's as-shot white point, so the first slider drag persists
-    /// settings that re-render identically after a restart. Failures keep the
-    /// previous buffer and surface in the panel (reviews M2/M6).
+    /// background executor. A photo with no row yet starts from the default
+    /// settings (raw import defaults and the as-shot white balance arrive with
+    /// the D2 presets). Failures keep the previous buffer and surface in the
+    /// panel (reviews M2/M6).
     fn schedule_current_edit_load(&mut self, cx: &mut Context<Self>) {
         let Some(item) = self.current_item() else {
             return;
@@ -800,19 +800,13 @@ impl Browser {
         self.develop_pending = Some(item.item_id);
         let catalog = Arc::clone(&self.catalog);
         let item_id = item.item_id;
-        let path = item.display_path.clone();
         cx.spawn(async move |this, cx| {
             let outcome = cx
                 .background_executor()
                 .spawn(async move {
                     match catalog.get_edit(item_id) {
                         Err(e) => Err(format!("edit read failed: {e}")),
-                        Ok(None) => Ok(match RenderService::source_facts(Path::new(&path)) {
-                            Some(facts) if facts.raw => {
-                                DevelopSettings::for_raw(facts.as_shot_temp, facts.as_shot_tint)
-                            }
-                            _ => DevelopSettings::default(),
-                        }),
+                        Ok(None) => Ok(DevelopSettings::default()),
                         Ok(Some(edit)) => {
                             serde_json::from_str::<DevelopSettings>(&edit.develop_json)
                                 .map_err(|e| format!("corrupt edit row: {e}"))

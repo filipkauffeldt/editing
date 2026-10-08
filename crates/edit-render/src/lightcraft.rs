@@ -520,33 +520,3 @@ pub fn load_embedded_preview(bytes: &[u8], max_edge: usize) -> Option<(Rgb32f, S
         SourceInfo::default(),
     ))
 }
-
-/// Seed-relevant facts about a source, derived from the headers only, for
-/// the develop session's white-point seed (never developing samples).
-#[derive(Clone, Copy, Debug, Default, PartialEq)]
-pub struct SourceFacts {
-    /// Absolute-as-shot Kelvin WB interpretation (raw) or rendered-relative.
-    pub raw: bool,
-    pub as_shot_temp: f64,
-    pub as_shot_tint: f64,
-}
-
-/// Derive [`SourceFacts`] with a header-only container parse (no samples, per
-/// `probe_info`).
-pub fn source_facts(bytes: &[u8]) -> Option<SourceFacts> {
-    let info = lightcraft_raw::probe_info(bytes).ok()?;
-    let xy = lightcraft_raw::color::as_shot_white_xy_of(&info);
-    let fallback = !lightcraft_raw::color::has_matrix(&info.color);
-    let relative = file_local_look(info.format) && fallback;
-    let (temp, tint) = xy_to_temp_tint(xy);
-    let (temp, tint) = if relative {
-        (6500.0, 0.0)
-    } else {
-        (temp.round(), tint.round())
-    };
-    Some(SourceFacts {
-        raw: true,
-        as_shot_temp: temp,
-        as_shot_tint: tint,
-    })
-}
