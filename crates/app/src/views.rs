@@ -27,7 +27,12 @@ use std::rc::Rc;
 use std::sync::Arc;
 
 use edit_catalog::{Catalog, JobEvent, JobEventKind, JobId, JobKind};
-use gpui_kit::component::{ActiveTheme as _, TitleBar, h_flex, status_bar::StatusBar, v_flex};
+use gpui_kit::component::button::{Button, ButtonVariants as _};
+use gpui_kit::component::label::Label;
+use gpui_kit::component::{
+    ActiveTheme as _, Disableable as _, IconName, Sizable as _, TitleBar, h_flex,
+    status_bar::StatusBar, v_flex,
+};
 use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::*;
 
@@ -191,6 +196,7 @@ impl Browser {
                             .min(spec.min as f32)
                             .max(spec.max as f32)
                             .step(spec.step as f32)
+                            .default_value(spec.default as f32)
                     }),
                     None => cx.new(|_| SliderState::new()),
                 };
@@ -897,59 +903,95 @@ impl Browser {
     /// The develop panel (plan sections 2.1 and 2.3): Presets placeholder on
     /// top, then the six LR-style tone sliders driving `DevelopSettings`
     /// through the render service.
-    fn render_develop_panel(&mut self) -> impl IntoElement {
+    fn render_develop_panel(&mut self, cx: &mut Context<Self>) -> impl IntoElement {
+        let theme = cx.theme();
+        let (bg, fg, border, muted) = (
+            theme.sidebar,
+            theme.sidebar_foreground,
+            theme.sidebar_border,
+            theme.muted_foreground,
+        );
         let status = self.develop_status.clone();
         v_flex()
-            .w(px(220.0))
+            .w(px(240.0))
             .h_full()
-            .px_2()
-            .py_1()
-            .gap_2()
-            .bg(rgb(0x181818))
-            .child(div().text_sm().child("Develop (M2)".to_string()))
+            .p_3()
+            .gap_3()
+            .bg(bg)
+            .text_color(fg)
+            .border_l_1()
+            .border_color(border)
+            .child(Label::new("Develop").text_sm())
             .child(
-                div()
+                Label::new("Presets land in D2.")
                     .text_xs()
-                    .text_color(rgb(0x888888))
-                    .child("Presets land in D2.".to_string()),
+                    .text_color(muted),
             )
-            .children(self.render_develop_rows())
-            .child(div().text_xs().text_color(rgb(0x888888)).child(status))
+            .children(self.render_develop_rows(cx))
+            .child(Label::new(status).text_xs().text_color(muted))
     }
 
-    /// One row per slider: label, then the slider (which dispatches actions
-    /// from its own listeners against the browser entity).
-    fn render_develop_rows(&mut self) -> Vec<impl IntoElement> {
+    /// One block per slider: name, live value readout, a reset button, then
+    /// the slider (which dispatches actions from its own listeners against
+    /// the browser entity). Double-clicking the name row resets too.
+    fn render_develop_rows(&mut self, cx: &mut Context<Self>) -> Vec<impl IntoElement> {
+        let muted = cx.theme().muted_foreground;
         let mut rows = Vec::with_capacity(SliderId::ALL.len());
         for (id, control) in &self.develop_sliders {
             let id = *id;
-            let spec = match id.spec() {
-                Some(spec) => spec,
-                None => continue,
-            };
-            let name = spec.label.to_owned();
+            let Some(spec) = id.spec() else { continue };
+            let value = self.develop.slider_value(id);
+            let at_default = (value - spec.default).abs() < 1e-6;
+            let entity_id = control.entity_id().as_u64();
             rows.push(
-                h_flex()
+                v_flex()
                     .w_full()
-                    .items_center()
-                    .gap_2()
+                    .gap_1()
                     .child(
-                        div()
-                            .text_xs()
-                            .text_color(rgb(0xCCCCCC))
-                            .w(px(64.0))
-                            .child(name),
+                        h_flex()
+                            .id(("develop-row", entity_id))
+                            .w_full()
+                            .items_center()
+                            .justify_between()
+                            .on_click(cx.listener(move |this, event: &ClickEvent, _, cx| {
+                                if event.click_count() == 2 {
+                                    this.reset_develop_slider(id, cx);
+                                }
+                            }))
+                            .child(Label::new(spec.label).text_xs())
+                            .child(
+                                h_flex()
+                                    .items_center()
+                                    .gap_1()
+                                    .child(
+                                        Label::new(spec.format(value)).text_xs().text_color(muted),
+                                    )
+                                    .child(
+                                        Button::new(("develop-reset", entity_id))
+                                            .ghost()
+                                            .xsmall()
+                                            .icon(IconName::Undo2)
+                                            .tooltip("Reset")
+                                            .disabled(at_default)
+                                            .on_click(cx.listener(move |this, _, _, cx| {
+                                                this.reset_develop_slider(id, cx);
+                                            })),
+                                    ),
+                            ),
                     )
-                    .child(
-                        div()
-                            .id(("develop-slider", control.entity_id().as_u64()))
-                            .flex_1()
-                            .h(px(20.0))
-                            .child(DevelopSliderElement::new(control)),
-                    ),
+                    .child(DevelopSliderElement::new(control)),
             );
         }
         rows
+    }
+
+    /// Put one slider back to its default: the same commit a released drag
+    /// makes, so the render and the saved edit follow.
+    fn reset_develop_slider(&mut self, id: SliderId, cx: &mut Context<Self>) {
+        if let Some(spec) = id.spec() {
+            self.on_develop_release(id, spec.default as f32, cx);
+            cx.notify();
+        }
     }
 
     /// Sync the edit buffer's slider values into the widget states. A live
@@ -1741,7 +1783,7 @@ impl Render for Browser {
         // Right column collapses in grid mode (plan section 2.1).
         let right: AnyElement = match self.mode {
             Mode::Grid => div().into_any_element(),
-            Mode::Single => self.render_develop_panel().into_any_element(),
+            Mode::Single => self.render_develop_panel(cx).into_any_element(),
         };
         v_flex()
             .size_full()
