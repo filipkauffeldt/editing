@@ -155,7 +155,11 @@ impl Focusable for BrowserShell {
 impl Render for BrowserShell {
     fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let title_bar = self.render_title_bar(cx);
-        let (background, foreground) = (cx.theme().background, cx.theme().foreground);
+        let (background, foreground, border) = (
+            cx.theme().background,
+            cx.theme().foreground,
+            cx.theme().border,
+        );
         let dialog_open = self.state.read(cx).is_ingest_open();
         let dialog = self.dialog.clone();
         let templates_open = self.state.read(cx).is_templates_open();
@@ -170,18 +174,32 @@ impl Render for BrowserShell {
             .child(div().flex_1().min_h_0().child(self.browser.clone()))
             .when(dialog_open, |root| {
                 root.child(
-                    div()
-                        .absolute()
-                        .inset_0()
-                        .child(div().w(px(600.0)).mx_auto().mt_16().child(dialog)),
+                    div().absolute().inset_0().child(
+                        div()
+                            .w(px(600.0))
+                            .mx_auto()
+                            .mt_16()
+                            .bg(background)
+                            .border_1()
+                            .border_color(border)
+                            .rounded_md()
+                            .child(dialog),
+                    ),
                 )
             })
             .when(templates_open, |root| {
                 root.child(
-                    div()
-                        .absolute()
-                        .inset_0()
-                        .child(div().w(px(760.0)).mx_auto().mt_8().child(templates)),
+                    div().absolute().inset_0().child(
+                        div()
+                            .w(px(760.0))
+                            .mx_auto()
+                            .mt_8()
+                            .bg(background)
+                            .border_1()
+                            .border_color(border)
+                            .rounded_md()
+                            .child(templates),
+                    ),
                 )
             })
     }
