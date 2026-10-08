@@ -1,7 +1,7 @@
 //! Ingest dialog (B3 shell + C2 live state) and the shared [`AppState`].
 //!
 //! Scope: volume list driven by `edit-ingest` detection events, destination
-//! inputs as plain text, an IPTC template selector stub, and a live file table
+//! inputs as plain text, the IPTC template selector, and a live file table
 //! with a per-file state column. C2 adds the **Start ingest** action: it opens
 //! an `ingest_batches` row, enqueues one durable `ingest_copy` job per card
 //! (multi-card parallel), and reflects the worker's per-file progress, live
@@ -10,16 +10,20 @@
 use std::collections::HashMap;
 use std::sync::Arc;
 
-use edit_catalog::models::IngestFile;
+use edit_catalog::models::{IngestFile, IptcTemplate};
 use edit_catalog::{Catalog, JobEvent, JobEventKind, JobId, JobKind};
 use edit_core::IngestFileState;
 use edit_ingest::{
-    IngestCopyPayload, IngestPlanRequest, Volume, batch_volume_identity, plan_ingest,
+    DEFAULT_DEST_RULE, DEFAULT_FILENAME_RULE, IngestCopyPayload, Volume, batch_volume_identity,
 };
+
+use app::ingest_job::{IngestStart, start_ingest};
 use gpui_kit::component::button::Button;
 use gpui_kit::component::dialog::DialogTitle;
 use gpui_kit::component::input::{Input, InputState};
 use gpui_kit::component::progress::Progress;
+use gpui_kit::component::searchable_list::SearchableVec;
+use gpui_kit::component::select::{Select, SelectState};
 use gpui_kit::component::{ActiveTheme as _, Disableable as _, StyledExt as _, h_flex, v_flex};
 use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::*;
@@ -56,6 +60,36 @@ pub enum BatchState {
     Failed,
 }
 
+/// What happened to the files of one batch, counted from the ingest history.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct FileTally {
+    pub cataloged: usize,
+    pub duplicates: usize,
+    pub failed: usize,
+    /// The first recorded failure reason, in file order.
+    pub first_error: Option<String>,
+}
+
+impl FileTally {
+    pub fn from_rows(rows: &[IngestFile]) -> Self {
+        let mut tally = Self::default();
+        for row in rows {
+            match row.state {
+                IngestFileState::Cataloged => tally.cataloged += 1,
+                IngestFileState::Duplicate => tally.duplicates += 1,
+                IngestFileState::Failed => {
+                    tally.failed += 1;
+                    if tally.first_error.is_none() {
+                        tally.first_error = row.error.clone();
+                    }
+                }
+                _ => {}
+            }
+        }
+        tally
+    }
+}
+
 /// Per-card progress shown next to a detected volume.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct IngestBatchProgress {
@@ -65,6 +99,7 @@ pub struct IngestBatchProgress {
     pub done: usize,
     pub total: usize,
     pub state: BatchState,
+    pub tally: FileTally,
 }
 
 impl IngestBatchProgress {
@@ -74,6 +109,38 @@ impl IngestBatchProgress {
             0.0
         } else {
             (self.done as f32 / self.total as f32) * 100.0
+        }
+    }
+
+    /// One honest line for the card: what landed, what was skipped, and
+    /// what failed. A finished batch never says "done" for files that failed.
+    pub fn summary(&self) -> String {
+        let tally = &self.tally;
+        match self.state {
+            BatchState::Running if tally.failed > 0 => format!(
+                "ingesting {}/{} · {} failed",
+                self.done, self.total, tally.failed
+            ),
+            BatchState::Running => format!("ingesting {}/{}", self.done, self.total),
+            BatchState::Done | BatchState::Failed => {
+                let mut parts = vec![format!("{} ingested", tally.cataloged)];
+                if tally.duplicates > 0 {
+                    parts.push(format!("{} duplicates", tally.duplicates));
+                }
+                if tally.failed > 0 {
+                    parts.push(format!("{} failed", tally.failed));
+                }
+                let verdict = if self.state == BatchState::Failed
+                    || tally.cataloged == 0 && tally.failed > 0
+                {
+                    "failed"
+                } else if tally.failed > 0 {
+                    "done with failures"
+                } else {
+                    "done"
+                };
+                format!("{verdict} · {}", parts.join(" · "))
+            }
         }
     }
 }
@@ -87,8 +154,8 @@ pub struct AppState {
     batches: Vec<IngestBatchProgress>,
     files_by_batch: HashMap<i64, Vec<IngestFileRow>>,
     job_batches: HashMap<JobId, i64>,
-    /// IPTC template selector stub: `None` until M3/D3 populate templates.
-    pub iptc_template: Option<String>,
+    /// Bumped each time the dialog opens, so it reloads its template list.
+    ingest_generation: u64,
 }
 
 impl AppState {
@@ -100,7 +167,7 @@ impl AppState {
             batches: Vec::new(),
             files_by_batch: HashMap::new(),
             job_batches: HashMap::new(),
-            iptc_template: None,
+            ingest_generation: 0,
         }
     }
 
@@ -127,10 +194,11 @@ impl AppState {
         rows
     }
 
-    /// Progress of the batch for one card, if it is ingesting.
+    /// Progress of the card's newest batch (a retry opens a new one).
     pub fn batch_for_volume(&self, identity: &str) -> Option<&IngestBatchProgress> {
         self.batches
             .iter()
+            .rev()
             .find(|batch| batch.volume_identity == identity)
     }
 
@@ -146,8 +214,15 @@ impl AppState {
     pub fn set_ingest_open(&mut self, open: bool, cx: &mut Context<Self>) {
         if open != self.ingest_open {
             self.ingest_open = open;
+            if open {
+                self.ingest_generation += 1;
+            }
             cx.notify();
         }
+    }
+
+    pub fn ingest_generation(&self) -> u64 {
+        self.ingest_generation
     }
 
     /// Remember the batch a queued `ingest_copy` job belongs to, so progress
@@ -168,6 +243,7 @@ impl AppState {
             done: 0,
             total: 0,
             state: BatchState::Running,
+            tally: FileTally::default(),
         });
         cx.notify();
     }
@@ -205,8 +281,17 @@ impl AppState {
         }
     }
 
-    pub fn set_files(&mut self, batch_id: i64, rows: Vec<IngestFileRow>, cx: &mut Context<Self>) {
+    pub fn set_files(
+        &mut self,
+        batch_id: i64,
+        rows: Vec<IngestFileRow>,
+        tally: FileTally,
+        cx: &mut Context<Self>,
+    ) {
         self.files_by_batch.insert(batch_id, rows);
+        if let Some(batch) = self.batches.iter_mut().find(|b| b.batch_id == batch_id) {
+            batch.tally = tally;
+        }
         cx.notify();
     }
 
@@ -235,6 +320,7 @@ impl AppState {
                 done: 0,
                 total: 0,
                 state: BatchState::Running,
+                tally: FileTally::default(),
             });
             changed = true;
         }
@@ -290,7 +376,7 @@ pub fn apply_ingest_event(
     };
     if reload && let Ok(files) = catalog.list_ingest_files(batch_id) {
         let rows: Vec<IngestFileRow> = files.iter().map(IngestFileRow::from_db).collect();
-        state.set_files(batch_id, rows, cx);
+        state.set_files(batch_id, rows, FileTally::from_rows(&files), cx);
     }
 }
 
@@ -347,9 +433,12 @@ pub fn format_bytes(bytes: u64) -> String {
     }
 }
 
+/// Template choice meaning "ingest without stamping".
+const NO_TEMPLATE: &str = "(no template)";
+
 /// Ingest dialog (plan section 2.8): card list with per-card progress,
-/// destination folder + filename rule inputs, backup destination input, IPTC
-/// template selector stub, the live file table, and the Start action.
+/// destination folder + filename rule inputs, backup destination input, the
+/// IPTC template selector, the live file table, and the Start / Retry actions.
 pub struct IngestDialog {
     state: Entity<AppState>,
     catalog: Arc<Catalog>,
@@ -358,6 +447,10 @@ pub struct IngestDialog {
     pub dest_dir: Entity<InputState>,
     pub file_rule: Entity<InputState>,
     pub backup_dir: Entity<InputState>,
+    template_select: Entity<SelectState<SearchableVec<String>>>,
+    /// Template rows behind the selector, refreshed each time the dialog opens.
+    templates: Vec<IptcTemplate>,
+    seen_generation: u64,
     status: Option<String>,
 }
 
@@ -368,6 +461,7 @@ impl IngestDialog {
         dest_dir: Entity<InputState>,
         file_rule: Entity<InputState>,
         backup_dir: Entity<InputState>,
+        template_select: Entity<SelectState<SearchableVec<String>>>,
     ) -> Self {
         Self {
             state,
@@ -376,6 +470,10 @@ impl IngestDialog {
             dest_dir,
             file_rule,
             backup_dir,
+            template_select,
+            templates: Vec::new(),
+            // Differs from the state's generation, so the first render loads.
+            seen_generation: u64::MAX,
             status: None,
         }
     }
@@ -386,11 +484,56 @@ impl IngestDialog {
         });
     }
 
+    /// Reload the template rows and rebuild the selector. The default is the
+    /// newest ingest-scoped template (the ingest snapshot), else "no
+    /// template"; a still-existing earlier pick is kept.
+    fn reload_templates(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.templates = self.catalog.list_iptc_templates().unwrap_or_default();
+        self.templates.sort_by_key(|row| row.name.to_lowercase());
+        let previous = self.template_select.read(cx).selected_value().cloned();
+        let default = self
+            .templates
+            .iter()
+            .filter(|row| row.scope == "ingest")
+            .max_by_key(|row| row.updated_at)
+            .map(|row| row.name.clone());
+        let mut names = vec![NO_TEMPLATE.to_string()];
+        names.extend(self.templates.iter().map(|row| row.name.clone()));
+        let pick = previous
+            .filter(|name| names.contains(name))
+            .or(default)
+            .unwrap_or_else(|| NO_TEMPLATE.to_string());
+        self.template_select.update(cx, |select, cx| {
+            select.set_items(SearchableVec::new(names), window, cx);
+            select.set_selected_value(&pick, window, cx);
+        });
+    }
+
+    fn selected_template(&self, cx: &App) -> Option<IptcTemplate> {
+        let name = self.template_select.read(cx).selected_value().cloned()?;
+        self.templates.iter().find(|row| row.name == name).cloned()
+    }
+
+    /// Put the defaults back into blank rule boxes, so what the box shows is
+    /// exactly what the ingest uses (a placeholder is never the rule).
+    fn fill_blank_rules(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        for (input, default) in [
+            (&self.dest_dir, DEFAULT_DEST_RULE),
+            (&self.file_rule, DEFAULT_FILENAME_RULE),
+        ] {
+            if input.read(cx).value().trim().is_empty() {
+                input.update(cx, |input, cx| input.set_value(default, window, cx));
+            }
+        }
+    }
+
     /// Open an ingest batch for the selected card and queue its copy job.
+    /// Clicking it again after a failure retries: files already ingested are
+    /// skipped as duplicates and failed ones are copied again.
     ///
     /// Enumeration, copying and dedupe all run inside the `ingest_copy` job,
     /// so this never blocks the UI thread.
-    fn start(&mut self, cx: &mut Context<Self>) {
+    fn start(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let Some(identity) = self.selected.clone() else {
             self.status = Some("Select a card first.".to_string());
             cx.notify();
@@ -408,14 +551,14 @@ impl IngestDialog {
             cx.notify();
             return;
         };
-        if self.start_card(&volume, cx) {
+        if self.start_card(&volume, window, cx) {
             self.status = Some(format!("Ingesting {}…", volume.display_name()));
         }
         cx.notify();
     }
 
     /// Open one batch per detected card, so every card ingests in parallel.
-    fn start_all(&mut self, cx: &mut Context<Self>) {
+    fn start_all(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let volumes = self.state.read(cx).volumes().to_vec();
         if volumes.is_empty() {
             self.status = Some("No cards detected.".to_string());
@@ -424,7 +567,7 @@ impl IngestDialog {
         }
         let mut started = 0;
         for volume in &volumes {
-            if self.start_card(volume, cx) {
+            if self.start_card(volume, window, cx) {
                 started += 1;
             }
         }
@@ -434,58 +577,39 @@ impl IngestDialog {
         cx.notify();
     }
 
-    /// Validate the inputs, open the batch, and queue its `ingest_copy` job.
-    /// Returns false (with `status` set) when the card cannot be started.
-    fn start_card(&mut self, volume: &Volume, cx: &mut Context<Self>) -> bool {
+    /// Validate the inputs and queue the card. Returns false (with `status`
+    /// set) when the card cannot be started; a rejected request creates no
+    /// batch.
+    fn start_card(&mut self, volume: &Volume, window: &mut Window, cx: &mut Context<Self>) -> bool {
+        self.fill_blank_rules(window, cx);
         let dest = self.dest_dir.read(cx).value().to_string();
         let file_rule = self.file_rule.read(cx).value().to_string();
         let backup = self.backup_dir.read(cx).value().to_string();
         let session = volume.display_name();
-        let plan = match plan_ingest(&IngestPlanRequest {
-            volume_uuid: volume.fs_uuid.as_deref(),
-            volume_label: volume.label.as_deref(),
-            source_root: &volume.mount_point,
-            dest_dir_template: &dest,
-            filename_template: &file_rule,
-            backup_dir: Some(backup.as_str()),
-            session: &session,
-            start_seq: 1,
-            template: None,
-        }) {
-            Ok(plan) => plan,
-            Err(error) => {
-                self.status = Some(format!("Bad naming rule: {error}"));
-                return false;
-            }
-        };
-        let batch_id = match self.catalog.create_ingest_batch(&plan.batch) {
-            Ok(id) => id,
-            Err(error) => {
-                self.status = Some(format!("Could not open batch: {error}"));
-                return false;
-            }
-        };
-        let payload = IngestCopyPayload {
-            batch_id,
-            ..plan.payload
-        };
-        let encoded = match serde_json::to_string(&payload) {
-            Ok(encoded) => encoded,
-            Err(error) => {
-                self.status = Some(format!("Could not encode ingest job: {error}"));
-                return false;
-            }
-        };
-        match self.catalog.enqueue_job(JobKind::IngestCopy, &encoded) {
-            Ok(job_id) => {
+        let template = self.selected_template(cx);
+        let started = start_ingest(
+            &self.catalog,
+            &IngestStart {
+                volume_uuid: volume.fs_uuid.as_deref(),
+                volume_label: volume.label.as_deref(),
+                source_root: &volume.mount_point,
+                dest_rule: &dest,
+                filename_rule: &file_rule,
+                backup_dir: &backup,
+                session: &session,
+                template: template.as_ref(),
+            },
+        );
+        match started {
+            Ok(started) => {
                 let identity = volume.identity.clone();
                 self.state.update(cx, |state, cx| {
-                    state.register_batch(batch_id, job_id, identity, session, cx);
+                    state.register_batch(started.batch_id, started.job_id, identity, session, cx);
                 });
                 true
             }
-            Err(error) => {
-                self.status = Some(format!("Could not queue ingest: {error}"));
+            Err(message) => {
+                self.status = Some(message);
                 false
             }
         }
@@ -494,7 +618,7 @@ impl IngestDialog {
     fn render_cards(&self, cx: &mut Context<Self>) -> impl IntoElement {
         let volumes = self.state.read(cx).volumes().to_vec();
         let selected = self.selected.clone();
-        let progress: Vec<(String, Option<(f32, String)>)> = volumes
+        let progress: Vec<(String, Option<IngestBatchProgress>)> = volumes
             .iter()
             .map(|volume| {
                 let batch = self
@@ -502,17 +626,7 @@ impl IngestDialog {
                     .read(cx)
                     .batch_for_volume(&volume.identity)
                     .cloned();
-                let info = batch.map(|batch| {
-                    let text = match batch.state {
-                        BatchState::Running => {
-                            format!("ingesting {}/{}", batch.done, batch.total)
-                        }
-                        BatchState::Done => format!("done · {} files", batch.total),
-                        BatchState::Failed => format!("failed · {} files", batch.total),
-                    };
-                    (batch.percent(), text)
-                });
-                (volume.identity.clone(), info)
+                (volume.identity.clone(), batch)
             })
             .collect();
         v_flex().gap_2().children(volumes.into_iter().map(|volume| {
@@ -525,18 +639,27 @@ impl IngestDialog {
                 format_bytes(volume.free_bytes),
                 format_bytes(volume.capacity_bytes),
             );
-            let batch_info = progress
+            let batch = progress
                 .iter()
                 .find(|(id, _)| id == &identity)
-                .and_then(|(_, info)| info.clone());
-            let (percent, progress_text) = match batch_info {
-                Some((percent, text)) => (percent, text),
+                .and_then(|(_, batch)| batch.clone());
+            let (percent, progress_text, failure) = match batch {
+                Some(batch) => (
+                    batch.percent(),
+                    batch.summary(),
+                    batch
+                        .tally
+                        .first_error
+                        .clone()
+                        .map(|error| format!("First failure: {error}")),
+                ),
                 None => (
                     volume.used_percent(),
                     format!(
                         "{} used",
                         format_bytes(volume.capacity_bytes - volume.free_bytes)
                     ),
+                    None,
                 ),
             };
             let progress_id = format!("card-progress-{}", volume.identity);
@@ -563,6 +686,9 @@ impl IngestDialog {
                 )
                 .child(Progress::new(progress_id).value(percent))
                 .child(div().text_xs().child(progress_text))
+                .when_some(failure, |row, failure| {
+                    row.child(div().text_xs().text_color(rgb(0xE5484D)).child(failure))
+                })
         }))
     }
 
@@ -578,16 +704,16 @@ impl IngestDialog {
             .child(Input::new(input).id(id))
     }
 
-    fn render_template_stub(&self, cx: &mut Context<Self>) -> impl IntoElement {
-        let template = self
-            .state
-            .read(cx)
-            .iptc_template
-            .clone()
-            .unwrap_or_else(|| "none".to_string());
-        div().text_sm().child(format!(
-            "IPTC template: {template} (selector is populated in M3/D3)."
-        ))
+    fn render_template_picker(&self) -> impl IntoElement {
+        v_flex()
+            .gap_1()
+            .child(
+                div().text_sm().child(
+                    "IPTC template (frozen when you start, stamped on each photo as it lands)"
+                        .to_string(),
+                ),
+            )
+            .child(Select::new(&self.template_select).placeholder(NO_TEMPLATE))
     }
 
     fn render_file_table(&self, cx: &mut Context<Self>) -> impl IntoElement {
@@ -630,7 +756,12 @@ impl IngestDialog {
 }
 
 impl Render for IngestDialog {
-    fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+    fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        let generation = self.state.read(cx).ingest_generation();
+        if generation != self.seen_generation {
+            self.seen_generation = generation;
+            self.reload_templates(window, cx);
+        }
         let volumes = self.state.read(cx).volumes().to_vec();
         // Drop a selection whose card is gone so the highlight never points
         // at a removed volume.
@@ -640,10 +771,15 @@ impl Render for IngestDialog {
             self.selected = None;
         }
         let volume_count = volumes.len();
-        let dest = self.dest_dir.read(cx).value().to_string();
-        let dest_ready = !dest.trim().is_empty();
-        let ready = self.selected.is_some() && dest_ready;
-        let all_ready = volume_count > 0 && dest_ready;
+        // Blank boxes are fine: Start refills them with the defaults.
+        let ready = self.selected.is_some();
+        let all_ready = volume_count > 0;
+        let can_retry = self.selected.as_deref().is_some_and(|identity| {
+            self.state
+                .read(cx)
+                .batch_for_volume(identity)
+                .is_some_and(|batch| batch.state != BatchState::Running && batch.tally.failed > 0)
+        });
         let status = self.status.clone();
         div()
             .id("ingest-dialog")
@@ -675,7 +811,7 @@ impl Render for IngestDialog {
                         &self.backup_dir,
                         "ingest-backup",
                     ))
-                    .child(self.render_template_stub(cx))
+                    .child(self.render_template_picker())
                     .child(self.render_file_table(cx))
                     .when_some(status, |panel, status| {
                         panel.child(div().text_sm().child(status))
@@ -690,8 +826,18 @@ impl Render for IngestDialog {
                                     .label("Ingest all cards")
                                     .disabled(!all_ready)
                                     .on_click(cx.listener(
-                                        |this, _event: &ClickEvent, _window, cx| {
-                                            this.start_all(cx);
+                                        |this, _event: &ClickEvent, window, cx| {
+                                            this.start_all(window, cx);
+                                        },
+                                    )),
+                            )
+                            .child(
+                                Button::new("ingest-retry")
+                                    .label("Retry failed")
+                                    .disabled(!can_retry)
+                                    .on_click(cx.listener(
+                                        |this, _event: &ClickEvent, window, cx| {
+                                            this.start(window, cx);
                                         },
                                     )),
                             )
@@ -700,8 +846,8 @@ impl Render for IngestDialog {
                                     .label("Start ingest")
                                     .disabled(!ready)
                                     .on_click(cx.listener(
-                                        |this, _event: &ClickEvent, _window, cx| {
-                                            this.start(cx);
+                                        |this, _event: &ClickEvent, window, cx| {
+                                            this.start(window, cx);
                                         },
                                     )),
                             )
@@ -720,7 +866,7 @@ mod tests {
     // NOTE: import items explicitly, never `super::*` — the `gpui_kit::*`
     // glob re-exported above includes GPUI's `test` macro, which would shadow
     // the built-in `#[test]` attribute inside this module.
-    use super::{BatchState, IngestFileRow, format_bytes};
+    use super::{BatchState, FileTally, IngestBatchProgress, IngestFileRow, format_bytes};
     use edit_catalog::models::IngestFile;
     use edit_core::IngestFileState;
 
@@ -758,5 +904,82 @@ mod tests {
     fn batch_state_labels_are_distinct() {
         assert_ne!(BatchState::Running, BatchState::Done);
         assert_ne!(BatchState::Done, BatchState::Failed);
+    }
+
+    fn file(name: &str, state: IngestFileState, error: Option<&str>) -> IngestFile {
+        IngestFile {
+            id: 1,
+            batch_id: 1,
+            original_name: name.into(),
+            taken_at: None,
+            bytes: 1,
+            source_path: format!("/card/{name}"),
+            dest_path: None,
+            backup_path: None,
+            blake3: None,
+            photo_id: None,
+            state,
+            error: error.map(str::to_string),
+            created_at: 0,
+        }
+    }
+
+    fn progress(state: BatchState, rows: &[IngestFile]) -> IngestBatchProgress {
+        IngestBatchProgress {
+            batch_id: 1,
+            volume_identity: "uuid:X".into(),
+            label: "card".into(),
+            done: rows.len(),
+            total: rows.len(),
+            state,
+            tally: FileTally::from_rows(rows),
+        }
+    }
+
+    /// The reported card: all files failed, yet the header said "done".
+    #[test]
+    fn a_batch_where_every_file_failed_never_says_done() {
+        let rows: Vec<IngestFile> = (0..172)
+            .map(|n| {
+                file(
+                    &format!("DSC_{n:04}.NEF"),
+                    IngestFileState::Failed,
+                    Some("naming: rule rendered an empty name"),
+                )
+            })
+            .collect();
+        for state in [BatchState::Done, BatchState::Failed] {
+            let batch = progress(state, &rows);
+            assert_eq!(batch.summary(), "failed · 0 ingested · 172 failed");
+            assert_eq!(
+                batch.tally.first_error.as_deref(),
+                Some("naming: rule rendered an empty name")
+            );
+        }
+    }
+
+    #[test]
+    fn summaries_separate_ingested_duplicates_and_failures() {
+        let rows = [
+            file("a.NEF", IngestFileState::Cataloged, None),
+            file("b.NEF", IngestFileState::Duplicate, None),
+            file("c.NEF", IngestFileState::Failed, Some("copy: disk full")),
+            file("d.NEF", IngestFileState::Failed, Some("copy: other")),
+        ];
+        let done = progress(BatchState::Done, &rows);
+        assert_eq!(
+            done.summary(),
+            "done with failures · 1 ingested · 1 duplicates · 2 failed"
+        );
+        assert_eq!(done.tally.first_error.as_deref(), Some("copy: disk full"));
+        assert_eq!(
+            progress(BatchState::Running, &rows).summary(),
+            "ingesting 4/4 · 2 failed"
+        );
+        let clean = progress(
+            BatchState::Done,
+            &[file("a.NEF", IngestFileState::Cataloged, None)],
+        );
+        assert_eq!(clean.summary(), "done · 1 ingested");
     }
 }

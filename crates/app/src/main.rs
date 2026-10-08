@@ -7,9 +7,12 @@ use std::path::PathBuf;
 use std::sync::Arc;
 
 use edit_catalog::{Catalog, JobKind};
+use edit_ingest::{DEFAULT_DEST_RULE, DEFAULT_FILENAME_RULE};
 use gpui_kit::component::button::Button;
 use gpui_kit::component::input::InputState;
 use gpui_kit::component::label::Label;
+use gpui_kit::component::searchable_list::SearchableVec;
+use gpui_kit::component::select::SelectState;
 use gpui_kit::component::theme::{Theme, ThemeMode};
 use gpui_kit::component::{
     ActiveTheme as _, Disableable as _, IconName, Sizable as _, TitleBar, h_flex, v_flex,
@@ -279,16 +282,19 @@ fn main() {
             state.update(cx, |state, cx| state.resume_batches(&catalog, cx));
             let dest_dir = cx.new(|cx| {
                 InputState::new(window, cx)
-                    .placeholder("~/Photos")
-                    .default_value("~/Photos/{yyyy}/{mm}-{dd}")
+                    .placeholder(DEFAULT_DEST_RULE)
+                    .default_value(DEFAULT_DEST_RULE)
             });
             let file_rule = cx.new(|cx| {
                 InputState::new(window, cx)
-                    .placeholder("{session}_{seq:4}")
-                    .default_value("{session}_{seq:4}")
+                    .placeholder(DEFAULT_FILENAME_RULE)
+                    .default_value(DEFAULT_FILENAME_RULE)
             });
             let backup_dir =
                 cx.new(|cx| InputState::new(window, cx).placeholder("/mnt/backup (optional)"));
+            let template_select = cx.new(|cx| {
+                SelectState::new(SearchableVec::new(Vec::<String>::new()), None, window, cx)
+            });
             let dialog = cx.new(|_| {
                 IngestDialog::new(
                     state.clone(),
@@ -296,6 +302,7 @@ fn main() {
                     dest_dir,
                     file_rule,
                     backup_dir,
+                    template_select,
                 )
             });
             let templates = cx.new(|cx| {
