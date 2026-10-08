@@ -126,6 +126,7 @@ fn template_apply_recipe_writes_the_selection() {
             paths: vec![catalog.get_photo(*photo_id).unwrap().path],
             sequence: *sequence,
             captured_at: now_unix(),
+            session: None,
             fields_json: catalog.get_iptc_template(template_id).unwrap().fields_json,
             replacements: None,
         })

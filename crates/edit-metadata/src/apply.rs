@@ -56,6 +56,11 @@ pub struct MetadataWritePayload {
     /// apply batch, so a crash-resumed run expands like the original.
     #[serde(default)]
     pub captured_at: i64,
+    /// `{session}` override: an ingest names its session, which the
+    /// landed file's folder (a date rule, say) does not carry. `None`
+    /// keeps the folder-name default.
+    #[serde(default)]
+    pub session: Option<String>,
     /// The template row's `fields_json` verbatim.
     pub fields_json: String,
     /// Parsed code replacement file at apply time, so a crash-resumed job
@@ -202,7 +207,10 @@ pub fn run_metadata_write(
     let mut failed: Vec<String> = Vec::new();
     for (done, path_str) in payload.paths.iter().enumerate() {
         let path = Path::new(path_str);
-        let vars = vars_for(path, payload.sequence, now);
+        let mut vars = vars_for(path, payload.sequence, now);
+        if let Some(session) = &payload.session {
+            vars.session = session.clone();
+        }
         // Decision (metadata storage): XMP sidecar always for raws — the
         // raw container itself is never rewritten in place. Plain stills
         // keep Photo-Mechanic-style in-place IIM+XMP.
@@ -377,6 +385,39 @@ mod tests {
             .map(|(done, _)| done)
             .collect();
         assert_eq!(done, vec![1, 2], "one progress per path");
+    }
+
+    #[test]
+    fn run_metadata_write_uses_the_payload_session_over_the_folder_name() {
+        let fields = serde_json::json!({"credit": "{session}"});
+        let payload = serde_json::json!({
+            "item_id": 5,
+            "paths": ["/photo-scratch/10-07/A1.JPG"],
+            "sequence": 1,
+            "captured_at": 1_791_374_400,
+            "session": "Cup final",
+            "fields_json": fields.to_string(),
+        });
+        let captured = std::sync::Arc::new(std::sync::Mutex::new(Vec::<Vec<String>>::new()));
+        struct Cap(std::sync::Arc<std::sync::Mutex<Vec<Vec<String>>>>);
+        impl crate::Transport for Cap {
+            fn execute(&mut self, args: &[String]) -> crate::Result<String> {
+                self.0.lock().unwrap().push(args.to_vec());
+                Ok("    1 image files updated\n".into())
+            }
+        }
+        let writer = Writer::with_transport(Cap(std::sync::Arc::clone(&captured)));
+        let (tx, _rx) = flume::unbounded();
+        let job = ClaimedJob {
+            id: edit_catalog::JobId(14),
+            kind: edit_catalog::JobKind::MetadataWrite,
+            payload_json: payload.to_string(),
+            attempts: 1,
+        };
+        run_metadata_write(&job, &writer, &tx).unwrap();
+        let args = captured.lock().unwrap()[0].join(" ");
+        assert!(args.contains("-XMP-photoshop:Credit=Cup final"), "{args}");
+        assert!(!args.contains("Credit=10-07"), "{args}");
     }
 
     #[test]
