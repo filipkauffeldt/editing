@@ -9,6 +9,7 @@ pub mod code_replacements;
 pub mod crs;
 pub mod crs_keys;
 pub mod error;
+pub mod fields;
 pub mod persist;
 pub mod photo;
 pub mod template;
@@ -23,9 +24,10 @@ pub use crs::{
     tone_curve_points, write_sidecar,
 };
 pub use error::{Error, Result};
+pub use fields::{FIELDS, FieldSpec, Group, Kind};
 pub use persist::{PersistOutcome, persist_edit, persist_sidecar};
 pub use photo::{
     PhotoMetadata, read_exif, read_photo_metadata, read_xmp_file, read_xmp_sidecar_for,
 };
-pub use template::{TemplateFields, TemplateVars, expand, expand_with_codes};
+pub use template::{TemplateFields, TemplateVars, expand, expand_with_codes, xmp_only};
 pub use writer::{ProcessTransport, Transport, Writer};
