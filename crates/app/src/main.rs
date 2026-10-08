@@ -7,16 +7,19 @@ use std::path::PathBuf;
 use std::sync::Arc;
 
 use edit_catalog::{Catalog, JobKind};
+use gpui_kit::component::button::Button;
 use gpui_kit::component::input::InputState;
 use gpui_kit::component::theme::{Theme, ThemeMode};
-use gpui_kit::component::{ActiveTheme as _, TitleBar, v_flex};
+use gpui_kit::component::{
+    ActiveTheme as _, Disableable as _, IconName, Sizable as _, TitleBar, h_flex, v_flex,
+};
 use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::*;
 use ingest::{AppState, IngestDialog, OpenIngest, apply_ingest_event};
 use templates::{OpenTemplates, TemplateEditor};
 
 use app::ingest_job::handle_job;
-use app::views::Browser;
+use app::views::{Browser, OpenFolder};
 use edit_metadata::Writer;
 
 /// Worker threads draining the durable job queue.
@@ -96,6 +99,53 @@ impl BrowserShell {
     }
 }
 
+impl BrowserShell {
+    /// Window title bar with the app-level actions. The shell owns them
+    /// because ingest state lives here, not in the browser.
+    fn render_title_bar(&self, cx: &mut Context<Self>) -> impl IntoElement + use<> {
+        TitleBar::new().child(
+            h_flex()
+                .w_full()
+                .pr_2()
+                .items_center()
+                .justify_between()
+                .child("editing")
+                .child(
+                    h_flex()
+                        .gap_2()
+                        .child(
+                            Button::new("open-folder")
+                                .small()
+                                .icon(IconName::FolderOpen)
+                                .label("Open Folder")
+                                .tooltip("Open a folder (O)")
+                                .on_click(cx.listener(|this, _, _, cx| {
+                                    this.browser
+                                        .update(cx, |browser, cx| browser.prompt_open_folder(cx));
+                                })),
+                        )
+                        .child(
+                            Button::new("open-ingest")
+                                .small()
+                                .label("Ingest")
+                                .tooltip("Ingest from a card (I)")
+                                .on_click(cx.listener(|this, _, _, cx| {
+                                    this.state
+                                        .update(cx, |state, cx| state.set_ingest_open(true, cx));
+                                })),
+                        )
+                        .child(
+                            Button::new("finish-next")
+                                .small()
+                                .label("Finish & next")
+                                .tooltip("Coming later")
+                                .disabled(true),
+                        ),
+                ),
+        )
+    }
+}
+
 impl Focusable for BrowserShell {
     fn focus_handle(&self, _cx: &App) -> FocusHandle {
         self.focus_handle.clone()
@@ -104,6 +154,7 @@ impl Focusable for BrowserShell {
 
 impl Render for BrowserShell {
     fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        let title_bar = self.render_title_bar(cx);
         let (background, foreground) = (cx.theme().background, cx.theme().foreground);
         let dialog_open = self.state.read(cx).is_ingest_open();
         let dialog = self.dialog.clone();
@@ -115,7 +166,8 @@ impl Render for BrowserShell {
             .text_color(foreground)
             .key_context("Workspace")
             .track_focus(&self.focus_handle)
-            .child(self.browser.clone())
+            .child(title_bar)
+            .child(div().flex_1().min_h_0().child(self.browser.clone()))
             .when(dialog_open, |root| {
                 root.child(
                     div()
@@ -179,6 +231,7 @@ fn main() {
         cx.bind_keys([
             KeyBinding::new("i", OpenIngest, Some("Workspace && !Input")),
             KeyBinding::new("t", OpenTemplates, Some("Workspace && !Input")),
+            KeyBinding::new("o", OpenFolder, Some("Workspace && !Input")),
         ]);
 
         let window_options = TitleBar::window_options();
@@ -279,6 +332,11 @@ fn main() {
             }
         })
         .detach();
+
+        let open_folder_browser = shell.read(cx).browser.clone();
+        cx.on_action(move |_action: &OpenFolder, cx: &mut App| {
+            open_folder_browser.update(cx, |browser, cx| browser.prompt_open_folder(cx));
+        });
 
         let shortcuts_state = shell.read(cx).state.clone();
         cx.on_action(move |_action: &OpenTemplates, cx: &mut App| {

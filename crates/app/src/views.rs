@@ -18,6 +18,7 @@
 //! | Scroll | zoom (from fit it starts a free scale) |
 //! | Drag | pan while zoomed |
 //! | `0`–`5` | rating |
+//! | `O` | open a folder (native picker) |
 
 use std::cell::Cell;
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet, VecDeque};
@@ -30,8 +31,8 @@ use edit_catalog::{Catalog, JobEvent, JobEventKind, JobId, JobKind};
 use gpui_kit::component::button::{Button, ButtonVariants as _};
 use gpui_kit::component::label::Label;
 use gpui_kit::component::{
-    ActiveTheme as _, Disableable as _, IconName, Sizable as _, TitleBar, h_flex,
-    status_bar::StatusBar, v_flex,
+    ActiveTheme as _, Disableable as _, IconName, Sizable as _, h_flex, status_bar::StatusBar,
+    v_flex,
 };
 use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::*;
@@ -94,6 +95,7 @@ gpui_kit::actions!(
         ToggleView,
         FitView,
         HundredView,
+        OpenFolder,
         SelectAllItems,
         Rate0,
         Rate1,
@@ -329,6 +331,34 @@ impl Browser {
                     break;
                 }
             }
+        })
+        .detach();
+    }
+
+    /// Ask the platform for a folder (native picker) and open the choice.
+    /// A cancelled or failed picker leaves the current folder alone.
+    pub fn prompt_open_folder(&mut self, cx: &mut Context<Self>) {
+        let picked = cx.prompt_for_paths(PathPromptOptions {
+            files: false,
+            directories: true,
+            multiple: false,
+            prompt: Some("Open folder".into()),
+        });
+        cx.spawn(async move |this, cx| match picked.await {
+            Ok(Ok(Some(paths))) => {
+                if let Some(path) = paths.into_iter().next() {
+                    this.update(cx, |this, cx| this.open_folder(path, cx)).ok();
+                }
+            }
+            Ok(Ok(None)) => {}
+            Ok(Err(e)) => {
+                this.update(cx, |this, cx| {
+                    this.scan_status = format!("Folder picker failed: {e}");
+                    cx.notify();
+                })
+                .ok();
+            }
+            Err(_) => {}
         })
         .detach();
     }
@@ -1788,16 +1818,6 @@ impl Render for Browser {
         v_flex()
             .size_full()
             .child(
-                TitleBar::new().child(
-                    h_flex()
-                        .w_full()
-                        .pr_2()
-                        .justify_between()
-                        .child("editing — browse (M1)")
-                        .child("[Open Folder] [Ingest] [Finish & next ▾]"),
-                ),
-            )
-            .child(
                 div()
                     .id("browser-root")
                     .track_focus(&self.focus)
@@ -1865,7 +1885,7 @@ impl Render for Browser {
                         format!("{} · {}", self.template_status, self.scan_status)
                     })
                     .right(format!(
-                        "{} shown · G grid/single · Z fit · ⇧Z 100% · T templates",
+                        "{} shown · O open folder · I ingest · G grid/single · Z fit · ⇧Z 100% · T templates",
                         self.rows.len()
                     )),
             )
