@@ -9,6 +9,7 @@ use std::sync::Arc;
 use edit_catalog::{Catalog, JobKind};
 use gpui_kit::component::button::Button;
 use gpui_kit::component::input::InputState;
+use gpui_kit::component::label::Label;
 use gpui_kit::component::theme::{Theme, ThemeMode};
 use gpui_kit::component::{
     ActiveTheme as _, Disableable as _, IconName, Sizable as _, TitleBar, h_flex, v_flex,
@@ -89,6 +90,8 @@ impl BrowserShell {
         templates: Entity<TemplateEditor>,
         cx: &mut Context<Self>,
     ) -> Self {
+        // The title bar shows the open folder, which the browser owns.
+        cx.observe(&browser, |_, _, cx| cx.notify()).detach();
         Self {
             browser,
             state,
@@ -103,13 +106,20 @@ impl BrowserShell {
     /// Window title bar with the app-level actions. The shell owns them
     /// because ingest state lives here, not in the browser.
     fn render_title_bar(&self, cx: &mut Context<Self>) -> impl IntoElement + use<> {
+        let muted = cx.theme().muted_foreground;
+        let folder_name = self.browser.read(cx).folder_name();
         TitleBar::new().child(
             h_flex()
                 .w_full()
                 .pr_2()
                 .items_center()
                 .justify_between()
-                .child("editing")
+                .child(
+                    h_flex()
+                        .gap_2()
+                        .child(Label::new("Editing").text_sm())
+                        .child(Label::new(folder_name).text_sm().text_color(muted)),
+                )
                 .child(
                     h_flex()
                         .gap_2()

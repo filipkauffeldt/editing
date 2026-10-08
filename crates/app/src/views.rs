@@ -256,9 +256,9 @@ impl Browser {
             current: 0,
             mode: Mode::Grid,
             zoom: ZoomState::default(),
-            root_label: "No folder open".to_string(),
+            root_label: String::new(),
             root_id: None,
-            scan_status: "Ready".to_string(),
+            scan_status: String::new(),
             rows: Arc::new(Vec::new()),
             thumbs: HashMap::new(),
             thumb_order: VecDeque::new(),
@@ -275,7 +275,7 @@ impl Browser {
             develop_image: None,
             develop_image_item: None,
             develop_dirty: false,
-            develop_status: "Ready".to_string(),
+            develop_status: String::new(),
             renderer,
             scan_jobs: Vec::new(),
             template_status: String::new(),
@@ -285,6 +285,15 @@ impl Browser {
         };
         cx.on_app_quit(|this, cx| this.flush_for_quit(cx)).detach();
         browser
+    }
+
+    /// Name of the open folder (its last path component), empty before one
+    /// is opened.
+    pub fn folder_name(&self) -> String {
+        Path::new(&self.root_label)
+            .file_name()
+            .map(|name| name.to_string_lossy().into_owned())
+            .unwrap_or_else(|| self.root_label.clone())
     }
 
     /// The handle the browse key bindings hang off. Focus has to sit on it
@@ -354,7 +363,7 @@ impl Browser {
             Ok(Ok(None)) => {}
             Ok(Err(e)) => {
                 this.update(cx, |this, cx| {
-                    this.scan_status = format!("Folder picker failed: {e}");
+                    this.scan_status = format!("Could not open the folder picker: {e}");
                     cx.notify();
                 })
                 .ok();
@@ -386,12 +395,12 @@ impl Browser {
             Ok(id) => {
                 self.scan_jobs.push(id);
                 self.root_label = label.clone();
-                self.scan_status = format!("Scan queued: {label}");
+                self.scan_status = format!("Scanning {label}");
                 // The root row may already exist from an earlier open.
                 self.resolve_scan_root(id);
                 self.refresh_items();
             }
-            Err(e) => self.scan_status = format!("Scan failed to queue: {e}"),
+            Err(e) => self.scan_status = format!("Could not start the scan: {e}"),
         }
         cx.notify();
     }
@@ -635,7 +644,7 @@ impl Browser {
             JobEventKind::Started { .. } => {
                 if self.scan_jobs.contains(&event.id) {
                     self.resolve_scan_root(event.id);
-                    self.scan_status = "Scanning folder…".to_string();
+                    self.scan_status = "Scanning…".to_string();
                 } else if let Some(path) = self.thumb_path_for(event.id) {
                     self.mark_thumb(&path, ThumbState::Running);
                 } else if let Some(item_id) = self.meta_item_id(event.id) {
@@ -648,7 +657,7 @@ impl Browser {
             JobEventKind::Progress { done, total } => {
                 if self.scan_jobs.contains(&event.id) {
                     self.resolve_scan_root(event.id);
-                    self.scan_status = format!("Scanning: {done}/{total}");
+                    self.scan_status = format!("Scanning {done} of {total}");
                     self.refresh_items();
                 } else if self.meta_jobs.contains_key(&event.id) {
                     self.template_status = format!("Writing template metadata: {done}/{total}");
@@ -657,7 +666,7 @@ impl Browser {
             JobEventKind::Succeeded => {
                 if self.scan_jobs.contains(&event.id) {
                     self.resolve_scan_root(event.id);
-                    self.scan_status = "Scan complete".to_string();
+                    self.scan_status.clear();
                     self.refresh_items();
                 } else if let Some(path) = self.thumb_jobs.remove(&event.id) {
                     self.mark_thumb(&path, ThumbState::Ready);
@@ -773,7 +782,7 @@ impl Browser {
         self.prewarm_token.cancel();
         self.prewarm_token = CancelToken::new();
         if self.unsaved.is_empty() {
-            self.develop_status = "Ready".to_string();
+            self.develop_status.clear();
         }
     }
 
@@ -915,7 +924,7 @@ impl Browser {
                     self.develop.load_edit(item_id, buffer);
                     self.develop_dirty = false;
                 }
-                self.develop_status = "Ready".to_string();
+                self.develop_status.clear();
                 self.request_render(
                     RenderSize::Proxy(PROXY_DRAG_LONG_EDGE),
                     Some(RenderSize::Proxy(PROXY_RELEASE_LONG_EDGE)),
@@ -952,14 +961,10 @@ impl Browser {
             .text_color(fg)
             .border_l_1()
             .border_color(border)
-            .child(Label::new("Develop").text_sm())
-            .child(
-                Label::new("Presets land in D2.")
-                    .text_xs()
-                    .text_color(muted),
-            )
             .children(self.render_develop_rows(cx))
-            .child(Label::new(status).text_xs().text_color(muted))
+            .when(!status.is_empty(), |panel| {
+                panel.child(Label::new(status).text_xs().text_color(muted))
+            })
     }
 
     /// One block per slider: name, live value readout, a reset button, then
@@ -1370,45 +1375,31 @@ impl Browser {
         let theme = cx.theme();
         let (muted, border) = (theme.muted_foreground, theme.border);
         let count = self.rows.len();
-        let status = self.scan_status.clone();
-        let root = self.root_label.clone();
-        let mode_label = match self.mode {
-            Mode::Grid => "Grid (G for single)",
-            Mode::Single => "Single (G for grid)",
-        };
         h_flex()
-            .gap_2()
+            .gap_3()
             .items_center()
             .px_2()
             .py_1()
             .border_b_1()
             .border_color(border)
-            .child(div().text_sm().child(format!("Session: {root}")))
             .child(
-                div()
-                    .text_sm()
-                    .text_color(muted)
-                    .child(format!("{count} items")),
+                Label::new(format!(
+                    "{count} {}",
+                    if count == 1 { "photo" } else { "photos" }
+                ))
+                .text_sm(),
             )
             .child(
-                div()
+                Label::new(format!("Sorted by {}", self.sort_label()))
                     .text_sm()
-                    .text_color(muted)
-                    .child(format!("Sort: {}", self.sort_label())),
+                    .text_color(muted),
             )
-            .child(
-                div()
-                    .text_sm()
-                    .text_color(muted)
-                    .child(mode_label.to_string()),
-            )
-            .child(div().text_sm().text_color(muted).child(status))
     }
 
     fn sort_label(&self) -> &'static str {
         match self.sort {
             SortOrder::IngestOrder => "ingest order",
-            SortOrder::FileName => "filename",
+            SortOrder::FileName => "file name",
         }
     }
 
@@ -1589,7 +1580,7 @@ impl Browser {
     fn render_single(&mut self, cx: &mut Context<Self>) -> impl IntoElement {
         let item = self.current_item();
         let zoom_label = match self.zoom.mode {
-            ZoomMode::Fit => "fit".to_string(),
+            ZoomMode::Fit => "Fit".to_string(),
             ZoomMode::Hundred => "100%".to_string(),
             ZoomMode::Scale(s) => format!("{:.0}%", s * 100.0),
         };
@@ -1615,16 +1606,18 @@ impl Browser {
         let fit_cell = Rc::clone(&self.fit_scale);
         let title = item
             .as_ref()
-            .map(|row| row.label())
-            .unwrap_or_else(|| "No item".to_string());
+            .map(|row| row.base_name.clone())
+            .unwrap_or_default();
+        let muted = cx.theme().muted_foreground;
         v_flex()
             .size_full()
             .child(
-                div()
+                h_flex()
                     .px_2()
                     .py_1()
-                    .text_sm()
-                    .child(format!("{title} · {zoom_label}")),
+                    .gap_2()
+                    .child(Label::new(title).text_sm())
+                    .child(Label::new(zoom_label).text_sm().text_color(muted)),
             )
             .child(
                 div()
@@ -1813,7 +1806,7 @@ impl Browser {
                 row.rating,
                 Self::meta_text(row.meta),
             ),
-            None => ("—".to_string(), String::new(), 0, String::new()),
+            None => (String::new(), String::new(), 0, String::new()),
         };
         v_flex()
             .w(px(220.0))
@@ -1825,28 +1818,28 @@ impl Browser {
             .text_color(panel_fg)
             .border_r_1()
             .border_color(panel_border)
-            .child(div().text_sm().child("Metadata".to_string()))
-            .child(div().text_xs().child(format!("File: {title}")))
-            .child(div().text_xs().child(format!("Dir: {dir}")))
-            .child(div().text_xs().child(format!("Rating: {rating}/5")))
-            .when(!meta_state.is_empty(), |panel| {
-                panel.child(div().text_xs().text_color(warning).child(meta_state))
-            })
+            .child(Label::new(title).text_sm())
+            .child(Label::new(dir).text_xs().text_color(muted))
             .child(
-                div()
-                    .text_xs()
-                    .text_color(muted)
-                    .child("T — open the IPTC template editor.".to_string()),
+                Label::new(if rating > 0 {
+                    "★".repeat(rating.clamp(0, 5) as usize)
+                } else {
+                    "Not rated".to_string()
+                })
+                .text_xs(),
             )
+            .when(!meta_state.is_empty(), |panel| {
+                panel.child(Label::new(meta_state).text_xs().text_color(warning))
+            })
     }
 
     fn meta_text(meta: MetaBadge) -> String {
         match meta {
             MetaBadge::None => String::new(),
-            MetaBadge::Queued => "Template: queued".to_string(),
-            MetaBadge::Writing => "Template: writing…".to_string(),
-            MetaBadge::Done => "Template: applied".to_string(),
-            MetaBadge::Failed => "Template: failed".to_string(),
+            MetaBadge::Queued => "Template queued".to_string(),
+            MetaBadge::Writing => "Writing template…".to_string(),
+            MetaBadge::Done => "Template applied".to_string(),
+            MetaBadge::Failed => "Template failed".to_string(),
         }
     }
 }
@@ -1927,15 +1920,12 @@ impl Render for Browser {
             )
             .child(
                 StatusBar::new()
-                    .left(if self.template_status.is_empty() {
-                        self.scan_status.clone()
-                    } else {
-                        format!("{} · {}", self.template_status, self.scan_status)
+                    .left(match (self.template_status.is_empty(), self.scan_status.is_empty()) {
+                        (true, _) => self.scan_status.clone(),
+                        (false, true) => self.template_status.clone(),
+                        (false, false) => format!("{}; {}", self.template_status, self.scan_status),
                     })
-                    .right(format!(
-                        "{} shown · O open folder · I ingest · G grid/single · Z fit · ⇧Z 100% · T templates",
-                        self.rows.len()
-                    )),
+                    .right("O open folder, I ingest, G grid or single, Z fit, Shift Z 100%, T templates"),
             )
     }
 }
