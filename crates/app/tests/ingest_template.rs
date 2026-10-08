@@ -89,11 +89,12 @@ impl Card {
                 volume_label: Some("NIKON Z 6"),
                 source_root: &self.card,
                 dest_rule: &rule,
-                filename_rule: "",
+                filename_rule: "{session}_{seq:4}",
                 backup_dir: "",
                 session: "Cup final",
                 template: Some(&template),
                 replacements: None,
+                only_sources: None,
             },
         )
         .unwrap()

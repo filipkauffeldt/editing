@@ -69,6 +69,7 @@ fn photos_appear_one_by_one_while_the_ingest_runs(cx: &mut gpui_kit::TestAppCont
             session: "shoot",
             template: None,
             replacements: None,
+            only_sources: None,
         },
     )
     .unwrap();
@@ -171,6 +172,7 @@ fn an_ingest_switches_the_sheet_once_and_does_not_fight_the_user(
             session: "shoot",
             template: None,
             replacements: None,
+            only_sources: None,
         },
     )
     .unwrap();
@@ -282,6 +284,7 @@ fn the_sheet_counts_every_stamped_photo_after_a_live_ingest(cx: &mut gpui_kit::T
             session: "shoot",
             template: Some(&template),
             replacements: None,
+            only_sources: None,
         },
     )
     .unwrap();

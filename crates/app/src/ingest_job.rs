@@ -49,6 +49,8 @@ pub struct IngestStart<'a> {
     pub template: Option<&'a IptcTemplate>,
     /// Frozen with the template; applied when the stamp expands.
     pub replacements: Option<&'a CodeReplacements>,
+    /// Copy only these source paths (the tagged files); `None` copies all.
+    pub only_sources: Option<&'a [String]>,
 }
 
 /// A queued ingest: the batch row and its `ingest_copy` job.
@@ -84,6 +86,7 @@ pub fn start_ingest(catalog: &Catalog, start: &IngestStart<'_>) -> Result<Starte
             id: template.id,
             fields_json: &template.fields_json,
         }),
+        only_sources: start.only_sources,
     })
     .map_err(|e| format!("Bad naming rule: {e}"))?;
     let batch_id = catalog
@@ -266,6 +269,7 @@ mod tests {
             start_seq: 1,
             iptc_fields_json: None,
             iptc_replacements_json: None,
+            only_sources: None,
         };
         let job = ClaimedJob {
             id: JobId(1),
@@ -337,6 +341,7 @@ mod tests {
             start_seq: 1,
             iptc_fields_json: Some(r#"{"credit":"{session}"}"#.into()),
             iptc_replacements_json: None,
+            only_sources: None,
         };
         let job = ClaimedJob {
             id: JobId(1),
@@ -393,6 +398,7 @@ mod tests {
             session: "NIKON Z 6",
             template: None,
             replacements: None,
+            only_sources: None,
         }
     }
 
@@ -429,14 +435,7 @@ mod tests {
             .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
             .collect();
         names.sort();
-        assert_eq!(
-            names,
-            [
-                "NIKON Z 6_0001.JPG",
-                "NIKON Z 6_0001.NEF",
-                "NIKON Z 6_0002.NEF"
-            ]
-        );
+        assert_eq!(names, ["DSC_0001.JPG", "DSC_0001.NEF", "DSC_0002.NEF"]);
         std::fs::remove_dir_all(&base).ok();
     }
 

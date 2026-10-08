@@ -630,6 +630,7 @@ impl IngestDialog {
                 session: &session,
                 template: template.as_ref(),
                 replacements: replacements.as_ref(),
+                only_sources: None,
             },
         );
         match started {
