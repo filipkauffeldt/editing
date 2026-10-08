@@ -223,8 +223,10 @@ fn main() {
         })
         .expect("Failed to open window");
 
-        // Keyboard shortcut target: focus the shell so `i` dispatches.
-        let focus_handle = shell.read(cx).focus_handle.clone();
+        // Focus the browse view: its arrow/G/Z/rating handlers only run on
+        // the focused element and its ancestors, while the shell above it
+        // still supplies the `Workspace` context for `i`/`t`/`o`.
+        let focus_handle = shell.read(cx).browser.read(cx).focus_handle();
         let _ = window_handle.update(cx, |_view, window, cx| {
             window.focus(&focus_handle, cx);
         });

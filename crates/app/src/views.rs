@@ -278,6 +278,13 @@ impl Browser {
         browser
     }
 
+    /// The handle the browse key bindings hang off. Focus has to sit on it
+    /// (or below it): actions only reach handlers on the focused element and
+    /// its ancestors.
+    pub fn focus_handle(&self) -> FocusHandle {
+        self.focus.clone()
+    }
+
     /// Catalog root currently shown, if a scan has landed one.
     pub fn root_id(&self) -> Option<i64> {
         self.root_id
