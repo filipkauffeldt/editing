@@ -38,8 +38,8 @@ use crate::browse::{
 };
 use crate::develop::{DevelopSession, RenderQueue, SidecarQueue, SliderId};
 use crate::preview::BrowsePreviewProvider;
-use edit_metadata::{MetadataWritePayload, TemplateFields};
 use edit_core::{CancelToken, DevelopSettings, RenderSize};
+use edit_metadata::{MetadataWritePayload, TemplateFields};
 use edit_render::{PROXY_DRAG_LONG_EDGE, PROXY_RELEASE_LONG_EDGE, RenderService};
 use gpui_kit::component::slider::{
     Slider as DevelopSliderElement, SliderEvent, SliderState, SliderValue,
