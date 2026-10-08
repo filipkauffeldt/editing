@@ -651,17 +651,26 @@ fn recover(
     )
 }
 
-/// Resolve the stable destination root (`static_prefix`, tilde-expanded and
-/// canonicalized) so the catalog root row matches how browse canonicalizes.
+/// The destination root of a folder rule: its `static_prefix`, tilde-expanded
+/// and canonicalized when it exists. This is the path of the catalog root row
+/// the ingest fills, so the contact sheet can open it while files land.
+pub fn dest_root_path(template: &str) -> PathBuf {
+    let mut root = expand_tilde(&static_prefix(template));
+    if root.as_os_str().is_empty() {
+        root = std::env::current_dir().unwrap_or_default();
+    }
+    root.canonicalize().unwrap_or(root)
+}
+
+/// Create the destination root and resolve it as [`dest_root_path`] does, so
+/// the catalog root row matches how browse canonicalizes.
 fn resolve_dest_root(template: &str) -> Result<String, IngestError> {
-    let prefix = static_prefix(template);
-    let mut root = expand_tilde(&prefix);
+    let mut root = expand_tilde(&static_prefix(template));
     if root.as_os_str().is_empty() {
         root = std::env::current_dir()?;
     }
     fs::create_dir_all(&root)?;
-    let canonical = root.canonicalize().unwrap_or(root);
-    Ok(canonical.to_string_lossy().into_owned())
+    Ok(dest_root_path(template).to_string_lossy().into_owned())
 }
 
 /// What [`catalog_photo`] resolved for one landed file.
@@ -1308,6 +1317,35 @@ mod tests {
         assert_eq!(
             names,
             ["shoot_0001.JPG", "shoot_0001.NEF", "shoot_0002.NEF"]
+        );
+        fs::remove_dir_all(&base).ok();
+        fs::remove_dir_all(&card).ok();
+    }
+
+    #[test]
+    fn the_dest_root_path_is_the_catalog_root_the_ingest_fills() {
+        let card = card_with(&[("DSC0001.JPG", b"one")]);
+        let base = scratch("dest-root");
+        let dest = base.join("Photos");
+        let rule = dest.join("{yyyy}/{mm}").to_string_lossy().into_owned();
+        let catalog = Catalog::open(&base.join("catalog.sqlite")).unwrap();
+        // Not created yet: the helper must not create it.
+        assert!(!dest.exists());
+        let before = dest_root_path(&rule);
+        assert!(!dest.exists());
+
+        let batch = new_batch(&catalog, &dest, None);
+        let mut p = payload(batch, &card, &dest, None);
+        p.dest_dir_template = rule.clone();
+        run_ingest_copy(&catalog, &p, fixed_metadata, &|_, _| {}).unwrap();
+        let after = dest_root_path(&rule);
+        assert_eq!(after, dest.canonicalize().unwrap());
+        assert_eq!(before, dest, "uncanonicalized while it does not exist");
+        assert!(
+            catalog
+                .get_root_by_path(&after.to_string_lossy())
+                .unwrap()
+                .is_some()
         );
         fs::remove_dir_all(&base).ok();
         fs::remove_dir_all(&card).ok();

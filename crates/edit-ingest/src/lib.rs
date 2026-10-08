@@ -27,7 +27,7 @@ pub use copy::{
 pub use ingest::{
     CardFile, FileMetadata, FollowUpJob, IngestCopyPayload, IngestError, IngestPlan,
     IngestPlanRequest, IngestSummary, IngestTemplate, LandedPhoto, batch_volume_identity,
-    enumerate_card, plan_card, plan_ingest, run_ingest_copy, run_ingest_copy_with,
+    dest_root_path, enumerate_card, plan_card, plan_ingest, run_ingest_copy, run_ingest_copy_with,
 };
 pub use naming::{
     DEFAULT_DEST_RULE, DEFAULT_FILENAME_RULE, NamingContext, NamingError, expand_tilde, render_dir,
