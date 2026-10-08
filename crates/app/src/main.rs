@@ -1,4 +1,5 @@
 mod ingest;
+mod templates;
 
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -9,10 +10,12 @@ use gpui_kit::component::{TitleBar, v_flex};
 use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::*;
 use ingest::{AppState, IngestDialog, OpenIngest, apply_ingest_event};
+use templates::{OpenTemplates, TemplateEditor};
 
 use app::browse::CatalogScanPayload;
 use app::ingest_job::handle_job;
 use app::views::Browser;
+use edit_metadata::Writer;
 
 /// Worker threads draining the durable job queue.
 ///
@@ -42,6 +45,7 @@ struct BrowserShell {
     browser: Entity<Browser>,
     state: Entity<AppState>,
     dialog: Entity<IngestDialog>,
+    templates: Entity<TemplateEditor>,
     focus_handle: FocusHandle,
 }
 
@@ -50,12 +54,14 @@ impl BrowserShell {
         browser: Entity<Browser>,
         state: Entity<AppState>,
         dialog: Entity<IngestDialog>,
+        templates: Entity<TemplateEditor>,
         cx: &mut Context<Self>,
     ) -> Self {
         Self {
             browser,
             state,
             dialog,
+            templates,
             focus_handle: cx.focus_handle(),
         }
     }
@@ -71,6 +77,8 @@ impl Render for BrowserShell {
     fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let dialog_open = self.state.read(cx).is_ingest_open();
         let dialog = self.dialog.clone();
+        let templates_open = self.state.read(cx).is_templates_open();
+        let templates = self.templates.clone();
         v_flex()
             .size_full()
             .key_context("Workspace")
@@ -84,6 +92,14 @@ impl Render for BrowserShell {
                         .child(div().w(px(600.0)).mx_auto().mt_16().child(dialog)),
                 )
             })
+            .when(templates_open, |root| {
+                root.child(
+                    div()
+                        .absolute()
+                        .inset_0()
+                        .child(div().w(px(760.0)).mx_auto().mt_8().child(templates)),
+                )
+            })
     }
 }
 
@@ -92,8 +108,17 @@ fn main() {
     catalog.recover_running().expect("recover running jobs");
 
     let worker_catalog = Arc::clone(&catalog);
-    let handler: edit_catalog::JobHandler =
-        Arc::new(move |job, tx| handle_job(worker_catalog.clone(), job, tx));
+    // The resident exiftool writer lives once for the process; job grain
+    // serializes through the transport mutex. Missing binary: template
+    // jobs report the failure on their durable rows (degrade gracefully).
+    let writer = Writer::find_binary().and_then(|bin| Writer::resident(&bin).ok());
+    let handler: edit_catalog::JobHandler = Arc::new(move |job, tx| match job.kind {
+        JobKind::MetadataWrite => match &writer {
+            Some(writer) => edit_metadata::run_metadata_write(job, writer, tx),
+            None => Err("exiftool unavailable (install libimage-exiftool-perl)".into()),
+        },
+        _ => handle_job(worker_catalog.clone(), job, tx),
+    });
     let pool =
         edit_catalog::spawn_workers(&catalog, WORKER_THREADS, handler).expect("spawn workers");
     let events = pool.events().clone();
@@ -110,13 +135,12 @@ fn main() {
         gpui_kit::init(cx);
 
         // Keyboard shortcut target: focus lands in browse views too, so the
-        // ingest shortcut is gated on `Workspace && !Input` to leave typing
-        // in the dialog inputs alone.
-        cx.bind_keys([KeyBinding::new(
-            "i",
-            OpenIngest,
-            Some("Workspace && !Input"),
-        )]);
+        // ingest / template shortcuts are gated on `Workspace && !Input` to
+        // leave typing in the dialog inputs alone.
+        cx.bind_keys([
+            KeyBinding::new("i", OpenIngest, Some("Workspace && !Input")),
+            KeyBinding::new("t", OpenTemplates, Some("Workspace && !Input")),
+        ]);
 
         if let Some(folder) = pending_folder.clone() {
             let payload = serde_json::to_string(&CatalogScanPayload {
@@ -155,7 +179,16 @@ fn main() {
                     backup_dir,
                 )
             });
-            cx.new(|cx| BrowserShell::new(browser, state, dialog, cx))
+            let templates = cx.new(|cx| {
+                TemplateEditor::new(
+                    state.clone(),
+                    browser.clone(),
+                    Arc::clone(&catalog),
+                    window,
+                    cx,
+                )
+            });
+            cx.new(|cx| BrowserShell::new(browser, state.clone(), dialog, templates, cx))
         })
         .expect("Failed to open window");
 
@@ -198,6 +231,13 @@ fn main() {
             }
         })
         .detach();
+
+        let shortcuts_state = shell.read(cx).state.clone();
+        cx.on_action(move |_action: &OpenTemplates, cx: &mut App| {
+            shortcuts_state.update(cx, |state, cx| {
+                state.set_templates_open(true, cx);
+            });
+        });
 
         // Volume detection: blocking poll + udev hotplug on a worker thread,
         // snapshots drained on the GPUI executor so the dialog refreshes on

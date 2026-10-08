@@ -204,15 +204,27 @@ pub fn pair_entries(entries: Vec<FileEntry>) -> Vec<PairGroup> {
 
 // ---- browse item snapshot (what the views render) ----
 
-/// Upload badge states (plan section 2.2). B1 never writes transfers, so the
-/// scan path leaves this at `None`; later stages fill it from the transfers
-/// store per item.
+/// Per-photo upload badge states (plan section 2.2). C3 writes metadata
+/// jobs, not transfers; the scan path leaves both at `None`.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub enum UploadBadge {
     #[default]
     None,
     Queued,
     Uploading,
+    Done,
+    Failed,
+}
+
+/// Per-item IPTC template apply state (plan sections 2.1, 2.7): the
+/// status strip's "template changes" marker, rendered on cells like the
+/// upload badge. `metadata_write` jobs (plan section 1.2) drive it.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub enum MetaBadge {
+    #[default]
+    None,
+    Queued,
+    Writing,
     Done,
     Failed,
 }
@@ -239,6 +251,7 @@ pub struct BrowseItem {
     pub rating: i64,
     pub thumb: ThumbState,
     pub upload: UploadBadge,
+    pub meta: MetaBadge,
     pub ingest_fresh: bool,
 }
 
@@ -720,6 +733,7 @@ pub fn list_browse_items(
             rating,
             thumb: ThumbState::Queued,
             upload: UploadBadge::None,
+            meta: MetaBadge::None,
             ingest_fresh: false,
         });
     }
@@ -727,19 +741,95 @@ pub fn list_browse_items(
     Ok(items)
 }
 
+/// Filesystem paths of every photo side of one item (plan section 1.3:
+/// "A paired RAW+JPEG item stamps both files"). Falls back to the display
+/// path for an item row the catalog has not paired yet (item_id -1).
+pub fn item_photo_paths(catalog: &edit_catalog::Catalog, item: &BrowseItem) -> Vec<String> {
+    if item.item_id >= 0
+        && let Ok(item_row) = catalog.get_item(item.item_id)
+    {
+        let sides = [item_row.raw_photo_id, item_row.jpeg_photo_id];
+        let paths: Vec<String> = sides
+            .into_iter()
+            .flatten()
+            .filter_map(|photo_id| catalog.get_photo(photo_id).ok().map(|photo| photo.path))
+            .collect();
+        if !paths.is_empty() {
+            return paths;
+        }
+    }
+    vec![item.display_path.clone()]
+}
+
+// ---- template apply plan (pure, testable) ----
+
+/// One `metadata_write` job the apply step enqueues. Built from the
+/// selection without any UI state (plan section 2.7), so the sequence
+/// numbers and per-item paths are unit-testable.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct TemplateApplyPlan {
+    pub item_id: i64,
+    /// Every photo side of the pair (raw + jpeg when paired).
+    pub paths: Vec<String>,
+    /// 1-based, over the enqueueable items in display order.
+    pub sequence: u64,
+}
+
+/// Plan a template apply over a selection. An item without a catalog row
+/// (the transient `item_id < 0` cells) is skipped: it has no durable
+/// identity for badges or resumed queue state, so stamping it would
+/// collapse the per-item state of every not-yet-matched display row.
+pub fn plan_template_apply(
+    selection: &[BrowseItem],
+    catalog: &edit_catalog::Catalog,
+) -> Vec<TemplateApplyPlan> {
+    selection
+        .iter()
+        .filter(|item| item.item_id >= 0)
+        .zip(1u64..)
+        .map(|(item, sequence)| TemplateApplyPlan {
+            item_id: item.item_id,
+            paths: item_photo_paths(catalog, item),
+            sequence,
+        })
+        .collect()
+}
+
+/// `metadata_write` payload JSON for each planned step. `captured_at` is
+/// stamped once for the whole batch, so the `{date}` fallback is one value
+/// that a crash-resumed job reproduces from its durable payload.
+pub fn template_apply_payloads(
+    plan: &[TemplateApplyPlan],
+    fields_json: &str,
+    captured_at: i64,
+) -> Vec<String> {
+    plan.iter()
+        .map(|step| {
+            serde_json::to_string(&edit_metadata::MetadataWritePayload {
+                item_id: step.item_id,
+                paths: step.paths.clone(),
+                sequence: step.sequence,
+                captured_at,
+                fields_json: fields_json.to_owned(),
+            })
+            .unwrap_or_else(|_| "{}".to_string())
+        })
+        .collect()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use std::io::Write;
 
-    fn scratch_dir(name: &str) -> PathBuf {
+    pub(crate) fn scratch_dir(name: &str) -> PathBuf {
         let dir =
             std::env::temp_dir().join(format!("edit-browse-test-{}-{}", std::process::id(), name));
         std::fs::create_dir_all(&dir).unwrap();
         dir
     }
 
-    fn touch(dir: &Path, name: &str) -> PathBuf {
+    pub(crate) fn touch(dir: &Path, name: &str) -> PathBuf {
         let path = dir.join(name);
         if let Some(parent) = path.parent() {
             std::fs::create_dir_all(parent).unwrap();
@@ -748,7 +838,7 @@ mod tests {
         path
     }
 
-    fn tiny_jpeg(dir: &Path, name: &str) -> PathBuf {
+    pub(crate) fn tiny_jpeg(dir: &Path, name: &str) -> PathBuf {
         let path = dir.join(name);
         let img = image::RgbImage::from_pixel(4, 4, image::Rgb([200, 40, 40]));
         let mut bytes = Vec::new();
@@ -954,6 +1044,7 @@ mod tests {
                 has_jpeg: false,
                 rating: 5,
                 thumb: ThumbState::Ready,
+                meta: MetaBadge::None,
                 upload: UploadBadge::None,
                 ingest_fresh: false,
             },
@@ -966,6 +1057,7 @@ mod tests {
                 has_jpeg: true,
                 rating: 1,
                 thumb: ThumbState::Queued,
+                meta: MetaBadge::None,
                 upload: UploadBadge::None,
                 ingest_fresh: true,
             },
@@ -978,6 +1070,7 @@ mod tests {
                 has_jpeg: true,
                 rating: 3,
                 thumb: ThumbState::Running,
+                meta: MetaBadge::None,
                 upload: UploadBadge::Queued,
                 ingest_fresh: false,
             },
@@ -1094,6 +1187,101 @@ mod tests {
         let text = String::from_utf8(w).unwrap();
         assert!(text.contains("WALK_A"));
         assert!(text.contains("WALK_B"));
+        std::fs::remove_dir_all(&dir).ok();
+    }
+}
+
+#[cfg(test)]
+mod meta_paths_tests {
+    use super::tests::{scratch_dir, tiny_jpeg, touch};
+    use super::*;
+
+    #[test]
+    fn item_photo_paths_covers_both_sides_of_a_pair() {
+        let dir = scratch_dir("item-paths");
+        touch(&dir, "P.NEF");
+        touch(&dir, "p.JPG");
+        let db_path = dir.join("catalog.sqlite");
+        let catalog = edit_catalog::Catalog::open(&db_path).unwrap();
+        let summary = run_catalog_scan(&catalog, &dir, &|_, _| {}).unwrap();
+        let items = list_browse_items(&catalog, summary.root_id).unwrap();
+        assert_eq!(items.len(), 1);
+        let paths = item_photo_paths(&catalog, &items[0]);
+        assert_eq!(paths.len(), 2, "pair is stamped on both files: {paths:?}");
+        // And an unpaired display row still has at least one path.
+        let lone = BrowseItem {
+            item_id: -1,
+            dir: dir.to_string_lossy().into(),
+            base_name: "Q".into(),
+            display_path: "/missing/Q.JPG".into(),
+            has_raw: true,
+            has_jpeg: true,
+            rating: 0,
+            thumb: ThumbState::Queued,
+            upload: UploadBadge::None,
+            meta: MetaBadge::None,
+            ingest_fresh: false,
+        };
+        assert_eq!(item_photo_paths(&catalog, &lone), vec!["/missing/Q.JPG"]);
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn plan_skips_unmatched_and_numbers_the_rest() {
+        let dir = scratch_dir("apply-plan");
+        touch(&dir, "A.NEF");
+        touch(&dir, "a.JPG");
+        tiny_jpeg(&dir, "B.JPG");
+        let db_path = dir.join("plan.sqlite");
+        let catalog = edit_catalog::Catalog::open(&db_path).unwrap();
+        let summary = run_catalog_scan(&catalog, &dir, &|_, _| {}).unwrap();
+        let items = list_browse_items(&catalog, summary.root_id).unwrap();
+        assert_eq!(items.len(), 2);
+        // A display row the catalog never matched (item_id -1) is planned
+        // out, and the sequence numbers stay 1..N over the rest.
+        let mut with_ghost = items.clone();
+        with_ghost.push(BrowseItem {
+            item_id: -1,
+            dir: "/ghost".into(),
+            base_name: "GHOST".into(),
+            display_path: "/ghost/G.JPG".into(),
+            has_raw: true,
+            has_jpeg: false,
+            rating: 0,
+            thumb: ThumbState::Queued,
+            upload: UploadBadge::None,
+            meta: MetaBadge::None,
+            ingest_fresh: false,
+        });
+
+        let planned = plan_template_apply(&items, &catalog);
+        assert_eq!(planned.len(), 2, "every cataloged row plans");
+        for (offset, plan) in planned.iter().enumerate() {
+            assert_eq!(plan.sequence, (offset + 1) as u64);
+            assert!(plan.item_id >= 0);
+            let source = items
+                .iter()
+                .find(|item| item.item_id == plan.item_id)
+                .unwrap();
+            assert_eq!(plan.paths, item_photo_paths(&catalog, source));
+            assert!(!plan.paths.is_empty());
+        }
+
+        let with_ghost = plan_template_apply(&with_ghost, &catalog);
+        assert_eq!(with_ghost.len(), 2, "ghost row skipped");
+
+        // One enqueue-time clock for the whole batch rides every payload.
+        let payloads = template_apply_payloads(&planned, r#"{"credit":"x"}"#, 1_791_374_400);
+        assert_eq!(payloads.len(), planned.len());
+        for (payload, plan) in payloads.iter().zip(&planned) {
+            let parsed: edit_metadata::MetadataWritePayload =
+                serde_json::from_str(payload).unwrap();
+            assert_eq!(parsed.item_id, plan.item_id);
+            assert_eq!(parsed.paths, plan.paths);
+            assert_eq!(parsed.sequence, plan.sequence);
+            assert_eq!(parsed.captured_at, 1_791_374_400);
+            assert_eq!(parsed.fields_json, r#"{"credit":"x"}"#);
+        }
         std::fs::remove_dir_all(&dir).ok();
     }
 }

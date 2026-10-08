@@ -1593,6 +1593,7 @@ version = "0.1.0"
 dependencies = [
  "edit-catalog",
  "edit-core",
+ "flume 0.11.1",
  "kamadak-exif",
  "lightcraft-develop",
  "quick-xml 0.41.0",

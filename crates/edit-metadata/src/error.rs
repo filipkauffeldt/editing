@@ -21,6 +21,10 @@ pub enum Error {
     /// The exiftool binary is missing or unusable.
     #[error("exiftool unavailable: {0}")]
     Unavailable(String),
+    /// A path cannot be handed to the exiftool argfile (not UTF-8, or
+    /// contains a line break) — rejected instead of lossy-mangled.
+    #[error("path: {0}")]
+    InvalidPath(String),
     /// The resident exiftool process reported a failure.
     #[error("exiftool: {0}")]
     ExifTool(String),

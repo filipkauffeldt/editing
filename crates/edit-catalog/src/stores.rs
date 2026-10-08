@@ -799,7 +799,22 @@ impl Catalog {
 
     // ---- IPTC templates ----
 
+    /// Scopes a template row may hold (plan section 2.8 + M3): a browsed
+    /// set available everywhere, or one snapshot scoped to a single ingest.
+    const TEMPLATE_SCOPES: &[&str] = &["global", "ingest"];
+
+    fn check_template_scope(scope: &str) -> Result<()> {
+        if Self::TEMPLATE_SCOPES.contains(&scope) {
+            Ok(())
+        } else {
+            Err(Error::InvalidValue(format!(
+                "unknown template scope: {scope}"
+            )))
+        }
+    }
+
     pub fn insert_iptc_template(&self, name: &str, fields_json: &str, scope: &str) -> Result<i64> {
+        Self::check_template_scope(scope)?;
         self.with_conn(|conn| {
             conn.execute(
                 "INSERT INTO iptc_templates (name, fields_json, scope, updated_at)
@@ -807,6 +822,58 @@ impl Catalog {
                 params![name, fields_json, scope, now_unix()],
             )?;
             Ok(conn.last_insert_rowid())
+        })
+    }
+
+    /// Enqueue a whole batch in one transaction (apply-to-selection): the
+    /// UI hands the payloads over on a background thread and the durable
+    /// rows land as one atomic write. Returns the job ids in payload order.
+    pub fn enqueue_jobs_batch(
+        &self,
+        kind: crate::jobs::JobKind,
+        payloads: &[String],
+    ) -> Result<Vec<crate::jobs::JobId>> {
+        self.with_conn(|conn| {
+            let tx = conn.unchecked_transaction()?;
+            let mut ids = Vec::with_capacity(payloads.len());
+            for payload in payloads {
+                ids.push(crate::jobs::enqueue(&tx, kind, payload)?);
+            }
+            tx.commit()?;
+            Ok(ids)
+        })
+    }
+
+    /// Rewrite a template row in place; the id stays so enqueued jobs and
+    /// `ingest_batches.template_id` references keep pointing at it.
+    pub fn update_iptc_template(
+        &self,
+        id: i64,
+        name: &str,
+        fields_json: &str,
+        scope: &str,
+    ) -> Result<()> {
+        Self::check_template_scope(scope)?;
+        self.with_conn(|conn| {
+            let n = conn.execute(
+                "UPDATE iptc_templates SET name = ?1, fields_json = ?2, scope = ?3, updated_at = ?4
+                 WHERE id = ?5",
+                params![name, fields_json, scope, now_unix(), id],
+            )?;
+            if n == 0 {
+                return Err(not_found("iptc_template", id));
+            }
+            Ok(())
+        })
+    }
+
+    pub fn delete_iptc_template(&self, id: i64) -> Result<()> {
+        self.with_conn(|conn| {
+            let n = conn.execute("DELETE FROM iptc_templates WHERE id = ?1", [id])?;
+            if n == 0 {
+                return Err(not_found("iptc_template", id));
+            }
+            Ok(())
         })
     }
 
@@ -1200,6 +1267,29 @@ mod tests {
             .unwrap();
         assert_eq!(db.get_iptc_template(template).unwrap().scope, "ingest");
         assert_eq!(db.list_iptc_templates().unwrap().len(), 1);
+        db.update_iptc_template(template, "sports", r#"{"credit":"y"}"#, "global")
+            .unwrap();
+        assert_eq!(
+            (
+                db.get_iptc_template(template).unwrap().name.as_str(),
+                db.get_iptc_template(template).unwrap().scope.as_str()
+            ),
+            ("sports", "global")
+        );
+        let edit2 = db.insert_iptc_template("b", "{}", "global").unwrap();
+        db.delete_iptc_template(edit2).unwrap();
+        assert!(db.get_iptc_template(edit2).is_err());
+        assert!(db.insert_iptc_template("c", "{}", "session").is_err());
+        assert!(
+            db.update_iptc_template(999_999, "c", "{}", "global")
+                .is_err()
+        );
+        // Names are unique (migration 003): a second row with the same
+        // name is a unique violation, so the picker can never be ambiguous.
+        let dup = db
+            .insert_iptc_template("sports", "{}", "global")
+            .unwrap_err();
+        assert!(dup.is_unique_violation(), "{dup}");
 
         let batch = db.insert_ingest_batch("/photos/2026", "running").unwrap();
         db.finish_ingest_batch(batch, "done").unwrap();
@@ -1306,6 +1396,18 @@ mod tests {
         db.set_setting("theme", "dark").unwrap();
         assert_eq!(db.get_setting("theme").unwrap().as_deref(), Some("dark"));
         assert_eq!(db.get_setting("missing").unwrap(), None);
+
+        // Batched enqueue lands N durable rows in payload order.
+        let payloads = vec![r#"{"n":0}"#.to_owned(), r#"{"n":1}"#.to_owned()];
+        let ids = db
+            .enqueue_jobs_batch(crate::JobKind::MetadataWrite, &payloads)
+            .unwrap();
+        assert_eq!(ids.len(), 2);
+        for (offset, id) in ids.iter().enumerate() {
+            let job = db.job(*id).unwrap();
+            assert_eq!(job.state, crate::JobState::Queued);
+            assert_eq!(job.payload_json, payloads[offset].as_str());
+        }
 
         assert!(db.get_root(999_999).is_err());
         std::fs::remove_file(path).ok();

@@ -6,9 +6,10 @@ use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 
-use app::browse::{ThumbPayload, ThumbState, list_browse_items, run_catalog_scan};
+use app::browse::{MetaBadge, ThumbPayload, ThumbState, list_browse_items, run_catalog_scan};
 use app::views::Browser;
-use edit_catalog::{Catalog, JobEvent, JobEventKind, JobKind};
+use edit_catalog::{Catalog, JobEvent, JobEventKind, JobKind, JobState};
+use edit_metadata::{MetadataWritePayload, TemplateFields};
 use gpui_kit::AppContext;
 
 static NEXT_DIR: AtomicU64 = AtomicU64::new(0);
@@ -138,6 +139,71 @@ fn thumb_events_mark_cells_through_the_job_map(cx: &mut gpui_kit::TestAppContext
                 kind: JobEventKind::Succeeded,
             });
             assert_eq!(b.thumb_state_for(item_id), Some(ThumbState::Ready));
+        });
+    });
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+#[gpui_kit::test]
+fn apply_template_queues_the_selection_off_the_ui_thread(cx: &mut gpui_kit::TestAppContext) {
+    cx.update(gpui_kit::init);
+    let dir = photo_dir();
+    let catalog = Arc::new(Catalog::open(&dir.join("evt-meta.sqlite")).unwrap());
+    let browser = open_browser(cx, Arc::clone(&catalog));
+    cx.update(|cx| {
+        browser.update(cx, |b, cx| b.open_folder(dir.clone(), cx));
+    });
+    let scan_id = cx.update(|cx| browser.read(cx).last_scan_job().unwrap());
+    run_catalog_scan(&catalog, &dir, &|_, _| {}).unwrap();
+    cx.update(|cx| {
+        browser.update(cx, |b, _| {
+            b.on_job_event(&JobEvent {
+                id: scan_id,
+                kind: JobEventKind::Succeeded,
+            });
+        });
+    });
+
+    let fields = TemplateFields {
+        credit: Some("SHL".into()),
+        ..Default::default()
+    };
+    cx.update(|cx| {
+        browser.update(cx, |b, cx| {
+            b.apply_template(fields.clone(), "press", cx);
+            // The cells flip at once; the enqueue itself is still pending.
+            let item_id = b.selected_items()[0].item_id;
+            assert_eq!(b.item_meta(item_id), Some(MetaBadge::Queued));
+        });
+    });
+    cx.run_until_parked();
+
+    let queued: Vec<_> = catalog
+        .list_jobs(50)
+        .unwrap()
+        .into_iter()
+        .filter(|job| job.kind == JobKind::MetadataWrite)
+        .collect();
+    assert_eq!(queued.len(), 1, "the focused cell is the whole selection");
+    assert_eq!(queued[0].state, JobState::Queued);
+    let payload: MetadataWritePayload = serde_json::from_str(&queued[0].payload_json).unwrap();
+    assert_eq!(payload.sequence, 1);
+    assert!(payload.captured_at > 0);
+    assert!(!payload.paths.is_empty());
+    assert_eq!(
+        serde_json::from_str::<TemplateFields>(&payload.fields_json).unwrap(),
+        fields
+    );
+
+    // A worker event that beats any bookkeeping resolves its item from
+    // the durable payload and drives the badge.
+    cx.update(|cx| {
+        browser.update(cx, |b, _| {
+            b.on_job_event(&JobEvent {
+                id: queued[0].id,
+                kind: JobEventKind::Succeeded,
+            });
+            assert_eq!(b.item_meta(payload.item_id), Some(MetaBadge::Done));
         });
     });
     std::fs::remove_dir_all(&dir).ok();

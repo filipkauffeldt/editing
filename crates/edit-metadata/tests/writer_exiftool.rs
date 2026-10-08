@@ -1,6 +1,6 @@
-//! Resident writer against a real exiftool. Gated on an exiftool binary:
-//! `$EXIFTOOL`, else `exiftool` on `PATH`. CI installs
-//! `libimage-exiftool-perl` for this; without it the tests skip loudly.
+//! Resident writer against a real exiftool: `$EXIFTOOL`, else `exiftool`
+//! on `PATH`. CI installs `libimage-exiftool-perl` for this; a missing
+//! binary fails the tests (see `Writer::binary_for_tests`).
 
 use std::path::PathBuf;
 use std::process::Command;
@@ -8,7 +8,7 @@ use std::process::Command;
 use edit_metadata::Writer;
 
 fn exiftool() -> Option<PathBuf> {
-    Writer::find_binary()
+    Writer::binary_for_tests()
 }
 
 fn fixture_copy(dir: &tempfile::TempDir) -> PathBuf {
@@ -23,7 +23,8 @@ fn fixture_copy(dir: &tempfile::TempDir) -> PathBuf {
 
 fn exiftool_value(bin: &std::path::Path, file: &std::path::Path, tag: &str) -> String {
     let out = Command::new(bin)
-        .args(["-s3", &format!("-XMP-crs:{tag}"), &file.to_string_lossy()])
+        .args(["-s3", &format!("-XMP-crs:{tag}")])
+        .arg(file)
         .output()
         .expect("exiftool read-back runs");
     assert!(out.status.success());
@@ -32,10 +33,7 @@ fn exiftool_value(bin: &std::path::Path, file: &std::path::Path, tag: &str) -> S
 
 #[test]
 fn resident_writer_sets_and_updates_tags() {
-    let Some(bin) = exiftool() else {
-        eprintln!("SKIPPED: no exiftool binary ($EXIFTOOL or PATH)");
-        return;
-    };
+    let Some(bin) = exiftool() else { return };
     let dir = tempfile::TempDir::new().unwrap();
     let photo = fixture_copy(&dir);
 
