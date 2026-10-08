@@ -31,10 +31,14 @@ use std::path::{Path, PathBuf};
 /// Folder rule the ingest dialog starts with (and an empty one falls back to).
 pub const DEFAULT_DEST_RULE: &str = "~/Photos/{yyyy}/{mm}-{dd}";
 
-/// Filename rule the ingest dialog starts with (and an empty one falls back
-/// to). The original extension is appended at landing, so a RAW+JPEG pair
-/// lands as `shoot_0001.NEF` / `shoot_0001.JPG`.
-pub const DEFAULT_FILENAME_RULE: &str = "{session}_{seq:4}";
+/// Filename rule an ingest uses unless the photographer asks to rename:
+/// keep the card's own names (and an empty rule falls back to it).
+pub const DEFAULT_FILENAME_RULE: &str = "{filename}";
+
+/// A starting point for the optional "Rename files" rule. The original
+/// extension is appended at landing, so a RAW+JPEG pair lands as
+/// `shoot_0001.NEF` / `shoot_0001.JPG`.
+pub const RENAME_EXAMPLE_RULE: &str = "{session}_{seq:4}";
 
 /// A rule that could not be resolved to a name.
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
@@ -506,6 +510,7 @@ mod tests {
             Err(NamingError::UnknownVariable(_))
         ));
         assert!(validate_filename_rule(DEFAULT_FILENAME_RULE).is_ok());
+        assert!(validate_filename_rule(RENAME_EXAMPLE_RULE).is_ok());
         // A rule that only renders for files that carry a camera still passes.
         assert!(validate_filename_rule("{camera}_{seq}").is_ok());
     }

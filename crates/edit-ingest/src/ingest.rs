@@ -30,8 +30,8 @@ use serde::{Deserialize, Serialize};
 
 use crate::copy::{CopyError, CopyOutcome, CopyRequest, CopyStage, copy_verified_with, hash_file};
 use crate::naming::{
-    DEFAULT_FILENAME_RULE, NamingContext, NamingError, expand_tilde, render_dir, render_filename,
-    static_prefix, validate, validate_filename_rule, with_original_extension,
+    DEFAULT_DEST_RULE, DEFAULT_FILENAME_RULE, NamingContext, NamingError, expand_tilde, render_dir,
+    render_filename, static_prefix, validate, validate_filename_rule, with_original_extension,
 };
 
 /// Raw extensions the ingest pipeline recognizes.
@@ -76,6 +76,11 @@ pub struct IngestCopyPayload {
     /// template (opaque JSON; the metadata writer reads it).
     #[serde(default)]
     pub iptc_replacements_json: Option<String>,
+    /// Copy only these card files (their full source paths); `None` copies
+    /// every photo. Files left out are not recorded, so they never show up
+    /// as failures or duplicates.
+    #[serde(default)]
+    pub only_sources: Option<Vec<String>>,
 }
 
 /// One supported file found on a card.
@@ -143,6 +148,8 @@ pub struct IngestPlanRequest<'a> {
     pub session: &'a str,
     pub start_seq: u64,
     pub template: Option<IngestTemplate<'a>>,
+    /// Copy only these source paths; `None` copies every photo on the card.
+    pub only_sources: Option<&'a [String]>,
 }
 
 /// A planned batch: the `ingest_batches` row and the job payload.
@@ -159,14 +166,14 @@ pub struct IngestPlan {
 /// a rule that cannot produce a file name is rejected here, before a batch
 /// is created.
 pub fn plan_ingest(request: &IngestPlanRequest<'_>) -> Result<IngestPlan, NamingError> {
-    let dest = request.dest_dir_template.trim();
+    let dest = match request.dest_dir_template.trim() {
+        "" => DEFAULT_DEST_RULE,
+        rule => rule,
+    };
     let filename = match request.filename_template.trim() {
         "" => DEFAULT_FILENAME_RULE,
         rule => rule,
     };
-    if dest.is_empty() {
-        return Err(NamingError::EmptyName);
-    }
     validate(dest)?;
     validate_filename_rule(filename)?;
     let backup_dir = request
@@ -196,6 +203,7 @@ pub fn plan_ingest(request: &IngestPlanRequest<'_>) -> Result<IngestPlan, Naming
                 .template
                 .map(|template| template.fields_json.to_string()),
             iptc_replacements_json: None,
+            only_sources: request.only_sources.map(<[String]>::to_vec),
         },
     })
 }
@@ -301,7 +309,21 @@ pub fn assign_sequence(files: &[CardFile], start_seq: u64) -> Vec<u64> {
 
 /// Plan a card into the ordered file list and sequence numbers.
 pub fn plan_card(root: &Path, start_seq: u64) -> std::io::Result<(Vec<CardFile>, Vec<u64>)> {
-    let files = enumerate_card(root)?;
+    plan_selected(root, start_seq, None)
+}
+
+/// [`plan_card`] limited to `only` (source paths) when given. Sequence
+/// numbers count the chosen files only, so renamed files stay contiguous.
+pub fn plan_selected(
+    root: &Path,
+    start_seq: u64,
+    only: Option<&[String]>,
+) -> std::io::Result<(Vec<CardFile>, Vec<u64>)> {
+    let mut files = enumerate_card(root)?;
+    if let Some(only) = only {
+        let wanted: std::collections::HashSet<&str> = only.iter().map(String::as_str).collect();
+        files.retain(|file| wanted.contains(file.path.to_string_lossy().as_ref()));
+    }
     let seqs = assign_sequence(&files, start_seq);
     Ok((files, seqs))
 }
@@ -387,7 +409,11 @@ where
     F: Fn(&Path) -> FileMetadata,
 {
     let on_progress = hooks.on_progress;
-    let (files, seqs) = plan_card(Path::new(&payload.source_root), payload.start_seq)?;
+    let (files, seqs) = plan_selected(
+        Path::new(&payload.source_root),
+        payload.start_seq,
+        payload.only_sources.as_deref(),
+    )?;
     let dest_root = resolve_dest_root(&payload.dest_dir_template)?;
     // Get-or-create races safely when two cards land in a fresh destination.
     let root_id = catalog.ensure_root(&dest_root, "folder")?;
@@ -822,6 +848,7 @@ mod tests {
             start_seq: 1,
             iptc_fields_json: None,
             iptc_replacements_json: None,
+            only_sources: None,
         }
     }
 
@@ -1223,6 +1250,7 @@ mod tests {
             start_seq: 1,
             iptc_fields_json: None,
             iptc_replacements_json: None,
+            only_sources: None,
         };
         assert!(run_ingest_copy(&catalog, &p, fixed_metadata, &|_, _| {}).is_err());
         assert_eq!(catalog.get_ingest_batch(batch).unwrap().state, "failed");
@@ -1241,6 +1269,7 @@ mod tests {
             session: "shoot",
             start_seq: 1,
             template: None,
+            only_sources: None,
         })
         .unwrap();
         assert_eq!(plan.batch.volume_label.as_deref(), Some("CARD"));
@@ -1257,14 +1286,17 @@ mod tests {
             .unwrap_err(),
             NamingError::UnknownVariable(_)
         ));
-        assert!(matches!(
+        // A blank folder rule is not an error: it means the default.
+        assert_eq!(
             plan_ingest(&IngestPlanRequest {
                 dest_dir_template: "   ",
                 ..plan_request_defaults()
             })
-            .unwrap_err(),
-            NamingError::EmptyName
-        ));
+            .unwrap()
+            .payload
+            .dest_dir_template,
+            DEFAULT_DEST_RULE
+        );
     }
 
     #[test]
@@ -1321,10 +1353,87 @@ mod tests {
             .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
             .collect();
         names.sort();
+        // Blank means "keep the card's names", extension included.
+        assert_eq!(names, ["DSC0001.JPG", "DSC0001.NEF", "DSC0002.NEF"]);
+        fs::remove_dir_all(&base).ok();
+        fs::remove_dir_all(&card).ok();
+    }
+
+    #[test]
+    fn renaming_is_optional_and_a_renamed_pair_does_not_collide() {
+        let card = card_with(&[
+            ("DSC0001.JPG", b"one jpg"),
+            ("DSC0001.NEF", b"one raw"),
+            ("DSC0002.NEF", b"two raw"),
+        ]);
+        let base = scratch("rename");
+        let dest = base.join("Photos");
+        let catalog = Catalog::open(&base.join("catalog.sqlite")).unwrap();
+        let plan = plan_ingest(&IngestPlanRequest {
+            source_root: &card,
+            dest_dir_template: &dest.to_string_lossy(),
+            filename_template: crate::naming::RENAME_EXAMPLE_RULE,
+            session: "shoot",
+            ..plan_request_defaults()
+        })
+        .unwrap();
+        let batch = catalog.create_ingest_batch(&plan.batch).unwrap();
+        run_ingest_copy(
+            &catalog,
+            &IngestCopyPayload {
+                batch_id: batch,
+                ..plan.payload
+            },
+            fixed_metadata,
+            &|_, _| {},
+        )
+        .unwrap();
+        let mut names: Vec<String> = fs::read_dir(&dest)
+            .unwrap()
+            .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
+            .collect();
+        names.sort();
         assert_eq!(
             names,
             ["shoot_0001.JPG", "shoot_0001.NEF", "shoot_0002.NEF"]
         );
+        fs::remove_dir_all(&base).ok();
+        fs::remove_dir_all(&card).ok();
+    }
+
+    #[test]
+    fn only_the_chosen_files_are_copied_and_the_rest_leave_no_trace() {
+        let card = card_with(&[
+            ("DSC0001.JPG", b"one"),
+            ("DSC0002.JPG", b"two"),
+            ("DSC0003.JPG", b"three"),
+        ]);
+        let base = scratch("only");
+        let dest = base.join("Photos");
+        let catalog = Catalog::open(&base.join("catalog.sqlite")).unwrap();
+        let batch = new_batch(&catalog, &dest, None);
+        let mut p = payload(batch, &card, &dest, None);
+        let pick = |name: &str| {
+            card.join("DCIM/100CANON")
+                .join(name)
+                .to_string_lossy()
+                .into_owned()
+        };
+        p.only_sources = Some(vec![pick("DSC0001.JPG"), pick("DSC0003.JPG")]);
+        let progress = std::cell::RefCell::new(Vec::new());
+        let summary = run_ingest_copy(&catalog, &p, fixed_metadata, &|done, total| {
+            progress.borrow_mut().push((done, total))
+        })
+        .unwrap();
+        assert_eq!((summary.files, summary.copied, summary.failed), (2, 2, 0));
+        assert_eq!(progress.borrow().last(), Some(&(2, 2)));
+        let rows = catalog.list_ingest_files(batch).unwrap();
+        assert_eq!(rows.len(), 2, "the skipped file is not recorded at all");
+        assert!(rows.iter().all(|r| r.original_name != "DSC0002.JPG"));
+        // Sequence numbers count the chosen files only.
+        assert!(dest.join("2026-10-07/shoot_0001.JPG").is_file());
+        assert!(dest.join("2026-10-07/shoot_0002.JPG").is_file());
+        assert_eq!(catalog.get_ingest_batch(batch).unwrap().state, "done");
         fs::remove_dir_all(&base).ok();
         fs::remove_dir_all(&card).ok();
     }
@@ -1383,6 +1492,7 @@ mod tests {
             session: "shoot",
             start_seq: 1,
             template: None,
+            only_sources: None,
         }
     }
 }

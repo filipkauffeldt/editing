@@ -27,11 +27,13 @@ pub use copy::{
 pub use ingest::{
     CardFile, FileMetadata, FollowUpJob, IngestCopyPayload, IngestError, IngestPlan,
     IngestPlanRequest, IngestSummary, IngestTemplate, LandedPhoto, batch_volume_identity,
-    dest_root_path, enumerate_card, plan_card, plan_ingest, run_ingest_copy, run_ingest_copy_with,
+    dest_root_path, enumerate_card, plan_card, plan_ingest, plan_selected, run_ingest_copy,
+    run_ingest_copy_with,
 };
 pub use naming::{
-    DEFAULT_DEST_RULE, DEFAULT_FILENAME_RULE, NamingContext, NamingError, expand_tilde, render_dir,
-    render_filename, static_prefix, validate, validate_filename_rule, with_original_extension,
+    DEFAULT_DEST_RULE, DEFAULT_FILENAME_RULE, NamingContext, NamingError, RENAME_EXAMPLE_RULE,
+    expand_tilde, render_dir, render_filename, static_prefix, validate, validate_filename_rule,
+    with_original_extension,
 };
 pub use volumes::{
     DiskInfo, DiskSource, POLL_INTERVAL, SysinfoSource, UdevEntry, Volume, VolumeEvent, diff,
