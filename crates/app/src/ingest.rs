@@ -196,6 +196,13 @@ impl AppState {
         rows
     }
 
+    /// Whether any card is still ingesting.
+    pub fn has_running_batch(&self) -> bool {
+        self.batches
+            .iter()
+            .any(|batch| batch.state == BatchState::Running)
+    }
+
     /// Progress of the card's newest batch (a retry opens a new one).
     pub fn batch_for_volume(&self, identity: &str) -> Option<&IngestBatchProgress> {
         self.batches
@@ -798,9 +805,13 @@ impl Render for IngestDialog {
                 .batch_for_volume(identity)
                 .is_some_and(|batch| batch.state != BatchState::Running && batch.tally.failed > 0)
         });
+        // A progress note is only true while something is ingesting; a
+        // rejection stays until the next action.
+        let busy = self.state.read(cx).has_running_batch();
         let status = self
             .status
             .clone()
+            .filter(|_| self.status_is_error || busy)
             .map(|message| (self.status_is_error, message));
         div()
             .id("ingest-dialog")
