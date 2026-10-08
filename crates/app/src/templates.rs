@@ -2,16 +2,16 @@
 //!
 //! The editor is the `Form`/`Input`/`Textarea`/`Select` surface over the
 //! phase-1 field set (`edit_metadata::TemplateFields`), stored in the
-//! catalog `iptc_templates` table. "Apply to selection" reads the
-//! template currently picked in the Select and hands it to
+//! catalog `iptc_templates` table. "Apply to selection" applies what the
+//! form shows right now, saved or not, and hands it to
 //! [`Browser::apply_template`], which enqueues one durable
 //! `metadata_write` job per selected item (plan sections 2.1, 2.7). `T`
 //! opens the editor from anywhere in the shell.
 //!
-//! Fields may contain `{…}` variables. The Preview row expands the
-//! caption against the focused photo's capture metadata off the UI
-//! thread ([`edit_metadata::preview_field`]) before apply, so users see
-//! the resolved text (plan section 2.7).
+//! Fields may contain `{…}` variables. The Preview rows expand every
+//! field against the focused photo's capture metadata off the UI thread
+//! ([`edit_metadata::preview_fields`]) before apply, so users see the
+//! resolved text (plan section 2.7).
 
 use std::sync::Arc;
 
@@ -24,6 +24,7 @@ use gpui_kit::component::input::{Input, InputState, Textarea, TextareaState};
 use gpui_kit::component::searchable_list::SearchableVec;
 use gpui_kit::component::select::{Select, SelectState};
 use gpui_kit::component::{ActiveTheme as _, Disableable as _, StyledExt as _, h_flex, v_flex};
+use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::*;
 
 use crate::ingest::AppState;
@@ -54,7 +55,8 @@ pub struct TemplateEditor {
     instructions: Entity<InputState>,
     edit_status: Entity<InputState>,
     rights: Entity<InputState>,
-    preview: String,
+    /// Resolved `(label, text)` rows for the focused photo.
+    preview: Vec<(&'static str, String)>,
     status: String,
 }
 
@@ -118,10 +120,10 @@ impl TemplateEditor {
             instructions,
             edit_status,
             rights,
-            preview: String::new(),
+            preview: Vec::new(),
             status: "Fill the fields, Save, then pick and Apply to selection.".to_string(),
         };
-        editor.reload(window, cx);
+        editor.reload(None, window, cx);
         editor
     }
 
@@ -132,16 +134,15 @@ impl TemplateEditor {
     }
 
     /// Reload template rows from the catalog and rebuild the picker,
-    /// keeping whatever was selected by name.
-    fn reload(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+    /// selecting `prefer` (a just-saved name) or else whatever was picked.
+    /// Names are unique (catalog migration 003), so a name identifies a row.
+    fn reload(&mut self, prefer: Option<String>, window: &mut Window, cx: &mut Context<Self>) {
         self.templates = self.catalog.list_iptc_templates().unwrap_or_default();
         self.templates.sort_by_key(|row| row.name.to_lowercase());
         let names: Vec<String> = self.templates.iter().map(|row| row.name.clone()).collect();
-        let selected: Option<String> = self
-            .names
-            .read(cx)
-            .selected_value()
-            .cloned()
+        let selected: Option<String> = prefer
+            .or_else(|| self.names.read(cx).selected_value().cloned())
+            .filter(|name| names.contains(name))
             .or_else(|| self.templates.first().map(|row| row.name.clone()));
         self.names.update(cx, |select, cx| {
             select.set_items(SearchableVec::new(names), window, cx);
@@ -263,22 +264,38 @@ impl TemplateEditor {
         let fields_json =
             serde_json::to_string(&self.fields(cx)).unwrap_or_else(|_| "{}".to_string());
         let outcome = match self.editing_id {
-            Some(id) => self
-                .catalog
-                .update_iptc_template(id, &name, &fields_json, "global")
-                .map(|_| id),
+            Some(id) => {
+                // Editing keeps the row's scope (an ingest-scoped snapshot
+                // stays ingest-scoped); only a new row starts global.
+                let scope = self
+                    .templates
+                    .iter()
+                    .find(|row| row.id == id)
+                    .map_or("global", |row| row.scope.as_str());
+                self.catalog
+                    .update_iptc_template(id, &name, &fields_json, scope)
+                    .map(|_| id)
+            }
             None => self
                 .catalog
                 .insert_iptc_template(&name, &fields_json, "global"),
         };
-        match outcome {
+        let saved_name = match outcome {
             Ok(id) => {
                 self.editing_id = Some(id);
                 self.status = format!("Saved template \"{name}\".");
+                Some(name)
             }
-            Err(e) => self.status = format!("Save failed: {e}"),
-        }
-        self.reload(window, cx);
+            Err(e) if e.is_unique_violation() => {
+                self.status = format!("A template named \"{name}\" already exists.");
+                None
+            }
+            Err(e) => {
+                self.status = format!("Save failed: {e}");
+                None
+            }
+        };
+        self.reload(saved_name, window, cx);
     }
 
     fn delete(&mut self, window: &mut Window, cx: &mut Context<Self>) {
@@ -299,7 +316,7 @@ impl TemplateEditor {
             Err(e) => self.status = format!("Delete failed: {e}"),
         }
         self.start_new(window, cx);
-        self.reload(window, cx);
+        self.reload(None, window, cx);
     }
 
     /// Load the template selected in the picker into the form.
@@ -313,32 +330,30 @@ impl TemplateEditor {
         }
     }
 
-    /// Hand the template selected in the picker to the browser for the
-    /// multi-selection. The browser enqueues and reports; the editor
-    /// mirrors its status line.
+    /// Hand what the form shows to the browser for the multi-selection,
+    /// whether or not it is saved or matches the picked row: the user
+    /// applies what they see. The browser enqueues and reports; the
+    /// editor mirrors its status line.
     fn apply_selected(&mut self, cx: &mut Context<Self>) {
-        let Some(row) = self.selected_template(cx) else {
-            self.status = "Select a saved template first.".to_string();
-            cx.notify();
-            return;
-        };
-        let fields: TemplateFields = serde_json::from_str(&row.fields_json).unwrap_or_default();
+        let fields = self.fields(cx);
         if fields == TemplateFields::default() {
-            self.status = format!("Template \"{}\" has no fields to write.", row.name);
+            self.status = "The form has no fields to write.".to_string();
             cx.notify();
             return;
         }
+        let name = value_of(&self.name, cx).unwrap_or_else(|| "unsaved".to_string());
         self.browser.update(cx, |browser, cx| {
-            browser.apply_template(fields, &row.name, cx);
+            browser.apply_template(fields, &name, cx);
         });
         self.status = self.browser.read(cx).template_status();
         cx.notify();
     }
 
-    /// Expand the caption against the focused photo in the background;
-    /// the resolved text lands in the Preview row (plan section 2.7).
-    fn preview_caption(&mut self, cx: &mut Context<Self>) {
-        let caption = self.caption.read(cx).value().to_string();
+    /// Expand every form field against the focused photo in the
+    /// background; the resolved rows land under the form (plan section
+    /// 2.7).
+    fn preview_fields(&mut self, cx: &mut Context<Self>) {
+        let fields = self.fields(cx);
         let Some(path) = self.browser.read(cx).current_display_path() else {
             self.preview.clear();
             self.status = "Open a folder and focus a photo to preview.".to_string();
@@ -347,9 +362,9 @@ impl TemplateEditor {
         };
         cx.spawn(async move |this, cx| {
             let resolved = cx.background_executor().spawn(async move {
-                edit_metadata::preview_field(
+                edit_metadata::preview_fields(
                     std::path::Path::new(&path),
-                    &caption,
+                    &fields,
                     1,
                     edit_catalog::db::now_unix(),
                 )
@@ -384,6 +399,31 @@ impl TemplateEditor {
         )
     }
 
+    fn render_preview(&self) -> impl IntoElement {
+        let rows = self.preview.iter().map(|(label, text)| {
+            let shown = if text.is_empty() {
+                "(empty, skipped)".to_string()
+            } else {
+                text.clone()
+            };
+            div()
+                .text_xs()
+                .text_color(rgb(0xDDC999))
+                .child(format!("{label}: {shown}"))
+        });
+        v_flex()
+            .gap_1()
+            .when(!self.preview.is_empty(), |col| {
+                col.child(
+                    div()
+                        .text_xs()
+                        .text_color(rgb(0x999999))
+                        .child("Preview (focused photo, sequence 1):".to_string()),
+                )
+            })
+            .children(rows)
+    }
+
     fn render_form(&self) -> impl IntoElement {
         Form::new()
             .columns(2)
@@ -399,7 +439,7 @@ impl TemplateEditor {
             )
             .child(
                 Field::new()
-                    .label("Keywords ( ; , separated)")
+                    .label("Keywords (; separated)")
                     .child(Input::new(&self.keywords).id("template-keywords")),
             )
             .child(
@@ -454,7 +494,6 @@ impl Render for TemplateEditor {
     fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let theme = cx.theme().clone();
         let status = self.status.clone();
-        let preview = self.preview.clone();
         let can_delete = self.editing_id.is_some();
         div()
             .id("template-editor")
@@ -485,12 +524,7 @@ impl Render for TemplateEditor {
                     )
                     .child(self.render_template_picker())
                     .child(self.render_form())
-                    .child(
-                        div()
-                            .text_xs()
-                            .text_color(rgb(0xDDC999))
-                            .child(format!("Preview (focused photo, sequence 1): {preview}")),
-                    )
+                    .child(self.render_preview())
                     .child(div().text_sm().child(status))
                     .child(
                         h_flex()
@@ -524,7 +558,7 @@ impl Render for TemplateEditor {
                             ))
                             .child(Button::new("template-preview").label("Preview").on_click(
                                 cx.listener(|this, _: &ClickEvent, _window, cx| {
-                                    this.preview_caption(cx);
+                                    this.preview_fields(cx);
                                 }),
                             ))
                             .child(

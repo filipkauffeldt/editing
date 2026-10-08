@@ -12,7 +12,7 @@ pub mod photo;
 pub mod template;
 pub mod writer;
 
-pub use apply::{MetadataWritePayload, preview_field, run_metadata_write, vars_for};
+pub use apply::{MetadataWritePayload, preview_fields, run_metadata_write, vars_for};
 pub use crs::{
     channel_curve_points, crop_attributes, develop_attributes, exiftool_tag_args,
     tone_curve_points, write_sidecar,

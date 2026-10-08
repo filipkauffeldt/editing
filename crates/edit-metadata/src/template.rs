@@ -255,6 +255,34 @@ impl TemplateFields {
         tags
     }
 
+    /// Every field in the template with its expansion for one photo, in
+    /// form order, for the editor's preview. An empty value is a field
+    /// the write would skip.
+    pub fn preview(&self, vars: &TemplateVars) -> Vec<(&'static str, String)> {
+        let single = [
+            ("Caption", &self.caption),
+            ("Headline", &self.headline),
+            ("Byline", &self.byline),
+            ("Byline title", &self.byline_title),
+            ("Credit", &self.credit),
+            ("Source", &self.source),
+            ("Copyright", &self.copyright),
+            ("Instructions", &self.instructions),
+            ("Edit status", &self.edit_status),
+            ("Rights", &self.rights),
+        ];
+        let mut lines = Vec::new();
+        if self.keywords.is_some() {
+            lines.push(("Keywords", self.keywords_list(vars).join(" | ")));
+        }
+        for (label, raw) in single {
+            if let Some(text) = raw {
+                lines.push((label, expand(text, vars).trim().to_owned()));
+            }
+        }
+        lines
+    }
+
     /// XMP-only half of [`Self::to_tags`], for `.xmp` sidecar targets
     /// (raw files are stamped in a sidecar per the metadata-storage
     /// decision: XMP sidecar always for raws). IIM tags have no meaning
@@ -427,6 +455,29 @@ mod tests {
         };
         let pairs: Vec<String> = f.keywords_list(&vars()).into_iter().collect();
         assert_eq!(pairs, vec!["Smith, John", "ice"]);
+    }
+
+    #[test]
+    fn preview_lists_every_set_field_expanded() {
+        let f = TemplateFields {
+            caption: Some("{base} #{seq}".into()),
+            keywords: Some("ice; Smith, John".into()),
+            credit: Some("{camera}".into()),
+            ..Default::default()
+        };
+        let no_cam = TemplateVars {
+            camera: None,
+            ..vars()
+        };
+        assert_eq!(
+            f.preview(&no_cam),
+            vec![
+                ("Keywords", "ice | Smith, John".to_owned()),
+                ("Caption", "AHQ_0701 #07".to_owned()),
+                ("Credit", String::new()),
+            ]
+        );
+        assert!(TemplateFields::default().preview(&vars()).is_empty());
     }
 
     #[test]

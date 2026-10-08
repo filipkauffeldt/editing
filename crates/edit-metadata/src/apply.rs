@@ -21,7 +21,7 @@ use edit_catalog::{ClaimedJob, JobEvent, JobEventKind};
 use flume::Sender;
 
 use crate::read_photo_metadata;
-use crate::template::{TemplateFields, TemplateVars, expand};
+use crate::template::{TemplateFields, TemplateVars};
 use crate::writer::Writer;
 
 /// Raw extensions stamped through the XMP sidecar instead of in place
@@ -140,11 +140,16 @@ fn photo_dir_session(path: &Path) -> String {
         .unwrap_or_default()
 }
 
-/// Preview one field expansion for the UI (plan section 2.7: resolved
-/// text before apply). Never fails: unreadable sources expand against
-/// defaults.
-pub fn preview_field(path: &Path, text: &str, sequence: u64, now_unix: i64) -> String {
-    expand(text, &vars_for(path, sequence, now_unix))
+/// Preview every field of a template against one photo (plan section
+/// 2.7: resolved text before apply). Never fails: unreadable sources
+/// expand against defaults.
+pub fn preview_fields(
+    path: &Path,
+    fields: &TemplateFields,
+    sequence: u64,
+    now_unix: i64,
+) -> Vec<(&'static str, String)> {
+    fields.preview(&vars_for(path, sequence, now_unix))
 }
 
 /// Run one claimed `metadata_write` job against a shared
@@ -232,6 +237,7 @@ fn write_tags(writer: &Writer, path: &Path, tags: Vec<(String, String)>) -> Resu
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::template::expand;
 
     #[test]
     fn vars_read_capture_fields_from_exif_fixture() {
@@ -258,9 +264,19 @@ mod tests {
     }
 
     #[test]
-    fn preview_resolves_tokens() {
-        let text = "{base} #{seq:3}";
-        assert_eq!(preview_field(Path::new("/x/A1.JPG"), text, 2, 0), "A1 #002");
+    fn preview_resolves_tokens_for_every_field() {
+        let fields = TemplateFields {
+            caption: Some("{base} #{seq:3}".into()),
+            credit: Some("{session}".into()),
+            ..Default::default()
+        };
+        assert_eq!(
+            preview_fields(Path::new("/x/A1.JPG"), &fields, 2, 0),
+            vec![
+                ("Caption", "A1 #002".to_owned()),
+                ("Credit", "x".to_owned())
+            ]
+        );
     }
 
     #[test]
