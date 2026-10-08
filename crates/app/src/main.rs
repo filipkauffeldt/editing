@@ -8,7 +8,8 @@ use std::sync::Arc;
 
 use edit_catalog::{Catalog, JobKind};
 use gpui_kit::component::input::InputState;
-use gpui_kit::component::{TitleBar, v_flex};
+use gpui_kit::component::theme::{Theme, ThemeMode};
+use gpui_kit::component::{ActiveTheme as _, TitleBar, v_flex};
 use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::*;
 use ingest::{AppState, IngestDialog, OpenIngest, apply_ingest_event};
@@ -103,12 +104,15 @@ impl Focusable for BrowserShell {
 
 impl Render for BrowserShell {
     fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        let (background, foreground) = (cx.theme().background, cx.theme().foreground);
         let dialog_open = self.state.read(cx).is_ingest_open();
         let dialog = self.dialog.clone();
         let templates_open = self.state.read(cx).is_templates_open();
         let templates = self.templates.clone();
         v_flex()
             .size_full()
+            .bg(background)
+            .text_color(foreground)
             .key_context("Workspace")
             .track_focus(&self.focus_handle)
             .child(self.browser.clone())
@@ -165,6 +169,9 @@ fn main() {
     let app = gpui_kit::application().with_assets(gpui_kit::assets::Assets);
     app.run(move |cx| {
         gpui_kit::init(cx);
+        // The component library starts in its light theme; a photo editor
+        // judges colour against a dark surround.
+        Theme::change(ThemeMode::Dark, None, cx);
 
         // Keyboard shortcut target: focus lands in browse views too, so the
         // ingest / template shortcuts are gated on `Workspace && !Input` to

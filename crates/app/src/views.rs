@@ -27,7 +27,7 @@ use std::rc::Rc;
 use std::sync::Arc;
 
 use edit_catalog::{Catalog, JobEvent, JobEventKind, JobId, JobKind};
-use gpui_kit::component::{TitleBar, h_flex, status_bar::StatusBar, v_flex};
+use gpui_kit::component::{ActiveTheme as _, TitleBar, h_flex, status_bar::StatusBar, v_flex};
 use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::*;
 
@@ -1293,7 +1293,9 @@ impl Browser {
         cx.notify();
     }
 
-    fn render_header(&mut self, _cx: &mut Context<Self>) -> impl IntoElement {
+    fn render_header(&mut self, cx: &mut Context<Self>) -> impl IntoElement {
+        let theme = cx.theme();
+        let (muted, border) = (theme.muted_foreground, theme.border);
         let count = self.rows.len();
         let status = self.scan_status.clone();
         let root = self.root_label.clone();
@@ -1306,15 +1308,28 @@ impl Browser {
             .items_center()
             .px_2()
             .py_1()
+            .border_b_1()
+            .border_color(border)
             .child(div().text_sm().child(format!("Session: {root}")))
-            .child(div().text_sm().child(format!("{count} items")))
             .child(
                 div()
                     .text_sm()
-                    .child(format!("Sort: {:?}", self.sort_label())),
+                    .text_color(muted)
+                    .child(format!("{count} items")),
             )
-            .child(div().text_sm().child(mode_label.to_string()))
-            .child(div().text_sm().child(status))
+            .child(
+                div()
+                    .text_sm()
+                    .text_color(muted)
+                    .child(format!("Sort: {}", self.sort_label())),
+            )
+            .child(
+                div()
+                    .text_sm()
+                    .text_color(muted)
+                    .child(mode_label.to_string()),
+            )
+            .child(div().text_sm().text_color(muted).child(status))
     }
 
     fn sort_label(&self) -> &'static str {
@@ -1381,6 +1396,15 @@ impl Browser {
         // The row closure is 'static, so cell clicks update through an
         // owned entity handle instead of a borrowed context.
         let entity = cx.entity();
+        let theme = cx.theme();
+        let (current_border, selected_border, idle_border) =
+            (theme.primary, theme.muted_foreground, theme.border);
+        let (cell_bg, empty_bg, empty_fg, text_fg) = (
+            theme.secondary,
+            theme.muted,
+            theme.muted_foreground,
+            theme.foreground,
+        );
         div().size_full().overflow_hidden().child(
             uniform_list("contact-sheet", row_count, move |range, _window, _cx| {
                 let mut cells = Vec::new();
@@ -1393,11 +1417,11 @@ impl Browser {
                     for index in span {
                         let item = &rows[index];
                         let border = if index == current {
-                            rgb(0x4C9AFF)
+                            current_border
                         } else if selected.contains(&index) {
-                            rgb(0x8A8A8A)
+                            selected_border
                         } else {
-                            rgb(0x2A2A2A)
+                            idle_border
                         };
                         let art: AnyElement = match thumbs.get(&item.item_id) {
                             Some(art) => {
@@ -1409,8 +1433,8 @@ impl Browser {
                                 .flex()
                                 .items_center()
                                 .justify_center()
-                                .bg(rgb(0x111111))
-                                .text_color(rgb(0x999999))
+                                .bg(empty_bg)
+                                .text_color(empty_fg)
                                 .text_sm()
                                 .child(item.label())
                                 .into_any_element(),
@@ -1428,13 +1452,13 @@ impl Browser {
                                 .border_2()
                                 .border_color(border)
                                 .rounded_md()
-                                .bg(rgb(0x1E1E1E))
+                                .bg(cell_bg)
                                 .cursor_pointer()
                                 .on_click(move |_, _, cx| {
                                     entity.update(cx, |this, cx| this.goto_item(item_id, cx));
                                 })
                                 .child(art)
-                                .child(div().text_xs().text_color(rgb(0xCCCCCC)).child(badges)),
+                                .child(div().text_xs().text_color(text_fg).child(badges)),
                         );
                     }
                     cells.push(row_el);
@@ -1491,7 +1515,7 @@ impl Browser {
                     .flex_1()
                     .size_full()
                     .overflow_hidden()
-                    .bg(rgb(0x0E0E0E))
+                    .bg(cx.theme().background)
                     .child(
                         canvas(
                             |bounds, _, _| bounds,
@@ -1591,14 +1615,20 @@ impl Browser {
                 budget -= 1;
             }
         }
+        let theme = cx.theme();
+        let (current_outline, idle_outline, cell_bg) =
+            (theme.primary, theme.border, theme.secondary);
+        let (empty_bg, empty_fg, badge_fg) =
+            (theme.muted, theme.muted_foreground, theme.muted_foreground);
+        let strip_bg = theme.sidebar;
         let cells: Vec<_> = rows
             .iter()
             .enumerate()
             .map(|(index, item)| {
                 let outline = if index == current {
-                    rgb(0x4C9AFF)
+                    current_outline
                 } else {
-                    rgb(0x2A2A2A)
+                    idle_outline
                 };
                 let item_id = item.item_id;
                 let badges = Self::cell_badges(item);
@@ -1610,9 +1640,9 @@ impl Browser {
                         .flex()
                         .items_center()
                         .justify_center()
-                        .bg(rgb(0x111111))
+                        .bg(empty_bg)
                         .text_xs()
-                        .text_color(rgb(0x999999))
+                        .text_color(empty_fg)
                         .child(item.base_name.clone())
                         .into_any_element(),
                 };
@@ -1624,13 +1654,13 @@ impl Browser {
                     .border_2()
                     .border_color(outline)
                     .rounded_sm()
-                    .bg(rgb(0x1A1A1A))
+                    .bg(cell_bg)
                     .cursor_pointer()
                     .on_click(cx.listener(move |this, _: &ClickEvent, _, cx| {
                         this.goto_item(item_id, cx);
                     }))
                     .child(art)
-                    .child(div().text_xs().text_color(rgb(0xAAAAAA)).child(badges))
+                    .child(div().text_xs().text_color(badge_fg).child(badges))
             })
             .collect();
         div()
@@ -1641,13 +1671,21 @@ impl Browser {
             .flex_row()
             .overflow_x_scroll()
             .track_scroll(&self.strip_scroll)
-            .bg(rgb(0x141414))
+            .bg(strip_bg)
             .children(cells)
     }
 
     /// Left metadata panel: item summary plus the template entry point
     /// (plan section 2.7: the template editor opens over the shell).
-    fn render_metadata(&self, _cx: &mut Context<Self>) -> impl IntoElement {
+    fn render_metadata(&self, cx: &mut Context<Self>) -> impl IntoElement {
+        let theme = cx.theme();
+        let (panel_bg, panel_fg, panel_border, muted, warning) = (
+            theme.sidebar,
+            theme.sidebar_foreground,
+            theme.sidebar_border,
+            theme.muted_foreground,
+            theme.warning,
+        );
         let (title, dir, rating, meta_state) = match self.current_item() {
             Some(row) => (
                 row.base_name.clone(),
@@ -1663,18 +1701,21 @@ impl Browser {
             .px_2()
             .py_1()
             .gap_1()
-            .bg(rgb(0x181818))
+            .bg(panel_bg)
+            .text_color(panel_fg)
+            .border_r_1()
+            .border_color(panel_border)
             .child(div().text_sm().child("Metadata".to_string()))
             .child(div().text_xs().child(format!("File: {title}")))
             .child(div().text_xs().child(format!("Dir: {dir}")))
             .child(div().text_xs().child(format!("Rating: {rating}/5")))
             .when(!meta_state.is_empty(), |panel| {
-                panel.child(div().text_xs().text_color(rgb(0xBBBB88)).child(meta_state))
+                panel.child(div().text_xs().text_color(warning).child(meta_state))
             })
             .child(
                 div()
                     .text_xs()
-                    .text_color(rgb(0x888888))
+                    .text_color(muted)
                     .child("T — open the IPTC template editor.".to_string()),
             )
     }
