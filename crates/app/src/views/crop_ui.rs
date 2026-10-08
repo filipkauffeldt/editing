@@ -340,7 +340,12 @@ impl Browser {
             .map(|s| (s.draft().aspect, s.draft().rotation_degrees))
             .unwrap_or((None, 0.0));
         let theme = cx.theme();
-        let (background, muted) = (theme.background, theme.muted_foreground);
+        let (bg, fg, border, muted) = (
+            theme.sidebar,
+            theme.sidebar_foreground,
+            theme.sidebar_border,
+            theme.muted_foreground,
+        );
         let presets = std::iter::once(None)
             .chain(Aspect::ALL.into_iter().map(Some))
             .enumerate()
@@ -355,15 +360,17 @@ impl Browser {
                     }))
             });
         v_flex()
-            .w(px(220.0))
+            .w(px(240.0))
             .h_full()
-            .px_2()
-            .py_1()
-            .gap_2()
-            .bg(background)
+            .p_3()
+            .gap_3()
+            .bg(bg)
+            .text_color(fg)
+            .border_l_1()
+            .border_color(border)
             .child(Label::new("Crop"))
             .child(
-                Label::new("Drag the frame or its handles. Enter applies, Esc cancels.")
+                Label::new("Drag the frame to move it, or drag a handle to resize.")
                     .text_xs()
                     .text_color(muted),
             )
