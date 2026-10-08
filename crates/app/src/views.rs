@@ -1732,7 +1732,14 @@ impl Browser {
                         this.goto_item(item_id, cx);
                     }))
                     .child(art)
-                    .child(div().text_xs().text_color(badge_fg).child(badges))
+                    .child(
+                        div()
+                            .text_xs()
+                            .text_color(badge_fg)
+                            .whitespace_nowrap()
+                            .overflow_hidden()
+                            .child(badges),
+                    )
             })
             .collect();
         div()
