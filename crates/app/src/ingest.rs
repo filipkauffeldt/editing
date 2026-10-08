@@ -18,9 +18,11 @@ use edit_ingest::{
 };
 
 use app::ingest_job::{IngestStart, start_ingest};
+use gpui_kit::component::alert::Alert;
 use gpui_kit::component::button::Button;
 use gpui_kit::component::dialog::DialogTitle;
 use gpui_kit::component::input::{Input, InputState};
+use gpui_kit::component::label::Label;
 use gpui_kit::component::progress::Progress;
 use gpui_kit::component::searchable_list::SearchableVec;
 use gpui_kit::component::select::{Select, SelectState};
@@ -452,6 +454,8 @@ pub struct IngestDialog {
     templates: Vec<IptcTemplate>,
     seen_generation: u64,
     status: Option<String>,
+    /// Whether `status` reports a rejected request (shown as an error).
+    status_is_error: bool,
 }
 
 impl IngestDialog {
@@ -475,7 +479,13 @@ impl IngestDialog {
             // Differs from the state's generation, so the first render loads.
             seen_generation: u64::MAX,
             status: None,
+            status_is_error: false,
         }
+    }
+
+    fn set_status(&mut self, is_error: bool, message: String) {
+        self.status = Some(message);
+        self.status_is_error = is_error;
     }
 
     fn close(&mut self, cx: &mut Context<Self>) {
@@ -535,7 +545,7 @@ impl IngestDialog {
     /// so this never blocks the UI thread.
     fn start(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let Some(identity) = self.selected.clone() else {
-            self.status = Some("Select a card first.".to_string());
+            self.set_status(true, "Select a card first.".to_string());
             cx.notify();
             return;
         };
@@ -547,12 +557,12 @@ impl IngestDialog {
             .find(|volume| volume.identity == identity)
             .cloned();
         let Some(volume) = volume else {
-            self.status = Some("That card is gone.".to_string());
+            self.set_status(true, "That card is gone.".to_string());
             cx.notify();
             return;
         };
         if self.start_card(&volume, window, cx) {
-            self.status = Some(format!("Ingesting {}…", volume.display_name()));
+            self.set_status(false, format!("Ingesting {}…", volume.display_name()));
         }
         cx.notify();
     }
@@ -561,7 +571,7 @@ impl IngestDialog {
     fn start_all(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let volumes = self.state.read(cx).volumes().to_vec();
         if volumes.is_empty() {
-            self.status = Some("No cards detected.".to_string());
+            self.set_status(true, "No cards detected.".to_string());
             cx.notify();
             return;
         }
@@ -572,7 +582,10 @@ impl IngestDialog {
             }
         }
         if started > 0 {
-            self.status = Some(format!("Ingesting {started}/{} cards…", volumes.len()));
+            self.set_status(
+                false,
+                format!("Ingesting {started}/{} cards…", volumes.len()),
+            );
         }
         cx.notify();
     }
@@ -609,7 +622,7 @@ impl IngestDialog {
                 true
             }
             Err(message) => {
-                self.status = Some(message);
+                self.set_status(true, message);
                 false
             }
         }
@@ -676,7 +689,9 @@ impl IngestDialog {
                     this.selected = Some(identity_for_click.clone());
                     cx.notify();
                 }))
-                .when(is_selected, |row| row.border_color(rgb(0x3399FF)))
+                .when(is_selected, |row| {
+                    row.border_color(cx.theme().tokens.list_active_border.color)
+                })
                 .child(
                     h_flex()
                         .w_full()
@@ -685,9 +700,12 @@ impl IngestDialog {
                         .child(div().text_sm().child(detail)),
                 )
                 .child(Progress::new(progress_id).value(percent))
-                .child(div().text_xs().child(progress_text))
+                .child(Label::new(progress_text).text_xs())
                 .when_some(failure, |row, failure| {
-                    row.child(div().text_xs().text_color(rgb(0xE5484D)).child(failure))
+                    row.child(Alert::error(
+                        format!("card-failure-{}", volume.identity),
+                        failure,
+                    ))
                 })
         }))
     }
@@ -708,10 +726,10 @@ impl IngestDialog {
         v_flex()
             .gap_1()
             .child(
-                div().text_sm().child(
-                    "IPTC template (frozen when you start, stamped on each photo as it lands)"
-                        .to_string(),
-                ),
+                Label::new(
+                    "IPTC template (frozen when you start, stamped on each photo as it lands)",
+                )
+                .text_sm(),
             )
             .child(Select::new(&self.template_select).placeholder(NO_TEMPLATE))
     }
@@ -780,7 +798,10 @@ impl Render for IngestDialog {
                 .batch_for_volume(identity)
                 .is_some_and(|batch| batch.state != BatchState::Running && batch.tally.failed > 0)
         });
-        let status = self.status.clone();
+        let status = self
+            .status
+            .clone()
+            .map(|message| (self.status_is_error, message));
         div()
             .id("ingest-dialog")
             .w_full()
@@ -813,8 +834,12 @@ impl Render for IngestDialog {
                     ))
                     .child(self.render_template_picker())
                     .child(self.render_file_table(cx))
-                    .when_some(status, |panel, status| {
-                        panel.child(div().text_sm().child(status))
+                    .when_some(status, |panel, (is_error, message)| {
+                        panel.child(if is_error {
+                            Alert::error("ingest-status", message)
+                        } else {
+                            Alert::info("ingest-status", message)
+                        })
                     })
                     .child(
                         h_flex()
