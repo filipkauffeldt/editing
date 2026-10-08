@@ -33,7 +33,7 @@ use gpui_kit::*;
 use crate::browse::{
     BrowseFilter, BrowseItem, CatalogScanPayload, MetaBadge, SelectionModel, SortOrder,
     ThumbPayload, ThumbState, UploadBadge, ZoomMode, ZoomState, apply_filter_sort, canonical_root,
-    item_photo_paths, list_browse_items, pair_key, run_catalog_scan,
+    list_browse_items, pair_key, plan_template_apply, run_catalog_scan, template_apply_payloads,
 };
 use crate::preview::BrowsePreviewProvider;
 use edit_metadata::{MetadataWritePayload, TemplateFields};
@@ -382,58 +382,61 @@ impl Browser {
 
     /// Queue the template over the multi-selection as durable
     /// `metadata_write` jobs (plan section 2.7). Variables expand inside
-    /// the worker per photo. Sequence numbers are display order, 1-based.
+    /// the worker per photo; sequence numbers are display order, 1-based.
+    ///
+    /// Cells flip to `Queued` right away and the whole batch commits in
+    /// one background transaction, so the UI thread never waits on the
+    /// catalog. Job ids are not tracked here: worker events resolve their
+    /// item from the durable payload (`meta_item_id`), which also keeps an
+    /// event that beats the enqueue result from being overwritten.
     pub fn apply_template(
         &mut self,
         fields: TemplateFields,
         template_name: &str,
         cx: &mut Context<Self>,
     ) {
-        let selection = self.selected_items();
-        if selection.is_empty() || fields == TemplateFields::default() {
-            self.template_status = "Apply skipped: nothing selected or template empty.".into();
+        if fields == TemplateFields::default() {
+            self.template_status = "Apply skipped: template is empty.".into();
             cx.notify();
             return;
         }
-        let mut results: Vec<(i64, MetaBadge)> = Vec::with_capacity(selection.len());
-        for (offset, item) in selection.iter().enumerate() {
-            let paths = item_photo_paths(&self.catalog, item);
-            let payload = serde_json::to_string(&MetadataWritePayload {
-                item_id: item.item_id,
-                paths,
-                sequence: (offset + 1) as u64,
-                captured_at: edit_catalog::db::now_unix(),
-                fields_json: serde_json::to_string(&fields).unwrap_or_else(|_| "{}".to_string()),
-            })
-            .unwrap_or_else(|_| "{}".to_string());
-            match self.catalog.enqueue_job(JobKind::MetadataWrite, &payload) {
-                Ok(job_id) => {
-                    self.meta_jobs.insert(job_id, item.item_id);
-                    results.push((item.item_id, MetaBadge::Queued));
-                }
-                Err(_) => results.push((item.item_id, MetaBadge::Failed)),
-            }
+        let plan = plan_template_apply(&self.selected_items(), &self.catalog);
+        if plan.is_empty() {
+            self.template_status = "Apply skipped: no cataloged item in the selection.".into();
+            cx.notify();
+            return;
         }
-        let queued: usize = results
-            .iter()
-            .filter(|(_, meta)| *meta == MetaBadge::Queued)
-            .count();
-        for (item_id, meta) in &results {
-            if let Some(item) = self.items.iter_mut().find(|i| i.item_id == *item_id) {
-                item.meta = *meta;
-            }
+        let item_ids: Vec<i64> = plan.iter().map(|step| step.item_id).collect();
+        for item_id in &item_ids {
+            self.set_meta_quiet(*item_id, MetaBadge::Queued);
         }
-        // Skip a re-rebuild when nothing queued: items already carry their
-        // failed badges; the display table still refreshes on notify.
-        if queued > 0 {
-            self.rebuild_rows();
-        }
-        self.template_status = if queued == 0 {
-            format!("Apply failed to queue for {template_name}.")
-        } else {
-            format!("Applying template \"{template_name}\" to {queued} photos…")
-        };
+        self.rebuild_rows();
+        self.template_status = format!(
+            "Applying template \"{template_name}\" to {} photos…",
+            item_ids.len()
+        );
         cx.notify();
+
+        let catalog = Arc::clone(&self.catalog);
+        let fields_json = serde_json::to_string(&fields).unwrap_or_else(|_| "{}".to_string());
+        cx.spawn(async move |this, cx| {
+            let enqueue = cx.background_executor().spawn(async move {
+                let payloads =
+                    template_apply_payloads(&plan, &fields_json, edit_catalog::db::now_unix());
+                catalog.enqueue_jobs_batch(JobKind::MetadataWrite, &payloads)
+            });
+            if let Err(e) = enqueue.await {
+                let _ = this.update(cx, |this, cx| {
+                    for item_id in &item_ids {
+                        this.set_meta_quiet(*item_id, MetaBadge::Failed);
+                    }
+                    this.rebuild_rows();
+                    this.template_status = format!("Apply failed to queue: {e}");
+                    cx.notify();
+                });
+            }
+        })
+        .detach();
     }
 
     fn meta_item_id(&mut self, id: JobId) -> Option<i64> {
@@ -445,11 +448,20 @@ impl Browser {
             return None;
         }
         let payload: MetadataWritePayload = serde_json::from_str(&job.payload_json).ok()?;
+        if payload.item_id < 0 {
+            return None;
+        }
         self.meta_jobs.insert(id, payload.item_id);
         Some(payload.item_id)
     }
 
-    fn set_meta(&mut self, item_id: i64, badge: MetaBadge) {
+    /// Flip an item's badge without rebuilding rows (callers batch).
+    /// Negative ids are transient display cells with no durable identity:
+    /// writing them would collapse every unmatched row's state.
+    fn set_meta_quiet(&mut self, item_id: i64, badge: MetaBadge) -> bool {
+        if item_id < 0 {
+            return false;
+        }
         let mut hit = false;
         for item in &mut self.items {
             if item.item_id == item_id {
@@ -457,7 +469,11 @@ impl Browser {
                 hit = true;
             }
         }
-        if hit {
+        hit
+    }
+
+    fn set_meta(&mut self, item_id: i64, badge: MetaBadge) {
+        if self.set_meta_quiet(item_id, badge) {
             self.rebuild_rows();
         }
     }
@@ -498,7 +514,11 @@ impl Browser {
                 } else if let Some(item_id) = self.meta_item_id(event.id) {
                     self.meta_jobs.remove(&event.id);
                     self.set_meta(item_id, MetaBadge::Done);
-                    let in_flight = self.meta_jobs.len();
+                    let in_flight = self
+                        .items
+                        .iter()
+                        .filter(|i| matches!(i.meta, MetaBadge::Queued | MetaBadge::Writing))
+                        .count();
                     let done_count = self
                         .items
                         .iter()

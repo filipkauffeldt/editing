@@ -761,6 +761,62 @@ pub fn item_photo_paths(catalog: &edit_catalog::Catalog, item: &BrowseItem) -> V
     vec![item.display_path.clone()]
 }
 
+// ---- template apply plan (pure, testable) ----
+
+/// One `metadata_write` job the apply step enqueues. Built from the
+/// selection without any UI state (plan section 2.7), so the sequence
+/// numbers and per-item paths are unit-testable.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct TemplateApplyPlan {
+    pub item_id: i64,
+    /// Every photo side of the pair (raw + jpeg when paired).
+    pub paths: Vec<String>,
+    /// 1-based, over the enqueueable items in display order.
+    pub sequence: u64,
+}
+
+/// Plan a template apply over a selection. An item without a catalog row
+/// (the transient `item_id < 0` cells) is skipped: it has no durable
+/// identity for badges or resumed queue state, so stamping it would
+/// collapse the per-item state of every not-yet-matched display row.
+pub fn plan_template_apply(
+    selection: &[BrowseItem],
+    catalog: &edit_catalog::Catalog,
+) -> Vec<TemplateApplyPlan> {
+    selection
+        .iter()
+        .filter(|item| item.item_id >= 0)
+        .zip(1u64..)
+        .map(|(item, sequence)| TemplateApplyPlan {
+            item_id: item.item_id,
+            paths: item_photo_paths(catalog, item),
+            sequence,
+        })
+        .collect()
+}
+
+/// `metadata_write` payload JSON for each planned step. `captured_at` is
+/// stamped once for the whole batch, so the `{date}` fallback is one value
+/// that a crash-resumed job reproduces from its durable payload.
+pub fn template_apply_payloads(
+    plan: &[TemplateApplyPlan],
+    fields_json: &str,
+    captured_at: i64,
+) -> Vec<String> {
+    plan.iter()
+        .map(|step| {
+            serde_json::to_string(&edit_metadata::MetadataWritePayload {
+                item_id: step.item_id,
+                paths: step.paths.clone(),
+                sequence: step.sequence,
+                captured_at,
+                fields_json: fields_json.to_owned(),
+            })
+            .unwrap_or_else(|_| "{}".to_string())
+        })
+        .collect()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -782,7 +838,7 @@ mod tests {
         path
     }
 
-    fn tiny_jpeg(dir: &Path, name: &str) -> PathBuf {
+    pub(crate) fn tiny_jpeg(dir: &Path, name: &str) -> PathBuf {
         let path = dir.join(name);
         let img = image::RgbImage::from_pixel(4, 4, image::Rgb([200, 40, 40]));
         let mut bytes = Vec::new();
@@ -1137,7 +1193,7 @@ mod tests {
 
 #[cfg(test)]
 mod meta_paths_tests {
-    use super::tests::{scratch_dir, touch};
+    use super::tests::{scratch_dir, tiny_jpeg, touch};
     use super::*;
 
     #[test]
@@ -1167,6 +1223,65 @@ mod meta_paths_tests {
             ingest_fresh: false,
         };
         assert_eq!(item_photo_paths(&catalog, &lone), vec!["/missing/Q.JPG"]);
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn plan_skips_unmatched_and_numbers_the_rest() {
+        let dir = scratch_dir("apply-plan");
+        touch(&dir, "A.NEF");
+        touch(&dir, "a.JPG");
+        tiny_jpeg(&dir, "B.JPG");
+        let db_path = dir.join("plan.sqlite");
+        let catalog = edit_catalog::Catalog::open(&db_path).unwrap();
+        let summary = run_catalog_scan(&catalog, &dir, &|_, _| {}).unwrap();
+        let items = list_browse_items(&catalog, summary.root_id).unwrap();
+        assert_eq!(items.len(), 2);
+        // A display row the catalog never matched (item_id -1) is planned
+        // out, and the sequence numbers stay 1..N over the rest.
+        let mut with_ghost = items.clone();
+        with_ghost.push(BrowseItem {
+            item_id: -1,
+            dir: "/ghost".into(),
+            base_name: "GHOST".into(),
+            display_path: "/ghost/G.JPG".into(),
+            has_raw: true,
+            has_jpeg: false,
+            rating: 0,
+            thumb: ThumbState::Queued,
+            upload: UploadBadge::None,
+            meta: MetaBadge::None,
+            ingest_fresh: false,
+        });
+
+        let planned = plan_template_apply(&items, &catalog);
+        assert_eq!(planned.len(), 2, "every cataloged row plans");
+        for (offset, plan) in planned.iter().enumerate() {
+            assert_eq!(plan.sequence, (offset + 1) as u64);
+            assert!(plan.item_id >= 0);
+            let source = items
+                .iter()
+                .find(|item| item.item_id == plan.item_id)
+                .unwrap();
+            assert_eq!(plan.paths, item_photo_paths(&catalog, source));
+            assert!(!plan.paths.is_empty());
+        }
+
+        let with_ghost = plan_template_apply(&with_ghost, &catalog);
+        assert_eq!(with_ghost.len(), 2, "ghost row skipped");
+
+        // One enqueue-time clock for the whole batch rides every payload.
+        let payloads = template_apply_payloads(&planned, r#"{"credit":"x"}"#, 1_791_374_400);
+        assert_eq!(payloads.len(), planned.len());
+        for (payload, plan) in payloads.iter().zip(&planned) {
+            let parsed: edit_metadata::MetadataWritePayload =
+                serde_json::from_str(payload).unwrap();
+            assert_eq!(parsed.item_id, plan.item_id);
+            assert_eq!(parsed.paths, plan.paths);
+            assert_eq!(parsed.sequence, plan.sequence);
+            assert_eq!(parsed.captured_at, 1_791_374_400);
+            assert_eq!(parsed.fields_json, r#"{"credit":"x"}"#);
+        }
         std::fs::remove_dir_all(&dir).ok();
     }
 }
