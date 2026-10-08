@@ -14,7 +14,9 @@ use gpui_kit::component::label::Label;
 use gpui_kit::component::slider::{
     Slider as StraightenSlider, SliderEvent, SliderState, SliderValue,
 };
-use gpui_kit::component::{ActiveTheme as _, Selectable as _, Sizable as _, h_flex, v_flex};
+use gpui_kit::component::{
+    ActiveTheme as _, Disableable as _, IconName, Selectable as _, Sizable as _, h_flex, v_flex,
+};
 use gpui_kit::*;
 
 use super::{Browser, Mode, PROXY_DRAG_LONG_EDGE, PROXY_RELEASE_LONG_EDGE};
@@ -132,6 +134,28 @@ impl Browser {
     /// Whether crop mode is active.
     pub fn crop_active(&self) -> bool {
         self.crop.is_some()
+    }
+
+    /// The draft crop, while crop mode is active.
+    pub fn crop_draft(&self) -> Option<edit_core::Crop> {
+        self.crop.as_ref().map(|session| session.draft().clone())
+    }
+
+    /// Whether the crop canvas has painted, so the frame can be edited.
+    pub fn crop_ready(&self) -> bool {
+        self.straightened_image && self.crop.as_ref().is_some_and(CropSession::has_source)
+    }
+
+    /// Where the canvas last painted the image, as `(x, y, w, h)` in window
+    /// pixels.
+    pub fn canvas_image_frame(&self) -> Option<(f32, f32, f32, f32)> {
+        self.crop_frame.get().map(|f| (f.x, f.y, f.w, f.h))
+    }
+
+    /// Turn the image to `degrees` as if the slider were released there.
+    pub fn straighten_to(&mut self, degrees: f32, cx: &mut Context<Self>) {
+        self.on_straighten(degrees, true, cx);
+        cx.notify();
     }
 
     /// `C`: enter crop mode, or apply the frame and leave.
@@ -297,7 +321,7 @@ impl Browser {
         self.request_render(RenderSize::Proxy(size), None, cx);
     }
 
-    fn set_crop_aspect(&mut self, aspect: Option<Aspect>, cx: &mut Context<Self>) {
+    pub fn set_crop_aspect(&mut self, aspect: Option<Aspect>, cx: &mut Context<Self>) {
         if let Some(session) = self.crop.as_mut() {
             session.set_aspect(aspect);
             cx.notify();
@@ -332,7 +356,9 @@ impl Browser {
         }
     }
 
-    /// The crop panel: aspect presets, straighten, and the way out.
+    /// The crop panel, laid out like the Develop panel it replaces: a title
+    /// and hint, the aspect presets in an even grid, the straighten row
+    /// (name, readout and reset on one line, slider below), and the actions.
     pub(super) fn render_crop_panel(&mut self, cx: &mut Context<Self>) -> impl IntoElement {
         let (aspect, angle) = self
             .crop
@@ -346,19 +372,29 @@ impl Browser {
             theme.sidebar_border,
             theme.muted_foreground,
         );
-        let presets = std::iter::once(None)
+        let presets: Vec<Option<Aspect>> = std::iter::once(None)
             .chain(Aspect::ALL.into_iter().map(Some))
-            .enumerate()
-            .map(|(i, preset)| {
-                Button::new(("crop-aspect", i))
-                    .label(preset.map(Aspect::label).unwrap_or("Free"))
-                    .compact()
-                    .small()
-                    .selected(aspect == preset)
-                    .on_click(cx.listener(move |this, _: &ClickEvent, _, cx| {
-                        this.set_crop_aspect(preset, cx);
-                    }))
-            });
+            .collect();
+        let mut preset_rows = Vec::new();
+        for (row, chunk) in presets.chunks(4).enumerate() {
+            let mut line = h_flex().w_full().gap_1();
+            for (col, preset) in chunk.iter().enumerate() {
+                let preset = *preset;
+                line = line.child(
+                    div().flex_1().child(
+                        Button::new(("crop-aspect", row * 4 + col))
+                            .label(preset.map(Aspect::label).unwrap_or("Free"))
+                            .xsmall()
+                            .w_full()
+                            .selected(aspect == preset)
+                            .on_click(cx.listener(move |this, _: &ClickEvent, _, cx| {
+                                this.set_crop_aspect(preset, cx);
+                            })),
+                    ),
+                );
+            }
+            preset_rows.push(line);
+        }
         v_flex()
             .w(px(240.0))
             .h_full()
@@ -368,49 +404,94 @@ impl Browser {
             .text_color(fg)
             .border_l_1()
             .border_color(border)
-            .child(Label::new("Crop"))
             .child(
-                Label::new("Drag the frame to move it, or drag a handle to resize.")
-                    .text_xs()
-                    .text_color(muted),
-            )
-            .child(Label::new("Aspect").text_sm())
-            .child(h_flex().flex_wrap().gap_1().children(presets))
-            .child(Label::new("Straighten").text_sm())
-            .child(
-                h_flex()
-                    .w_full()
-                    .items_center()
-                    .gap_2()
-                    .child(
-                        div()
-                            .id("crop-straighten")
-                            .flex_1()
-                            .h(px(20.0))
-                            .child(StraightenSlider::new(&self.straighten)),
-                    )
-                    .child(Label::new(format!("{angle:+.2}°")).text_xs()),
+                v_flex().gap_1().child(Label::new("Crop").text_lg()).child(
+                    Label::new("Drag the frame to move it, or a handle to resize.")
+                        .text_xs()
+                        .text_color(muted),
+                ),
             )
             .child(
-                h_flex()
-                    .w_full()
+                v_flex()
+                    .gap_1()
+                    .child(Label::new("Aspect ratio").text_xs().text_color(muted))
+                    .children(preset_rows),
+            )
+            .child(
+                v_flex()
                     .gap_1()
                     .child(
-                        Button::new("crop-reset").label("Reset").small().on_click(
-                            cx.listener(|this, _: &ClickEvent, _, cx| this.reset_crop(cx)),
-                        ),
+                        h_flex()
+                            .w_full()
+                            .items_center()
+                            .justify_between()
+                            .child(Label::new("Straighten").text_xs())
+                            .child(
+                                h_flex()
+                                    .items_center()
+                                    .gap_1()
+                                    .child(
+                                        Label::new(format!("{angle:+.1}°"))
+                                            .text_xs()
+                                            .text_color(muted),
+                                    )
+                                    .child(
+                                        Button::new("crop-straighten-reset")
+                                            .ghost()
+                                            .xsmall()
+                                            .icon(IconName::Undo2)
+                                            .tooltip("Reset straighten")
+                                            .disabled(angle == 0.0)
+                                            .on_click(cx.listener(
+                                                |this, _: &ClickEvent, _, cx| {
+                                                    this.on_straighten(0.0, true, cx);
+                                                    this.straighten_dragging = false;
+                                                    cx.notify();
+                                                },
+                                            )),
+                                    ),
+                            ),
                     )
-                    .child(Button::new("crop-cancel").label("Cancel").small().on_click(
-                        cx.listener(|this, _: &ClickEvent, _, cx| this.finish_crop(false, cx)),
-                    ))
+                    .child(StraightenSlider::new(&self.straighten)),
+            )
+            .child(
+                h_flex()
+                    .w_full()
+                    .gap_2()
+                    .justify_between()
                     .child(
-                        Button::new("crop-done")
-                            .label("Done")
+                        Button::new("crop-reset")
+                            .ghost()
                             .small()
-                            .primary()
+                            .label("Reset")
+                            .tooltip("Back to the whole photo")
                             .on_click(cx.listener(|this, _: &ClickEvent, _, cx| {
-                                this.finish_crop(true, cx);
+                                this.reset_crop(cx);
                             })),
+                    )
+                    .child(
+                        h_flex()
+                            .gap_2()
+                            .child(
+                                Button::new("crop-cancel")
+                                    .outline()
+                                    .small()
+                                    .label("Cancel")
+                                    .tooltip("Cancel (Esc)")
+                                    .on_click(cx.listener(|this, _: &ClickEvent, _, cx| {
+                                        this.finish_crop(false, cx);
+                                    })),
+                            )
+                            .child(
+                                Button::new("crop-apply")
+                                    .primary()
+                                    .small()
+                                    .label("Apply")
+                                    .tooltip("Apply (Enter)")
+                                    .on_click(cx.listener(|this, _: &ClickEvent, _, cx| {
+                                        this.finish_crop(true, cx);
+                                    })),
+                            ),
                     ),
             )
     }

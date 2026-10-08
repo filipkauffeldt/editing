@@ -149,6 +149,11 @@ impl CropSession {
         &self.draft
     }
 
+    /// Whether the straightened canvas has painted, so edits can run.
+    pub fn has_source(&self) -> bool {
+        self.source.is_some()
+    }
+
     pub fn is_dragging(&self) -> bool {
         self.drag.is_some()
     }
