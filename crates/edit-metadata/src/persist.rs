@@ -28,11 +28,9 @@ pub enum PersistOutcome {
 /// row, so a sidecar built from unparsable JSON is skipped but the row
 /// still commits.
 ///
-/// [Crop] can ride in two places: the `crop_json` column and embedded
-/// `DevelopSettings.crop` (C1/D1 producers may emit either). When
-/// `crop_json` is missing, the embedded crop is mapped into the sidecar;
-/// a debug assert flags the mapping so D1 can reconcile the two models
-/// instead of relying on it.
+/// The crop rides only in `crop_json`. A crop embedded in the develop
+/// settings is ignored here and by the render service, so the sidecar and
+/// the pixels never describe two different crops.
 pub fn persist_edit(
     catalog: &Catalog,
     item_id: i64,
@@ -60,7 +58,7 @@ pub fn persist_sidecar(
         Err(e) => return Ok(PersistOutcome::SidecarSkipped(format!("develop json: {e}"))),
     };
     let crop: Option<Crop> = match crop_json {
-        None => embedded_crop(&develop),
+        None => None,
         Some(json) => match serde_json::from_str(json) {
             Ok(c) => Some(c),
             Err(e) => return Ok(PersistOutcome::SidecarSkipped(format!("crop json: {e}"))),
@@ -74,27 +72,6 @@ pub fn persist_sidecar(
         }
         Err(e) => Ok(PersistOutcome::SidecarSkipped(e.to_string())),
     }
-}
-
-/// Map the LightCraft-embedded crop to the sidecar `Crop` when no
-/// `crop_json` row exists, so the sidecar encodes exactly one crop model.
-/// TODO(D1): replace this fallback with a single reconciled crop model —
-/// a producer must not have to choose where the crop rides.
-fn embedded_crop(develop: &DevelopSettings) -> Option<Crop> {
-    let geometry = &develop.crop.geometry;
-    if develop.crop == DevelopSettings::default().crop {
-        return None;
-    }
-    Some(Crop {
-        rect: edit_core::Rect::new(
-            geometry.rect.x0 as f32,
-            geometry.rect.y0 as f32,
-            (geometry.rect.x1 - geometry.rect.x0) as f32,
-            (geometry.rect.y1 - geometry.rect.y0) as f32,
-        ),
-        rotation_degrees: geometry.angle as f32,
-        aspect: None,
-    })
 }
 
 #[cfg(test)]
@@ -211,22 +188,51 @@ mod tests {
     }
 
     #[test]
-    fn persist_maps_crop_embedded_in_develop_json() {
+    fn persist_writes_the_crop_json_into_the_sidecar() {
+        let (_dir, catalog) = scratch_catalog();
+        let item = seed_item(&catalog);
+        let dir = tempfile::TempDir::new().unwrap();
+        let develop_json = serde_json::to_string(&DevelopSettings::default()).unwrap();
+        let crop_json = serde_json::to_string(&Crop {
+            rect: edit_core::Rect::new(0.1, 0.2, 0.6, 0.5),
+            rotation_degrees: 4.5,
+            aspect: Some(edit_core::Aspect::FourThree),
+        })
+        .unwrap();
+
+        let outcome = persist_edit(
+            &catalog,
+            item,
+            &develop_json,
+            Some(&crop_json),
+            &dir.path().join("photo.xmp"),
+        )
+        .unwrap();
+        assert_eq!(outcome, PersistOutcome::Written);
+        let packet = std::fs::read_to_string(dir.path().join("photo.xmp")).unwrap();
+        assert!(packet.contains("crs:HasCrop=\"True\""));
+        assert!(packet.contains("crs:CropLeft=\"0.1\""));
+        assert!(packet.contains("crs:CropAngle=\"4.5\""));
+        // Both strings round-trip through the edits row untouched.
+        let edit = catalog.get_edit(item).unwrap().unwrap();
+        assert_eq!(edit.develop_json, develop_json);
+        assert_eq!(edit.crop_json.as_deref(), Some(crop_json.as_str()));
+        assert!(edit.crs_written_at.is_some());
+    }
+
+    #[test]
+    fn persist_ignores_a_crop_embedded_in_develop_json() {
         let (_dir, catalog) = scratch_catalog();
         let item = seed_item(&catalog);
         let dir = tempfile::TempDir::new().unwrap();
 
-        // A first C1/D1 producer embedding the crop in develop_json instead
-        // of crop_json: the sidecar encodes exactly one crop model, never
-        // both.
-        let embedded = serde_json::json!({
-            "crop": {"geometry": {"rect": {"x0": 0.1, "y0": 0.2, "x1": 0.9, "y1": 0.9}, "angle": 0.0}, "aspect": null, "flipH": false, "flipV": false},
-        });
+        // The crop lives in crop_json only: one crop model, never two.
         let develop_json = {
             let mut base = serde_json::to_value(DevelopSettings::default()).unwrap();
-            for (k, v) in embedded.as_object().unwrap() {
-                base[k] = v.clone();
-            }
+            base["crop"] = serde_json::json!({
+                "geometry": {"rect": {"x0": 0.1, "y0": 0.2, "x1": 0.9, "y1": 0.9}, "angle": 0.0},
+                "aspect": null, "flipH": false, "flipV": false,
+            });
             serde_json::to_string(&base).unwrap()
         };
 
@@ -240,20 +246,37 @@ mod tests {
         .unwrap();
         assert_eq!(outcome, PersistOutcome::Written);
         let packet = std::fs::read_to_string(dir.path().join("photo.xmp")).unwrap();
-        assert!(packet.contains("crs:HasCrop=\"True\""));
-        assert!(packet.contains("crs:CropLeft=\"0.1\""));
+        assert!(packet.contains("crs:HasCrop=\"False\""));
+        assert!(!packet.contains("crs:CropLeft"));
         // The edit committed verbatim; crs_written_at follows the sidecar.
+        let edit = catalog.get_edit(item).unwrap().unwrap();
+        assert_eq!(edit.develop_json, develop_json);
+        assert!(edit.crs_written_at.is_some());
+    }
+
+    #[test]
+    fn persist_keeps_the_edit_when_crop_json_is_corrupt() {
+        let (_dir, catalog) = scratch_catalog();
+        let item = seed_item(&catalog);
+        let dir = tempfile::TempDir::new().unwrap();
+        let develop_json = serde_json::to_string(&DevelopSettings::default()).unwrap();
+        let outcome = persist_edit(
+            &catalog,
+            item,
+            &develop_json,
+            Some("{nope"),
+            &dir.path().join("photo.xmp"),
+        )
+        .unwrap();
+        assert!(matches!(outcome, PersistOutcome::SidecarSkipped(m) if m.contains("crop json")));
         assert_eq!(
-            catalog.get_edit(item).unwrap().unwrap().develop_json,
-            develop_json
-        );
-        assert!(
             catalog
                 .get_edit(item)
                 .unwrap()
                 .unwrap()
-                .crs_written_at
-                .is_some()
+                .crop_json
+                .as_deref(),
+            Some("{nope")
         );
     }
 }

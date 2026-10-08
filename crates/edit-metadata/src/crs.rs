@@ -95,11 +95,13 @@ pub fn exiftool_tag_args(develop: &DevelopSettings, crop: Option<&Crop>) -> Vec<
 /// `crs:` crop attributes. Always includes `HasCrop`; edges and angle only
 /// when cropped.
 ///
-/// `CropAngle` carries the app rotation (clockwise-positive) as-is. The
-/// sign against Lightroom is unverified: darktable's importer negates the
-/// angle (lightroom.c:494-503), which suggests LR and darktable disagree on
-/// direction. A ±15° straighten round-tripped through real Lightroom must
-/// verify the sign before D1 ships crop UI on this mapping.
+/// The edges and `CropAngle` are the app's crop numbers unchanged, because
+/// `Crop` and LightCraft's own `crs:` reader (`engine/src/crs.rs`, crop
+/// block) share one basis and one clockwise-positive sign: a frame in the
+/// image turned about its centre. Whether real Lightroom agrees on the sign
+/// has not been checked against Lightroom itself; darktable's importer
+/// negates the angle, but it turns its image the other way. A +-15 degree
+/// straighten round-tripped through Lightroom settles it.
 pub fn crop_attributes(crop: Option<&Crop>) -> Vec<(String, String)> {
     let Some(crop) = crop else {
         return vec![("HasCrop".into(), "False".into())];
@@ -392,6 +394,29 @@ mod tests {
         assert_eq!(attrs["CropTop"], "0.1");
         assert_eq!(attrs["CropRight"], "0.95");
         assert_eq!(attrs["CropBottom"], "0.9");
+    }
+
+    #[test]
+    fn crop_attributes_carry_the_straighten_angle_as_is() {
+        let crop = Crop {
+            rect: Rect::new(0.1, 0.2, 0.7, 0.6),
+            rotation_degrees: -3.5,
+            aspect: Some(edit_core::Aspect::ThreeTwo),
+        };
+        let attrs: std::collections::HashMap<_, _> =
+            crop_attributes(Some(&crop)).into_iter().collect();
+        assert_eq!(attrs["CropAngle"], "-3.5");
+        assert_eq!(attrs["CropRight"], "0.8");
+        // A level frame that is only rotated still counts as a crop.
+        let tilted = Crop {
+            rect: Rect::full(),
+            rotation_degrees: 2.0,
+            aspect: None,
+        };
+        let attrs: std::collections::HashMap<_, _> =
+            crop_attributes(Some(&tilted)).into_iter().collect();
+        assert_eq!(attrs["HasCrop"], "True");
+        assert_eq!(attrs["CropAngle"], "2");
     }
 
     #[test]
