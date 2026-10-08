@@ -477,6 +477,11 @@ fn aspect_w_h(aspect: Aspect) -> (u32, u32) {
 
 /// Map a normalized crop (+ rotation) into the develop settings' own crop
 /// model.
+///
+/// TODO(D1): reconcile the angle models — `edit_core::Crop.rotation_degrees`
+/// and `DevelopSettings.crop.geometry.angle` (straighten, −45..45, and the
+/// crop rect shrunk symmetrically inside the rotated image) share one basis
+/// only for small angles.
 fn apply_crop(develop: &mut DevelopSettings, crop: &Crop) {
     let rect = crop.rect.clamped();
     let geometry = &mut develop.crop.geometry;
@@ -562,8 +567,7 @@ mod tests {
         std::fs::write(path, bytes).unwrap();
     }
 
-    /// Mean of the G/B/R (BGRA: index 1/2/0... documented at the call sites)
-    /// channels of a frame.
+    /// Mean of the BGRA channels of a frame (index 0 = blue, 1 = green, 2 = red).
     fn mean_channels(frame: &Frame) -> [f32; 4] {
         let px = frame.pixels.as_chunks::<4>().0;
         let n = px.len() as f32;
@@ -607,6 +611,159 @@ mod tests {
         let mean = mean_channels(&full);
         assert!(mean[0] < mean[2], "frame is not BGRA: {mean:?}");
         std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn crop_mapping_plumbs_rect_and_angle() {
+        let dir = std::env::temp_dir().join(format!("edit-render-crop-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("crop.jpg");
+        // Non-uniform source: left half dark, right half bright.
+        let (w, h) = (48u32, 32u32);
+        let mut src = image::RgbImage::new(w, h);
+        for (x, _y, px) in src.enumerate_pixels_mut() {
+            let level = if x < w / 2 { 60u8 } else { 230u8 };
+            *px = image::Rgb([level, level, level]);
+        }
+        let mut bytes = Vec::new();
+        src.write_to(&mut Cursor::new(&mut bytes), image::ImageFormat::Jpeg)
+            .unwrap();
+        std::fs::write(&path, bytes).unwrap();
+
+        let service = RenderService::new();
+        let cancel = CancelToken::new();
+        let develop = DevelopSettings::default();
+        let full = service
+            .render_path(&path, RenderSize::Full, &develop, None, &cancel)
+            .unwrap();
+        // Normalized crop rect x 0..0.5: the crop render mirrors the *left* half.
+        let crop = Crop {
+            rect: edit_core::Rect::new(0.0, 0.0, 0.5, 1.0),
+            rotation_degrees: 0.0,
+            aspect: None,
+        };
+        let cropped = service
+            .render_path(&path, RenderSize::Full, &develop, Some(&crop), &cancel)
+            .unwrap();
+        let full_mean = mean_channels(&full);
+        let cropped_mean = mean_channels(&cropped);
+        assert!(
+            (cropped_mean[0] - full_mean[0]).abs() > 30.0,
+            "crop rect did not select the source region: {full_mean:?} vs {cropped_mean:?}"
+        );
+        // A straighten angle flows (the pinned engine clamps the crop rect
+        // symmetrically about the centre, so the sign inside is not provable
+        // alone; D1 reconciles the straighten model).
+        let mut plus = crop.clone();
+        plus.rotation_degrees = 12.0;
+        let plus_frame = service
+            .render_path(&path, RenderSize::Full, &develop, Some(&plus), &cancel)
+            .unwrap();
+        let plus_mean = mean_channels(&plus_frame);
+        assert_ne!(plus_mean, cropped_mean, "angle did not plumb");
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn a_cancelled_token_rejects_the_render() {
+        let dir = std::env::temp_dir().join(format!("edit-render-cancel-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("cancel.jpg");
+        tiny_jpeg(&path, 32, 20, [120, 120, 120]);
+        let service = RenderService::new();
+        let token = CancelToken::new();
+        token.cancel();
+        let result = service.render_path(
+            &path,
+            RenderSize::Full,
+            &DevelopSettings::default(),
+            None,
+            &token,
+        );
+        assert!(matches!(result, Err(edit_core::Error::Cancelled)));
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn pending_decode_publishes_errors_to_waiters() {
+        let slot = Arc::new(super::PendingDecode {
+            out: Mutex::new(None),
+            cond: Condvar::new(),
+        });
+        let waiter = Arc::clone(&slot);
+        let handle = std::thread::spawn(move || {
+            std::thread::sleep(std::time::Duration::from_millis(20));
+            slot.publish(Err("disk full".to_string()));
+        });
+        let observed = waiter.wait(&CancelToken::new());
+        handle.join().unwrap();
+        assert_eq!(
+            observed.map(|r| r.err()),
+            Some(Some("disk full".to_string()))
+        );
+    }
+
+    #[test]
+    fn proxy_and_full_renders_agree_on_a_uniform_source() {
+        // One code path at every size: a uniform gray source develops to the
+        // same look at the drag edge and at native resolution, within the
+        // resample tolerance.
+        let dir = std::env::temp_dir().join(format!("edit-render-agree-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("agree.jpg");
+        tiny_jpeg(&path, 64, 48, [140, 150, 160]);
+        let service = RenderService::new();
+        let cancel = CancelToken::new();
+        let develop = DevelopSettings::default();
+        let proxy = service
+            .render_path(&path, RenderSize::Proxy(32), &develop, None, &cancel)
+            .unwrap();
+        let full = service
+            .render_path(&path, RenderSize::Full, &develop, None, &cancel)
+            .unwrap();
+        assert!(proxy.width <= 32 && full.width == 64);
+        let proxy_mean = mean_channels(&proxy);
+        let full_mean = mean_channels(&full);
+        for i in 0..4 {
+            assert!(
+                (proxy_mean[i] - full_mean[i]).abs() <= 6.0,
+                "proxy and full disagree on channel {i}: {proxy_mean:?} vs {full_mean:?}"
+            );
+        }
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn raw_fixture_develops_proxy_and_full() {
+        // Set EDIT_RENDER_RAW_FIXTURE to a camera raw (CC0 sample from
+        // raw.pixls.us; the binary is multi-MB camera data and not committed).
+        let Some(fixture) = std::env::var_os("EDIT_RENDER_RAW_FIXTURE").map(PathBuf::from) else {
+            eprintln!("skip: set EDIT_RENDER_RAW_FIXTURE to a camera raw file");
+            return;
+        };
+        if !fixture.is_file() {
+            eprintln!("skip: {} is not a file", fixture.display());
+            return;
+        }
+        let service = RenderService::new();
+        let cancel = CancelToken::new();
+        let develop = DevelopSettings::default();
+        let proxy = service
+            .render_path(
+                &fixture,
+                RenderSize::Proxy(crate::PROXY_DRAG_LONG_EDGE as u16),
+                &develop,
+                None,
+                &cancel,
+            )
+            .unwrap();
+        assert!(proxy.width <= crate::PROXY_DRAG_LONG_EDGE);
+        // The full export-grade path also renders (the code path is shared).
+        let full = service
+            .render_path(&fixture, RenderSize::Full, &develop, None, &cancel)
+            .unwrap();
+        assert!(full.width > 0 && full.height > 0);
     }
 
     #[test]
