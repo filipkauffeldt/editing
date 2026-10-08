@@ -41,7 +41,20 @@ pub fn persist_edit(
     sidecar_path: &Path,
 ) -> Result<PersistOutcome> {
     catalog.upsert_edit(item_id, develop_json, crop_json)?;
+    persist_sidecar(catalog, item_id, develop_json, crop_json, sidecar_path)
+}
 
+/// The sidecar leg of [`persist_edit`], for callers that already committed
+/// the catalog row: it never writes the `edits` row, so a slow sidecar write
+/// cannot overwrite a newer commit. `crs_written_at` follows a successful
+/// write.
+pub fn persist_sidecar(
+    catalog: &Catalog,
+    item_id: i64,
+    develop_json: &str,
+    crop_json: Option<&str>,
+    sidecar_path: &Path,
+) -> Result<PersistOutcome> {
     let develop: DevelopSettings = match serde_json::from_str(develop_json) {
         Ok(d) => d,
         Err(e) => return Ok(PersistOutcome::SidecarSkipped(format!("develop json: {e}"))),
@@ -131,6 +144,25 @@ mod tests {
         assert!(edit.crs_written_at.is_some());
         let packet = std::fs::read_to_string(&sidecar).unwrap();
         assert!(packet.contains("crs:ProcessVersion=\"11.0\""));
+    }
+
+    #[test]
+    fn persist_sidecar_leaves_the_edit_row_alone() {
+        let (_dir, catalog) = scratch_catalog();
+        let item = seed_item(&catalog);
+        let dir = tempfile::TempDir::new().unwrap();
+        let newer = serde_json::to_string(&DevelopSettings::default()).unwrap();
+        catalog.upsert_edit(item, &newer, None).unwrap();
+
+        // A stale sidecar write must not clobber the committed row.
+        let stale = newer.replace("\"exposure\":0.0", "\"exposure\":1.0");
+        assert_ne!(stale, newer);
+        let outcome =
+            persist_sidecar(&catalog, item, &stale, None, &dir.path().join("photo.xmp")).unwrap();
+        assert_eq!(outcome, PersistOutcome::Written);
+        let edit = catalog.get_edit(item).unwrap().unwrap();
+        assert_eq!(edit.develop_json, newer);
+        assert!(edit.crs_written_at.is_some());
     }
 
     #[test]

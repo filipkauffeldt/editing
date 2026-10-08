@@ -10,6 +10,7 @@ use app::browse::{MetaBadge, ThumbPayload, ThumbState, list_browse_items, run_ca
 use app::views::Browser;
 use edit_catalog::{Catalog, JobEvent, JobEventKind, JobKind, JobState};
 use edit_metadata::{MetadataWritePayload, TemplateFields};
+use edit_render::RenderService;
 use gpui_kit::AppContext;
 
 static NEXT_DIR: AtomicU64 = AtomicU64::new(0);
@@ -40,7 +41,7 @@ fn open_browser(
     catalog: Arc<Catalog>,
 ) -> gpui_kit::Entity<Browser> {
     let (_, rx) = flume::unbounded();
-    cx.update(|cx| cx.new(|cx| Browser::new(catalog, rx, cx)))
+    cx.update(|cx| cx.new(|cx| Browser::new(catalog, rx, Arc::new(RenderService::new()), cx)))
 }
 
 #[gpui_kit::test]

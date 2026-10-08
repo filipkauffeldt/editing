@@ -1,6 +1,8 @@
 mod ingest;
 mod templates;
 
+use edit_render::RenderService;
+
 use std::path::PathBuf;
 use std::sync::Arc;
 
@@ -26,6 +28,33 @@ use edit_metadata::Writer;
 /// database, is the bottleneck, and each worker holds its own SQLite
 /// connection, so raising this is a one-line change when more cards are common.
 const WORKER_THREADS: usize = 3;
+
+/// Item → photo-path resolution over the catalog: the JPEG side of a pair
+/// (display grain), else the raw side. Feeds the render service's
+/// DevelopEngine contract.
+struct CatalogPhotoPaths {
+    catalog: Arc<Catalog>,
+}
+
+impl edit_render::ItemPhotoPaths for CatalogPhotoPaths {
+    fn photo_path(&self, item: edit_core::ItemId) -> edit_core::Result<Option<PathBuf>> {
+        let item = self
+            .catalog
+            .get_item(item.get())
+            .map_err(|e| edit_core::Error::InvalidInput(e.to_string()))?;
+        let side = item.jpeg_photo_id.or(item.raw_photo_id);
+        match side {
+            Some(photo_id) => {
+                let photo = self
+                    .catalog
+                    .get_photo(photo_id)
+                    .map_err(|e| edit_core::Error::InvalidInput(e.to_string()))?;
+                Ok(Some(PathBuf::from(photo.path)))
+            }
+            None => Ok(None),
+        }
+    }
+}
 
 fn catalog_path() -> PathBuf {
     let base = std::env::var_os("EDITING_CATALOG")
@@ -123,12 +152,16 @@ fn main() {
         edit_catalog::spawn_workers(&catalog, WORKER_THREADS, handler).expect("spawn workers");
     let events = pool.events().clone();
     let browser_events = events.clone();
+    let renderer = Arc::new(RenderService::with_paths(Arc::new(CatalogPhotoPaths {
+        catalog: Arc::clone(&catalog),
+    })));
     // The pool owns the worker threads; leak it so background jobs keep
     // draining for the life of the window.
     std::mem::forget(pool);
 
     // Open the demo folder from argv[1] through the real job path when given.
     let pending_folder: Option<PathBuf> = std::env::args().nth(1).map(PathBuf::from);
+    let browser_renderer = Arc::clone(&renderer);
 
     let app = gpui_kit::application().with_assets(gpui_kit::assets::Assets);
     app.run(move |cx| {
@@ -153,7 +186,14 @@ fn main() {
         let window_options = TitleBar::window_options();
         let (window_handle, shell) = gpui_kit::open_window(window_options, cx, |window, cx| {
             let browser_catalog = Arc::clone(&catalog);
-            let browser = cx.new(|cx| Browser::new(browser_catalog, browser_events.clone(), cx));
+            let browser = cx.new(|cx| {
+                Browser::new(
+                    browser_catalog,
+                    browser_events.clone(),
+                    browser_renderer,
+                    cx,
+                )
+            });
             // Ingest dialog state + inputs. Rebuild the card/job routing from
             // durable state so a crash-resumed ingest is visible.
             let state = cx.new(|_| AppState::new());

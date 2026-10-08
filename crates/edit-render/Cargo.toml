@@ -1,0 +1,19 @@
+[package]
+name = "edit-render"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+description = "LightCraft bridge: decode, develop at any size, retouch stage, crop; BGRA frames."
+
+[dependencies]
+edit-core.workspace = true
+lightcraft-pipeline.workspace = true
+lightcraft-raw.workspace = true
+lightcraft-raster.workspace = true
+lightcraft-color.workspace = true
+lightcraft-geom.workspace = true
+lightcraft-codecs.workspace = true
+lightcraft-develop.workspace = true
+image.workspace = true
+moxcms.workspace = true
