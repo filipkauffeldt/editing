@@ -13,7 +13,7 @@
 //! `/proc/mounts`, not a volume label). Labels and filesystem UUIDs come from
 //! udev `ID_FS_LABEL` / `ID_FS_UUID` properties joined on the device node.
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 /// How often the volume list is re-polled when no hotplug event arrives.
@@ -56,6 +56,41 @@ impl Volume {
             Some(uuid) => format!("uuid:{uuid}"),
             None => format!("mount:{}", mount_point.display()),
         }
+    }
+
+    /// A plain folder offered as an ingest source ("Choose folder…").
+    pub fn folder(path: &Path) -> Self {
+        Self {
+            identity: format!("folder:{}", path.display()),
+            device: String::new(),
+            mount_point: path.to_path_buf(),
+            label: None,
+            fs_uuid: None,
+            fs_type: "folder".to_string(),
+            capacity_bytes: 0,
+            free_bytes: 0,
+            removable: false,
+            read_only: false,
+        }
+    }
+
+    /// Whether this looks like a camera card or external drive rather than
+    /// a system mount. Removable media and anything under `/media`,
+    /// `/run/media` or `/mnt` qualify; `/`, `/home`, `/boot`, `/tmp` and
+    /// friends never do. (Anything else can still be chosen as a folder.)
+    pub fn is_ingest_source(&self) -> bool {
+        const EXTERNAL: &[&str] = &["/media", "/run/media", "/mnt"];
+        let mount = self.mount_point.as_path();
+        if mount == Path::new("/") {
+            return false;
+        }
+        if EXTERNAL.iter().any(|prefix| mount.starts_with(prefix)) {
+            return true;
+        }
+        if self.removable {
+            return true;
+        }
+        false
     }
 
     /// Human-readable name: label, then mount directory name, then device.
@@ -536,5 +571,39 @@ mod tests {
             start.elapsed() >= interval,
             "disconnected channel must sleep the full interval, not spin"
         );
+    }
+
+    fn volume_at(mount: &str, removable: bool) -> Volume {
+        let mut volume = snapshot(&[disk("/dev/sdb1", mount)], &[]).remove(0);
+        volume.removable = removable;
+        volume
+    }
+
+    #[test]
+    fn only_cards_and_external_drives_are_ingest_sources() {
+        for mount in ["/media/card", "/run/media/filip/EOS_DIGITAL", "/mnt/usb"] {
+            assert!(volume_at(mount, false).is_ingest_source(), "{mount}");
+        }
+        assert!(volume_at("/somewhere/reader", true).is_ingest_source());
+        for mount in [
+            "/",
+            "/home",
+            "/boot",
+            "/boot/efi",
+            "/tmp/.mount_t3_abc",
+            "/var/lib/x",
+        ] {
+            assert!(!volume_at(mount, false).is_ingest_source(), "{mount}");
+        }
+        // Removable never rescues the root filesystem.
+        assert!(!volume_at("/", true).is_ingest_source());
+    }
+
+    #[test]
+    fn a_chosen_folder_is_a_source_of_its_own() {
+        let folder = Volume::folder(Path::new("/home/filip/Pictures/card-dump"));
+        assert_eq!(folder.identity, "folder:/home/filip/Pictures/card-dump");
+        assert_eq!(folder.display_name(), "card-dump");
+        assert_eq!(folder.used_percent(), 0.0);
     }
 }
