@@ -507,8 +507,10 @@ fn load_bytes_now(
 /// `max_edge`, oriented.
 pub fn load_embedded_preview(bytes: &[u8], max_edge: usize) -> Option<(Rgb32f, SourceInfo)> {
     let jpeg = lightcraft_raw::embedded_preview(bytes)?;
-    let d = lightcraft_codecs::decode(&jpeg, DecodeOptions::fit(max_edge as u32, max_edge as u32))
-        .ok()?;
+    // The decoder doubles its bounds; a native-size request (`usize::MAX`)
+    // must not overflow them.
+    let edge = max_edge.min(1 << 20) as u32;
+    let d = lightcraft_codecs::decode(&jpeg, DecodeOptions::fit(edge, edge)).ok()?;
     let img = d.to_working();
     let img = if img.width.max(img.height) > max_edge {
         fit(&img, max_edge, max_edge, Filter::Mitchell)

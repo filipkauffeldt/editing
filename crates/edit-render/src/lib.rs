@@ -896,6 +896,17 @@ mod tests {
             mean[0] < mean[2],
             "preview did not carry its color: {mean:?}"
         );
+        // Full takes the same fallback at the preview's own size.
+        let full = service
+            .render_path(
+                &path,
+                RenderSize::Full,
+                &DevelopSettings::default(),
+                None,
+                &CancelToken::new(),
+            )
+            .unwrap();
+        assert_eq!((full.width, full.height), (64, 40));
         std::fs::remove_dir_all(&dir).ok();
     }
 
