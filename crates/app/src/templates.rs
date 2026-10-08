@@ -35,8 +35,7 @@ use app::views::Browser;
 
 actions!(templates, [OpenTemplates]);
 
-/// Catalog setting holding the last loaded code replacement file path.
-const REPLACEMENTS_SETTING: &str = "code_replacements_path";
+use app::ingest_job::REPLACEMENTS_SETTING;
 
 /// The overlay dialog. Owns the form and the catalog rows; the browser
 /// owns the job queue and badges, so apply is a thin read + enqueue.

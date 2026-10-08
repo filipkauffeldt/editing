@@ -93,6 +93,7 @@ impl Card {
                 backup_dir: "",
                 session: "Cup final",
                 template: Some(&template),
+                replacements: None,
             },
         )
         .unwrap()

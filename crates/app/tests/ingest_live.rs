@@ -68,6 +68,7 @@ fn photos_appear_one_by_one_while_the_ingest_runs(cx: &mut gpui_kit::TestAppCont
             backup_dir: "",
             session: "shoot",
             template: None,
+            replacements: None,
         },
     )
     .unwrap();
@@ -169,6 +170,7 @@ fn an_ingest_switches_the_sheet_once_and_does_not_fight_the_user(
             backup_dir: "",
             session: "shoot",
             template: None,
+            replacements: None,
         },
     )
     .unwrap();

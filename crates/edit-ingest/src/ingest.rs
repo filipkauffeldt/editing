@@ -72,6 +72,10 @@ pub struct IngestCopyPayload {
     /// ingest; `None` ingests without stamping.
     #[serde(default)]
     pub iptc_fields_json: Option<String>,
+    /// The code replacement table in force at start, frozen with the
+    /// template (opaque JSON; the metadata writer reads it).
+    #[serde(default)]
+    pub iptc_replacements_json: Option<String>,
 }
 
 /// One supported file found on a card.
@@ -191,6 +195,7 @@ pub fn plan_ingest(request: &IngestPlanRequest<'_>) -> Result<IngestPlan, Naming
             iptc_fields_json: request
                 .template
                 .map(|template| template.fields_json.to_string()),
+            iptc_replacements_json: None,
         },
     })
 }
@@ -816,6 +821,7 @@ mod tests {
             session: "shoot".to_string(),
             start_seq: 1,
             iptc_fields_json: None,
+            iptc_replacements_json: None,
         }
     }
 
@@ -1216,6 +1222,7 @@ mod tests {
             session: "shoot".into(),
             start_seq: 1,
             iptc_fields_json: None,
+            iptc_replacements_json: None,
         };
         assert!(run_ingest_copy(&catalog, &p, fixed_metadata, &|_, _| {}).is_err());
         assert_eq!(catalog.get_ingest_batch(batch).unwrap().state, "failed");

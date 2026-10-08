@@ -482,6 +482,7 @@ mod tests {
             paths: vec![jpeg.to_string_lossy().into_owned()],
             sequence: 1,
             captured_at: 1_791_374_400,
+            session: None,
             fields_json: fields.to_string(),
             replacements: Some(replacements),
         })

@@ -17,7 +17,7 @@ use edit_ingest::{
     DEFAULT_DEST_RULE, DEFAULT_FILENAME_RULE, IngestCopyPayload, Volume, batch_volume_identity,
 };
 
-use app::ingest_job::{IngestStart, start_ingest};
+use app::ingest_job::{IngestStart, saved_code_replacements, start_ingest};
 use gpui_kit::component::alert::Alert;
 use gpui_kit::component::button::Button;
 use gpui_kit::component::dialog::DialogTitle;
@@ -607,6 +607,7 @@ impl IngestDialog {
         let backup = self.backup_dir.read(cx).value().to_string();
         let session = volume.display_name();
         let template = self.selected_template(cx);
+        let replacements = saved_code_replacements(&self.catalog);
         let started = start_ingest(
             &self.catalog,
             &IngestStart {
@@ -618,6 +619,7 @@ impl IngestDialog {
                 backup_dir: &backup,
                 session: &session,
                 template: template.as_ref(),
+                replacements: replacements.as_ref(),
             },
         );
         match started {

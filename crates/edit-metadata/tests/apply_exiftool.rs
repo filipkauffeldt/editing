@@ -222,6 +222,7 @@ fn code_replacements_expand_into_the_written_caption() {
         paths: vec![path.to_string_lossy().into_owned()],
         sequence: 1,
         captured_at: now_unix(),
+        session: None,
         fields_json: fields,
         replacements: Some(replacements),
     })

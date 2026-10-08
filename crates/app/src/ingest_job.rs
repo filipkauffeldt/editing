@@ -20,7 +20,19 @@ use edit_ingest::{
     FileMetadata, FollowUpJob, IngestCopyPayload, IngestPlanRequest, IngestTemplate, LandedPhoto,
     plan_ingest, run_ingest_copy_with,
 };
-use edit_metadata::{MetadataWritePayload, TemplateFields};
+use edit_metadata::{CodeReplacements, MetadataWritePayload, TemplateFields};
+
+/// Catalog setting holding the last loaded code replacement file path (the
+/// template editor writes it).
+pub const REPLACEMENTS_SETTING: &str = "code_replacements_path";
+
+/// The code replacements the template editor last loaded, if any.
+pub fn saved_code_replacements(catalog: &Catalog) -> Option<CodeReplacements> {
+    let path = catalog.get_setting(REPLACEMENTS_SETTING).ok().flatten()?;
+    CodeReplacements::from_file(Path::new(&path))
+        .ok()
+        .filter(|codes| !codes.is_empty())
+}
 
 /// What the dialog hands over to start one card's ingest.
 #[derive(Clone, Copy, Debug)]
@@ -35,6 +47,8 @@ pub struct IngestStart<'a> {
     pub session: &'a str,
     /// The chosen IPTC template; its fields are frozen onto the batch.
     pub template: Option<&'a IptcTemplate>,
+    /// Frozen with the template; applied when the stamp expands.
+    pub replacements: Option<&'a CodeReplacements>,
 }
 
 /// A queued ingest: the batch row and its `ingest_copy` job.
@@ -77,6 +91,10 @@ pub fn start_ingest(catalog: &Catalog, start: &IngestStart<'_>) -> Result<Starte
         .map_err(|e| format!("Could not open batch: {e}"))?;
     let payload = IngestCopyPayload {
         batch_id,
+        iptc_replacements_json: start
+            .replacements
+            .filter(|_| start.template.is_some())
+            .and_then(|codes| serde_json::to_string(codes).ok()),
         ..plan.payload
     };
     let encoded =
@@ -115,6 +133,7 @@ pub fn handle_job(
 pub fn iptc_stamp_job(
     payload: &IngestCopyPayload,
     captured_at: i64,
+    replacements: &Option<CodeReplacements>,
     landed: &LandedPhoto,
 ) -> FollowUpJob {
     let fields_json = payload.iptc_fields_json.as_ref()?;
@@ -125,6 +144,7 @@ pub fn iptc_stamp_job(
         captured_at,
         session: Some(payload.session.clone()),
         fields_json: fields_json.clone(),
+        replacements: replacements.clone(),
     };
     Some((JobKind::MetadataWrite, serde_json::to_string(&job).ok()?))
 }
@@ -148,6 +168,10 @@ pub fn ingest_job_handler(
         .get_ingest_batch(payload.batch_id)
         .map_err(|e| format!("ingest batch: {e}"))?
         .started_at;
+    let replacements: Option<CodeReplacements> = payload
+        .iptc_replacements_json
+        .as_deref()
+        .and_then(|json| serde_json::from_str(json).ok());
     run_ingest_copy_with(
         &catalog,
         &payload,
@@ -158,7 +182,7 @@ pub fn ingest_job_handler(
                 camera: meta.camera,
             }
         },
-        &|landed| iptc_stamp_job(&payload, captured_at, landed),
+        &|landed| iptc_stamp_job(&payload, captured_at, &replacements, landed),
         &|done, total| {
             tx_progress
                 .send(JobEvent {
@@ -241,6 +265,7 @@ mod tests {
             session: "shoot".into(),
             start_seq: 1,
             iptc_fields_json: None,
+            iptc_replacements_json: None,
         };
         let job = ClaimedJob {
             id: JobId(1),
@@ -311,6 +336,7 @@ mod tests {
             session: "Cup final".into(),
             start_seq: 1,
             iptc_fields_json: Some(r#"{"credit":"{session}"}"#.into()),
+            iptc_replacements_json: None,
         };
         let job = ClaimedJob {
             id: JobId(1),
@@ -343,6 +369,7 @@ mod tests {
             iptc_stamp_job(
                 &plain,
                 0,
+                &None,
                 &LandedPhoto {
                     item_id: 1,
                     photo_id: 1,
@@ -365,6 +392,7 @@ mod tests {
             backup_dir: "",
             session: "NIKON Z 6",
             template: None,
+            replacements: None,
         }
     }
 
@@ -512,6 +540,49 @@ mod tests {
             catalog.get_ingest_batch(started.batch_id).unwrap().state,
             "failed"
         );
+        std::fs::remove_dir_all(&base).ok();
+    }
+
+    #[test]
+    fn code_replacements_are_frozen_with_the_template_and_ride_the_stamp_job() {
+        let base = scratch("codes");
+        let catalog = Catalog::open(&base.join("catalog.sqlite")).unwrap();
+        let card = base.join("card");
+        let dest = base.join("Photos").to_string_lossy().into_owned();
+        let id = catalog
+            .insert_iptc_template("press", r#"{"caption":"\\h1\\ win"}"#, "global")
+            .unwrap();
+        let template = catalog.get_iptc_template(id).unwrap();
+        let codes = CodeReplacements::parse("h1\tSHL\n");
+        let started = start_ingest(
+            &catalog,
+            &IngestStart {
+                template: Some(&template),
+                replacements: Some(&codes),
+                ..start_request(&card, &dest, "")
+            },
+        )
+        .unwrap();
+        let job = catalog.job(started.job_id).unwrap();
+        let payload: IngestCopyPayload = serde_json::from_str(&job.payload_json).unwrap();
+        let frozen: Option<CodeReplacements> =
+            serde_json::from_str(payload.iptc_replacements_json.as_deref().unwrap()).ok();
+        assert_eq!(frozen.as_ref(), Some(&codes));
+
+        let (_, stamp) = iptc_stamp_job(
+            &payload,
+            0,
+            &frozen,
+            &LandedPhoto {
+                item_id: 1,
+                photo_id: 1,
+                path: "/p/a.JPG".into(),
+                sequence: 1,
+            },
+        )
+        .unwrap();
+        let stamp: MetadataWritePayload = serde_json::from_str(&stamp).unwrap();
+        assert_eq!(stamp.replacements, Some(codes));
         std::fs::remove_dir_all(&base).ok();
     }
 
