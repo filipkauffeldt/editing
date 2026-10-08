@@ -11,13 +11,85 @@
 //! file's completion (see [`iptc_stamp_job`]). The metadata worker routes raw
 //! sides to their XMP sidecar, so a raw original is never rewritten.
 
+use std::path::Path;
 use std::sync::Arc;
 
-use edit_catalog::{Catalog, ClaimedJob, JobEvent, JobEventKind, JobKind};
+use edit_catalog::models::IptcTemplate;
+use edit_catalog::{Catalog, ClaimedJob, JobEvent, JobEventKind, JobId, JobKind};
 use edit_ingest::{
-    FileMetadata, FollowUpJob, IngestCopyPayload, LandedPhoto, run_ingest_copy_with,
+    FileMetadata, FollowUpJob, IngestCopyPayload, IngestPlanRequest, IngestTemplate, LandedPhoto,
+    plan_ingest, run_ingest_copy_with,
 };
-use edit_metadata::MetadataWritePayload;
+use edit_metadata::{MetadataWritePayload, TemplateFields};
+
+/// What the dialog hands over to start one card's ingest.
+#[derive(Clone, Copy, Debug)]
+pub struct IngestStart<'a> {
+    pub volume_uuid: Option<&'a str>,
+    pub volume_label: Option<&'a str>,
+    pub source_root: &'a Path,
+    pub dest_rule: &'a str,
+    /// Blank means the default rule.
+    pub filename_rule: &'a str,
+    pub backup_dir: &'a str,
+    pub session: &'a str,
+    /// The chosen IPTC template; its fields are frozen onto the batch.
+    pub template: Option<&'a IptcTemplate>,
+}
+
+/// A queued ingest: the batch row and its `ingest_copy` job.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct StartedIngest {
+    pub batch_id: i64,
+    pub job_id: JobId,
+}
+
+/// Validate the inputs, open the batch, and queue its `ingest_copy` job.
+///
+/// Every check that can reject the request (naming rules, the template)
+/// runs before the batch row exists, so a bad request leaves nothing behind.
+/// Errors are user-facing messages.
+pub fn start_ingest(catalog: &Catalog, start: &IngestStart<'_>) -> Result<StartedIngest, String> {
+    if let Some(template) = start.template {
+        let fields: TemplateFields = serde_json::from_str(&template.fields_json)
+            .map_err(|e| format!("Template \"{}\" is unreadable: {e}", template.name))?;
+        if fields == TemplateFields::default() {
+            return Err(format!("Template \"{}\" has no fields.", template.name));
+        }
+    }
+    let plan = plan_ingest(&IngestPlanRequest {
+        volume_uuid: start.volume_uuid,
+        volume_label: start.volume_label,
+        source_root: start.source_root,
+        dest_dir_template: start.dest_rule,
+        filename_template: start.filename_rule,
+        backup_dir: Some(start.backup_dir),
+        session: start.session,
+        start_seq: 1,
+        template: start.template.map(|template| IngestTemplate {
+            id: template.id,
+            fields_json: &template.fields_json,
+        }),
+    })
+    .map_err(|e| format!("Bad naming rule: {e}"))?;
+    let batch_id = catalog
+        .create_ingest_batch(&plan.batch)
+        .map_err(|e| format!("Could not open batch: {e}"))?;
+    let payload = IngestCopyPayload {
+        batch_id,
+        ..plan.payload
+    };
+    let encoded =
+        serde_json::to_string(&payload).map_err(|e| format!("Could not encode ingest job: {e}"))?;
+    let job_id = catalog
+        .enqueue_job(JobKind::IngestCopy, &encoded)
+        .map_err(|e| {
+            // No job will ever fill this batch; do not leave it `running`.
+            let _ = catalog.finish_ingest_batch(batch_id, "failed");
+            format!("Could not queue ingest: {e}")
+        })?;
+    Ok(StartedIngest { batch_id, job_id })
+}
 
 /// The single durable-job dispatch for the app: browse, thumbnail, and
 /// ingest kinds in one place. Unknown kinds are a no-op.
@@ -263,6 +335,135 @@ mod tests {
                 }
             )
             .is_none()
+        );
+        std::fs::remove_dir_all(&base).ok();
+    }
+
+    fn start_request<'a>(card: &'a Path, dest_rule: &'a str, rule: &'a str) -> IngestStart<'a> {
+        IngestStart {
+            volume_uuid: Some("UUID"),
+            volume_label: Some("NIKON Z 6"),
+            source_root: card,
+            dest_rule,
+            filename_rule: rule,
+            backup_dir: "",
+            session: "NIKON Z 6",
+            template: None,
+        }
+    }
+
+    /// The reported failure: Start with an empty filename rule used to queue
+    /// a job whose every file rendered an empty name and failed.
+    #[test]
+    fn starting_with_an_empty_rule_lands_every_file_under_the_default_name() {
+        let base = scratch("empty-rule");
+        let card = base.join("card");
+        let dcim = card.join("DCIM/100NIKON");
+        std::fs::create_dir_all(&dcim).unwrap();
+        std::fs::write(dcim.join("DSC_0001.NEF"), b"raw one").unwrap();
+        std::fs::write(dcim.join("DSC_0001.JPG"), b"jpg one").unwrap();
+        std::fs::write(dcim.join("DSC_0002.NEF"), b"raw two").unwrap();
+        let dest = base.join("Photos");
+        let dest_rule = dest.to_string_lossy().into_owned();
+
+        let catalog = Arc::new(Catalog::open(&base.join("catalog.sqlite")).unwrap());
+        let started = start_ingest(&catalog, &start_request(&card, &dest_rule, "")).unwrap();
+        let job = catalog.claim_job().unwrap().unwrap();
+        assert_eq!(job.id, started.job_id);
+        let (tx, _rx) = flume::unbounded();
+        ingest_job_handler(Arc::clone(&catalog), &job, &tx).unwrap();
+
+        let rows = catalog.list_ingest_files(started.batch_id).unwrap();
+        assert_eq!(rows.len(), 3);
+        assert!(
+            rows.iter()
+                .all(|row| row.state == edit_core::IngestFileState::Cataloged),
+            "{rows:?}"
+        );
+        let mut names: Vec<String> = std::fs::read_dir(&dest)
+            .unwrap()
+            .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
+            .collect();
+        names.sort();
+        assert_eq!(
+            names,
+            [
+                "NIKON Z 6_0001.JPG",
+                "NIKON Z 6_0001.NEF",
+                "NIKON Z 6_0002.NEF"
+            ]
+        );
+        std::fs::remove_dir_all(&base).ok();
+    }
+
+    #[test]
+    fn a_bad_request_is_rejected_before_any_batch_or_job_exists() {
+        let base = scratch("reject");
+        let catalog = Catalog::open(&base.join("catalog.sqlite")).unwrap();
+        let card = base.join("card");
+        let dest = base.join("Photos").to_string_lossy().into_owned();
+
+        let slash = start_ingest(&catalog, &start_request(&card, &dest, "a/b")).unwrap_err();
+        assert!(slash.starts_with("Bad naming rule"), "{slash}");
+        let unknown = start_ingest(&catalog, &start_request(&card, &dest, "{nope}")).unwrap_err();
+        assert!(unknown.contains("nope"), "{unknown}");
+
+        let empty = catalog
+            .insert_iptc_template("blank", "{}", "global")
+            .unwrap();
+        let empty = catalog.get_iptc_template(empty).unwrap();
+        let request = IngestStart {
+            template: Some(&empty),
+            ..start_request(&card, &dest, "")
+        };
+        let error = start_ingest(&catalog, &request).unwrap_err();
+        assert!(error.contains("has no fields"), "{error}");
+
+        assert!(catalog.list_jobs(10).unwrap().is_empty());
+        assert!(
+            catalog
+                .list_ingest_batches_by_state("running")
+                .unwrap()
+                .is_empty()
+        );
+        std::fs::remove_dir_all(&base).ok();
+    }
+
+    #[test]
+    fn the_chosen_template_is_frozen_onto_the_batch_and_the_job() {
+        let base = scratch("freeze");
+        let catalog = Catalog::open(&base.join("catalog.sqlite")).unwrap();
+        let card = base.join("card");
+        let dest = base.join("Photos").to_string_lossy().into_owned();
+        let id = catalog
+            .insert_iptc_template("press", r#"{"credit":"SHL"}"#, "global")
+            .unwrap();
+        let template = catalog.get_iptc_template(id).unwrap();
+        let started = start_ingest(
+            &catalog,
+            &IngestStart {
+                template: Some(&template),
+                ..start_request(&card, &dest, "")
+            },
+        )
+        .unwrap();
+
+        // Editing the template afterwards does not reach the queued ingest.
+        catalog
+            .update_iptc_template(id, "press", r#"{"credit":"changed"}"#, "global")
+            .unwrap();
+        assert_eq!(
+            catalog
+                .get_ingest_batch(started.batch_id)
+                .unwrap()
+                .template_id,
+            Some(id)
+        );
+        let job = catalog.job(started.job_id).unwrap();
+        let payload: IngestCopyPayload = serde_json::from_str(&job.payload_json).unwrap();
+        assert_eq!(
+            payload.iptc_fields_json.as_deref(),
+            Some(r#"{"credit":"SHL"}"#)
         );
         std::fs::remove_dir_all(&base).ok();
     }
