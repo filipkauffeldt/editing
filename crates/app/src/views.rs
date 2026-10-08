@@ -777,9 +777,9 @@ impl Browser {
             }
         }
         match kind {
-            JobEventKind::Started { .. } => self.scan_status = "Ingest started…".to_string(),
+            JobEventKind::Started { .. } => self.scan_status = "Ingest started".to_string(),
             JobEventKind::Progress { done, total } => {
-                self.scan_status = format!("Ingesting: {done}/{total}");
+                self.scan_status = format!("Ingesting {done} of {total}");
             }
             JobEventKind::Succeeded => self.scan_status = "Ingest complete".to_string(),
             JobEventKind::Failed { error } => self.scan_status = format!("Ingest failed: {error}"),

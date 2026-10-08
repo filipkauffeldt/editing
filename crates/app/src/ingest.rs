@@ -114,35 +114,31 @@ impl IngestBatchProgress {
         }
     }
 
-    /// One honest line for the card: what landed, what was skipped, and
-    /// what failed. A finished batch never says "done" for files that failed.
+    /// One plain line for the card: what landed, what was skipped, and what
+    /// failed. A finished batch never reads as done for files that failed.
     pub fn summary(&self) -> String {
         let tally = &self.tally;
-        match self.state {
-            BatchState::Running if tally.failed > 0 => format!(
-                "ingesting {}/{} · {} failed",
-                self.done, self.total, tally.failed
-            ),
-            BatchState::Running => format!("ingesting {}/{}", self.done, self.total),
-            BatchState::Done | BatchState::Failed => {
-                let mut parts = vec![format!("{} ingested", tally.cataloged)];
-                if tally.duplicates > 0 {
-                    parts.push(format!("{} duplicates", tally.duplicates));
-                }
-                if tally.failed > 0 {
-                    parts.push(format!("{} failed", tally.failed));
-                }
-                let verdict = if self.state == BatchState::Failed
-                    || tally.cataloged == 0 && tally.failed > 0
-                {
-                    "failed"
-                } else if tally.failed > 0 {
-                    "done with failures"
-                } else {
-                    "done"
-                };
-                format!("{verdict} · {}", parts.join(" · "))
+        if self.state == BatchState::Running {
+            let mut line = format!("Copying {} of {}", self.done, self.total);
+            if tally.failed > 0 {
+                line.push_str(&format!(", {} failed", tally.failed));
             }
+            return line;
+        }
+        let mut parts = Vec::new();
+        if tally.cataloged > 0 {
+            parts.push(format!("{} copied", tally.cataloged));
+        }
+        if tally.duplicates > 0 {
+            parts.push(format!("{} duplicates", tally.duplicates));
+        }
+        if tally.failed > 0 {
+            parts.push(format!("{} failed", tally.failed));
+        }
+        if parts.is_empty() {
+            "Nothing to copy".to_string()
+        } else {
+            parts.join(", ")
         }
     }
 }
@@ -443,7 +439,7 @@ pub fn format_bytes(bytes: u64) -> String {
 }
 
 /// Template choice meaning "ingest without stamping".
-const NO_TEMPLATE: &str = "(no template)";
+const NO_TEMPLATE: &str = "None";
 
 /// Ingest dialog (plan section 2.8): card list with per-card progress,
 /// destination folder + filename rule inputs, backup destination input, the
@@ -552,7 +548,7 @@ impl IngestDialog {
     /// so this never blocks the UI thread.
     fn start(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let Some(identity) = self.selected.clone() else {
-            self.set_status(true, "Select a card first.".to_string());
+            self.set_status(true, "Select a card.".to_string());
             cx.notify();
             return;
         };
@@ -564,12 +560,12 @@ impl IngestDialog {
             .find(|volume| volume.identity == identity)
             .cloned();
         let Some(volume) = volume else {
-            self.set_status(true, "That card is gone.".to_string());
+            self.set_status(true, "The card was removed.".to_string());
             cx.notify();
             return;
         };
         if self.start_card(&volume, window, cx) {
-            self.set_status(false, format!("Ingesting {}…", volume.display_name()));
+            self.set_status(false, format!("Copying from {}…", volume.display_name()));
         }
         cx.notify();
     }
@@ -578,7 +574,7 @@ impl IngestDialog {
     fn start_all(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let volumes = self.state.read(cx).volumes().to_vec();
         if volumes.is_empty() {
-            self.set_status(true, "No cards detected.".to_string());
+            self.set_status(true, "No cards found.".to_string());
             cx.notify();
             return;
         }
@@ -591,7 +587,7 @@ impl IngestDialog {
         if started > 0 {
             self.set_status(
                 false,
-                format!("Ingesting {started}/{} cards…", volumes.len()),
+                format!("Copying from {started} of {} cards…", volumes.len()),
             );
         }
         cx.notify();
@@ -655,12 +651,7 @@ impl IngestDialog {
             let identity = volume.identity.clone();
             let is_selected = selected.as_deref() == Some(identity.as_str());
             let label = volume.display_name();
-            let detail = format!(
-                "{} · {} free of {}",
-                volume.mount_point.display(),
-                format_bytes(volume.free_bytes),
-                format_bytes(volume.capacity_bytes),
-            );
+            let detail = volume.mount_point.display().to_string();
             let batch = progress
                 .iter()
                 .find(|(id, _)| id == &identity)
@@ -673,13 +664,14 @@ impl IngestDialog {
                         .tally
                         .first_error
                         .clone()
-                        .map(|error| format!("First failure: {error}")),
+                        .map(|error| format!("First error: {error}")),
                 ),
                 None => (
                     volume.used_percent(),
                     format!(
-                        "{} used",
-                        format_bytes(volume.capacity_bytes - volume.free_bytes)
+                        "{} free of {}",
+                        format_bytes(volume.free_bytes),
+                        format_bytes(volume.capacity_bytes)
                     ),
                     None,
                 ),
@@ -727,19 +719,14 @@ impl IngestDialog {
     ) -> impl IntoElement {
         v_flex()
             .gap_1()
-            .child(div().text_sm().child(label.to_string()))
+            .child(Label::new(label.to_string()).text_sm())
             .child(Input::new(input).id(id))
     }
 
     fn render_template_picker(&self) -> impl IntoElement {
         v_flex()
             .gap_1()
-            .child(
-                Label::new(
-                    "IPTC template (frozen when you start, stamped on each photo as it lands)",
-                )
-                .text_sm(),
-            )
+            .child(Label::new("IPTC template").text_sm())
             .child(Select::new(&self.template_select).placeholder(NO_TEMPLATE))
     }
 
@@ -747,37 +734,28 @@ impl IngestDialog {
         let files = self.state.read(cx).files();
         v_flex()
             .gap_1()
-            .child(
-                div()
-                    .text_sm()
-                    .font_semibold()
-                    .child("Files (medium: original name · bytes · state)".to_string()),
-            )
+            .child(Label::new("Files").text_sm().font_semibold())
             .child(
                 h_flex()
                     .w_full()
                     .gap_4()
                     .text_sm()
                     .font_semibold()
-                    .child(div().w_1_2().child("File".to_string()))
-                    .child(div().w_1_4().child("Size".to_string()))
-                    .child(div().w_1_4().child("State".to_string())),
+                    .child(Label::new("Name").w_1_2())
+                    .child(Label::new("Size").w_1_4())
+                    .child(Label::new("State").w_1_4()),
             )
             .children(files.iter().map(|row| {
                 h_flex()
                     .w_full()
                     .gap_4()
                     .text_sm()
-                    .child(div().w_1_2().child(row.name.clone()))
-                    .child(div().w_1_4().child(format_bytes(row.bytes)))
-                    .child(div().w_1_4().child(row.state.to_string()))
+                    .child(Label::new(row.name.clone()).w_1_2())
+                    .child(Label::new(format_bytes(row.bytes)).w_1_4())
+                    .child(Label::new(row.state.to_string()).w_1_4())
             }))
             .when(files.is_empty(), |table| {
-                table.child(
-                    div()
-                        .text_sm()
-                        .child("No files yet — start an ingest to fill the table.".to_string()),
-                )
+                table.child(Label::new("No files yet.").text_sm())
             })
     }
 }
@@ -825,23 +803,15 @@ impl Render for IngestDialog {
             .child(
                 v_flex()
                     .gap_3()
-                    .child(DialogTitle::new().child("Ingest photos".to_string()))
-                    .child(div().text_sm().child(if volume_count == 0 {
-                        "No volumes detected — plug in a card.".to_string()
-                    } else if volume_count == 1 {
-                        "1 volume detected.".to_string()
-                    } else {
-                        format!("{volume_count} volumes detected.")
-                    }))
+                    .child(DialogTitle::new().child("Ingest".to_string()))
+                    .when(volume_count == 0, |panel| {
+                        panel.child(Label::new("No cards found.").text_sm())
+                    })
                     .child(self.render_cards(cx))
                     .child(self.render_field("Destination folder", &self.dest_dir, "ingest-dest"))
+                    .child(self.render_field("Filename rule", &self.file_rule, "ingest-rule"))
                     .child(self.render_field(
-                        "Filename rule (variables: {session}, {seq:4}, {filename}, {ext}, {yyyy}…)",
-                        &self.file_rule,
-                        "ingest-rule",
-                    ))
-                    .child(self.render_field(
-                        "Backup destination (optional)",
+                        "Backup folder (optional)",
                         &self.backup_dir,
                         "ingest-backup",
                     ))
@@ -861,7 +831,7 @@ impl Render for IngestDialog {
                             .gap_2()
                             .child(
                                 Button::new("ingest-start-all")
-                                    .label("Ingest all cards")
+                                    .label("Ingest all")
                                     .disabled(!all_ready)
                                     .on_click(cx.listener(
                                         |this, _event: &ClickEvent, window, cx| {
@@ -881,7 +851,7 @@ impl Render for IngestDialog {
                             )
                             .child(
                                 Button::new("ingest-start")
-                                    .label("Start ingest")
+                                    .label("Start")
                                     .disabled(!ready)
                                     .on_click(cx.listener(
                                         |this, _event: &ClickEvent, window, cx| {
@@ -988,7 +958,7 @@ mod tests {
             .collect();
         for state in [BatchState::Done, BatchState::Failed] {
             let batch = progress(state, &rows);
-            assert_eq!(batch.summary(), "failed · 0 ingested · 172 failed");
+            assert_eq!(batch.summary(), "172 failed");
             assert_eq!(
                 batch.tally.first_error.as_deref(),
                 Some("naming: rule rendered an empty name")
@@ -1005,19 +975,16 @@ mod tests {
             file("d.NEF", IngestFileState::Failed, Some("copy: other")),
         ];
         let done = progress(BatchState::Done, &rows);
-        assert_eq!(
-            done.summary(),
-            "done with failures · 1 ingested · 1 duplicates · 2 failed"
-        );
+        assert_eq!(done.summary(), "1 copied, 1 duplicates, 2 failed");
         assert_eq!(done.tally.first_error.as_deref(), Some("copy: disk full"));
         assert_eq!(
             progress(BatchState::Running, &rows).summary(),
-            "ingesting 4/4 · 2 failed"
+            "Copying 4 of 4, 2 failed"
         );
         let clean = progress(
             BatchState::Done,
             &[file("a.NEF", IngestFileState::Cataloged, None)],
         );
-        assert_eq!(clean.summary(), "done · 1 ingested");
+        assert_eq!(clean.summary(), "1 copied");
     }
 }
