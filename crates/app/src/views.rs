@@ -30,9 +30,10 @@ use std::sync::Arc;
 use edit_catalog::{Catalog, JobEvent, JobEventKind, JobId, JobKind};
 use gpui_kit::component::button::{Button, ButtonVariants as _};
 use gpui_kit::component::label::Label;
+use gpui_kit::component::tooltip::Tooltip;
 use gpui_kit::component::{
-    ActiveTheme as _, Disableable as _, IconName, Sizable as _, h_flex, status_bar::StatusBar,
-    v_flex,
+    ActiveTheme as _, Disableable as _, Icon, IconName, Sizable as _, h_flex,
+    status_bar::StatusBar, v_flex,
 };
 use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::*;
@@ -1411,32 +1412,68 @@ impl Browser {
         }
     }
 
-    /// Badge line for a cell: rating stars, thumb state, upload state, and
-    /// the amber "new" marker while ingest is still landing.
-    fn cell_badges(item: &BrowseItem) -> String {
-        let stars = "★".repeat(item.rating.clamp(0, 5) as usize);
-        let thumb = match item.thumb {
-            ThumbState::Queued => "queued",
-            ThumbState::Running => "…",
-            ThumbState::Ready => "ready",
-            ThumbState::Failed => "failed",
-        };
-        let upload = match item.upload {
-            UploadBadge::None => String::new(),
-            UploadBadge::Queued => " ● queued".to_string(),
-            UploadBadge::Uploading => " ● uploading".to_string(),
-            UploadBadge::Done => " ● done".to_string(),
-            UploadBadge::Failed => " ● failed".to_string(),
-        };
-        let meta = match item.meta {
-            MetaBadge::None => String::new(),
-            MetaBadge::Queued => " ⊘ meta:queued".to_string(),
-            MetaBadge::Writing => " ⊘ meta:writing".to_string(),
-            MetaBadge::Done => " ⊘ meta:done".to_string(),
-            MetaBadge::Failed => " ⊘ meta:failed".to_string(),
-        };
-        let fresh = if item.ingest_fresh { " ◌ new" } else { "" };
-        format!("{stars} {} · {thumb}{upload}{meta}{fresh}", item.base_name)
+    /// Caption of a grid cell: the base name, with stars once rated.
+    fn cell_caption(item: &BrowseItem) -> String {
+        match item.rating.clamp(0, 5) {
+            0 => item.base_name.clone(),
+            n => format!("{} {}", item.base_name, "★".repeat(n as usize)),
+        }
+    }
+
+    /// Short state words for a grid cell (new, upload and metadata work);
+    /// empty when there is nothing to say.
+    fn cell_flags(item: &BrowseItem) -> String {
+        let mut flags = Vec::new();
+        if item.ingest_fresh {
+            flags.push("new");
+        }
+        match item.upload {
+            UploadBadge::None => {}
+            UploadBadge::Queued => flags.push("upload queued"),
+            UploadBadge::Uploading => flags.push("uploading"),
+            UploadBadge::Done => flags.push("uploaded"),
+            UploadBadge::Failed => flags.push("upload failed"),
+        }
+        match item.meta {
+            MetaBadge::None => {}
+            MetaBadge::Queued => flags.push("metadata queued"),
+            MetaBadge::Writing => flags.push("writing metadata"),
+            MetaBadge::Done => flags.push("metadata written"),
+            MetaBadge::Failed => flags.push("metadata failed"),
+        }
+        flags.join(", ")
+    }
+
+    /// The picture area of a cell. A thumbnail still loading is a quiet
+    /// placeholder; one that failed is a warning icon with the reason on hover.
+    fn thumb_art(
+        item: &BrowseItem,
+        art: Option<&Arc<RenderImage>>,
+        height: Pixels,
+        empty_bg: Hsla,
+        warning: Hsla,
+    ) -> AnyElement {
+        if let Some(art) = art {
+            return img(Arc::clone(art)).w_full().h(height).into_any_element();
+        }
+        let placeholder = div()
+            .w_full()
+            .h(height)
+            .flex()
+            .items_center()
+            .justify_center()
+            .bg(empty_bg);
+        if item.thumb == ThumbState::Failed {
+            placeholder
+                .id(("thumb-failed", item.item_id as u64))
+                .child(Icon::new(IconName::TriangleAlert).text_color(warning))
+                .tooltip(|window, cx| {
+                    Tooltip::new("The thumbnail could not be created").build(window, cx)
+                })
+                .into_any_element()
+        } else {
+            placeholder.into_any_element()
+        }
     }
 
     fn render_grid(&mut self, cx: &mut Context<Self>) -> impl IntoElement {
@@ -1471,11 +1508,12 @@ impl Browser {
         let theme = cx.theme();
         let (current_border, selected_border, idle_border) =
             (theme.primary, theme.muted_foreground, theme.border);
-        let (cell_bg, empty_bg, empty_fg, text_fg) = (
+        let (cell_bg, empty_bg, warning, text_fg, muted_fg) = (
             theme.secondary,
             theme.muted,
-            theme.muted_foreground,
+            theme.warning,
             theme.foreground,
+            theme.muted_foreground,
         );
         div().size_full().overflow_hidden().child(
             uniform_list("contact-sheet", row_count, move |range, _window, _cx| {
@@ -1495,24 +1533,16 @@ impl Browser {
                         } else {
                             idle_border
                         };
-                        let art: AnyElement = match thumbs.get(&item.item_id) {
-                            Some(art) => {
-                                img(Arc::clone(art)).w_full().h(px(96.0)).into_any_element()
-                            }
-                            None => div()
-                                .w_full()
-                                .h(px(96.0))
-                                .flex()
-                                .items_center()
-                                .justify_center()
-                                .bg(empty_bg)
-                                .text_color(empty_fg)
-                                .text_sm()
-                                .child(item.label())
-                                .into_any_element(),
-                        };
+                        let art = Self::thumb_art(
+                            item,
+                            thumbs.get(&item.item_id),
+                            px(96.0),
+                            empty_bg,
+                            warning,
+                        );
                         let item_id = item.item_id;
-                        let badges = Self::cell_badges(item);
+                        let caption = Self::cell_caption(item);
+                        let flags = Self::cell_flags(item);
                         let entity = entity.clone();
                         row_el = row_el.child(
                             div()
@@ -1530,7 +1560,22 @@ impl Browser {
                                     entity.update(cx, |this, cx| this.goto_item(item_id, cx));
                                 })
                                 .child(art)
-                                .child(div().text_xs().text_color(text_fg).child(badges)),
+                                .child(
+                                    div()
+                                        .text_xs()
+                                        .text_color(text_fg)
+                                        .truncate()
+                                        .child(caption),
+                                )
+                                .when(!flags.is_empty(), |cell| {
+                                    cell.child(
+                                        div()
+                                            .text_xs()
+                                            .text_color(muted_fg)
+                                            .truncate()
+                                            .child(flags),
+                                    )
+                                }),
                         );
                     }
                     cells.push(row_el);
@@ -1688,11 +1733,16 @@ impl Browser {
             }
         }
         let theme = cx.theme();
-        let (current_outline, idle_outline, cell_bg) =
-            (theme.primary, theme.border, theme.secondary);
-        let (empty_bg, empty_fg, badge_fg) =
-            (theme.muted, theme.muted_foreground, theme.muted_foreground);
-        let strip_bg = theme.sidebar;
+        let (current_outline, cell_bg, empty_bg, warning, caption_fg) = (
+            theme.primary,
+            theme.secondary,
+            theme.muted,
+            theme.warning,
+            theme.muted_foreground,
+        );
+        let (idle_outline, strip_bg) = (theme.transparent, theme.sidebar);
+        // Every cell has the same size and the same border width (clear when
+        // not selected), so selecting one moves and overlaps nothing.
         let cells: Vec<_> = rows
             .iter()
             .enumerate()
@@ -1703,29 +1753,17 @@ impl Browser {
                     idle_outline
                 };
                 let item_id = item.item_id;
-                let badges = Self::cell_badges(item);
-                let art: AnyElement = match self.thumbs.get(&item_id) {
-                    Some(art) => img(Arc::clone(art)).w_full().h(px(44.0)).into_any_element(),
-                    None => div()
-                        .w_full()
-                        .h(px(44.0))
-                        .flex()
-                        .items_center()
-                        .justify_center()
-                        .bg(empty_bg)
-                        .text_xs()
-                        .text_color(empty_fg)
-                        .child(item.base_name.clone())
-                        .into_any_element(),
-                };
-                div()
+                let art =
+                    Self::thumb_art(item, self.thumbs.get(&item_id), px(56.0), empty_bg, warning);
+                v_flex()
                     .id(("strip", index))
-                    .w(px(96.0))
-                    .h(px(72.0))
-                    .m(px(2.0))
+                    .flex_none()
+                    .w(px(104.0))
+                    .h(px(88.0))
+                    .p_1()
                     .border_2()
                     .border_color(outline)
-                    .rounded_sm()
+                    .rounded_md()
                     .bg(cell_bg)
                     .cursor_pointer()
                     .on_click(cx.listener(move |this, _: &ClickEvent, _, cx| {
@@ -1734,20 +1772,23 @@ impl Browser {
                     .child(art)
                     .child(
                         div()
+                            .w_full()
                             .text_xs()
-                            .text_color(badge_fg)
-                            .whitespace_nowrap()
-                            .overflow_hidden()
-                            .child(badges),
+                            .text_color(caption_fg)
+                            .truncate()
+                            .child(item.base_name.clone()),
                     )
             })
             .collect();
         div()
             .id("film-strip")
             .w_full()
-            .h(px(96.0))
+            .h(px(104.0))
             .flex()
             .flex_row()
+            .items_center()
+            .gap_2()
+            .px_2()
             .overflow_x_scroll()
             .track_scroll(&self.strip_scroll)
             .bg(strip_bg)
