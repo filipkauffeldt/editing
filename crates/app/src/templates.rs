@@ -23,6 +23,7 @@ use edit_metadata::{CodeReplacements, TemplateFields};
 use gpui_kit::component::button::Button;
 use gpui_kit::component::form::{Field, Form};
 use gpui_kit::component::input::{Input, InputState, Textarea, TextareaState};
+use gpui_kit::component::label::Label;
 use gpui_kit::component::searchable_list::SearchableVec;
 use gpui_kit::component::select::{Select, SelectState};
 use gpui_kit::component::{ActiveTheme as _, Disableable as _, StyledExt as _, h_flex, v_flex};
@@ -462,14 +463,12 @@ impl TemplateEditor {
     /// Path input for the replacement file plus its load status. The
     /// parsed set feeds Preview and the Apply payloads.
     fn render_code_replacements(&self, cx: &mut Context<Self>) -> impl IntoElement {
+        let muted = cx.theme().muted_foreground;
         v_flex()
             .gap_1()
-            .child(
-                div()
-                    .text_xs()
-                    .text_color(rgb(0x999999))
-                    .child("Code replacement file (PM TSV; =code= and hot codes):".to_string()),
-            )
+            .child(Label::new(
+                "Code replacement file (PM TSV; =code= and hot codes)",
+            ))
             .child(
                 h_flex()
                     .gap_2()
@@ -486,12 +485,7 @@ impl TemplateEditor {
                             })),
                     ),
             )
-            .child(
-                div()
-                    .text_xs()
-                    .text_color(rgb(0xDDC999))
-                    .child(self.replacement_status.clone()),
-            )
+            .child(Label::new(self.replacement_status.clone()).text_color(muted))
     }
 
     fn render_preview(&self) -> impl IntoElement {
