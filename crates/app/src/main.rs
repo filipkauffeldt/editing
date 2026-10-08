@@ -7,15 +7,20 @@ use std::path::PathBuf;
 use std::sync::Arc;
 
 use edit_catalog::{Catalog, JobKind};
+use gpui_kit::component::button::Button;
 use gpui_kit::component::input::InputState;
-use gpui_kit::component::{TitleBar, v_flex};
+use gpui_kit::component::label::Label;
+use gpui_kit::component::theme::{Theme, ThemeMode};
+use gpui_kit::component::{
+    ActiveTheme as _, Disableable as _, IconName, Sizable as _, TitleBar, h_flex, v_flex,
+};
 use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::*;
 use ingest::{AppState, IngestDialog, OpenIngest, apply_ingest_event};
 use templates::{OpenTemplates, TemplateEditor};
 
 use app::ingest_job::handle_job;
-use app::views::Browser;
+use app::views::{Browser, OpenFolder};
 use edit_metadata::Writer;
 
 /// Worker threads draining the durable job queue.
@@ -85,6 +90,8 @@ impl BrowserShell {
         templates: Entity<TemplateEditor>,
         cx: &mut Context<Self>,
     ) -> Self {
+        // The title bar shows the open folder, which the browser owns.
+        cx.observe(&browser, |_, _, cx| cx.notify()).detach();
         Self {
             browser,
             state,
@@ -92,6 +99,60 @@ impl BrowserShell {
             templates,
             focus_handle: cx.focus_handle(),
         }
+    }
+}
+
+impl BrowserShell {
+    /// Window title bar with the app-level actions. The shell owns them
+    /// because ingest state lives here, not in the browser.
+    fn render_title_bar(&self, cx: &mut Context<Self>) -> impl IntoElement + use<> {
+        let muted = cx.theme().muted_foreground;
+        let folder_name = self.browser.read(cx).folder_name();
+        TitleBar::new().child(
+            h_flex()
+                .w_full()
+                .pr_2()
+                .items_center()
+                .justify_between()
+                .child(
+                    h_flex()
+                        .gap_2()
+                        .child(Label::new("Editing").text_sm())
+                        .child(Label::new(folder_name).text_sm().text_color(muted)),
+                )
+                .child(
+                    h_flex()
+                        .gap_2()
+                        .child(
+                            Button::new("open-folder")
+                                .small()
+                                .icon(IconName::FolderOpen)
+                                .label("Open Folder")
+                                .tooltip("Open a folder (O)")
+                                .on_click(cx.listener(|this, _, _, cx| {
+                                    this.browser
+                                        .update(cx, |browser, cx| browser.prompt_open_folder(cx));
+                                })),
+                        )
+                        .child(
+                            Button::new("open-ingest")
+                                .small()
+                                .label("Ingest")
+                                .tooltip("Ingest from a card (I)")
+                                .on_click(cx.listener(|this, _, _, cx| {
+                                    this.state
+                                        .update(cx, |state, cx| state.set_ingest_open(true, cx));
+                                })),
+                        )
+                        .child(
+                            Button::new("finish-next")
+                                .small()
+                                .label("Finish & next")
+                                .tooltip("Coming later")
+                                .disabled(true),
+                        ),
+                ),
+        )
     }
 }
 
@@ -103,29 +164,52 @@ impl Focusable for BrowserShell {
 
 impl Render for BrowserShell {
     fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        let title_bar = self.render_title_bar(cx);
+        let (background, foreground, border) = (
+            cx.theme().background,
+            cx.theme().foreground,
+            cx.theme().border,
+        );
         let dialog_open = self.state.read(cx).is_ingest_open();
         let dialog = self.dialog.clone();
         let templates_open = self.state.read(cx).is_templates_open();
         let templates = self.templates.clone();
         v_flex()
             .size_full()
+            .bg(background)
+            .text_color(foreground)
             .key_context("Workspace")
             .track_focus(&self.focus_handle)
-            .child(self.browser.clone())
+            .child(title_bar)
+            .child(div().flex_1().min_h_0().child(self.browser.clone()))
             .when(dialog_open, |root| {
                 root.child(
-                    div()
-                        .absolute()
-                        .inset_0()
-                        .child(div().w(px(600.0)).mx_auto().mt_16().child(dialog)),
+                    div().absolute().inset_0().child(
+                        div()
+                            .w(px(600.0))
+                            .mx_auto()
+                            .mt_16()
+                            .bg(background)
+                            .border_1()
+                            .border_color(border)
+                            .rounded_md()
+                            .child(dialog),
+                    ),
                 )
             })
             .when(templates_open, |root| {
                 root.child(
-                    div()
-                        .absolute()
-                        .inset_0()
-                        .child(div().w(px(760.0)).mx_auto().mt_8().child(templates)),
+                    div().absolute().inset_0().child(
+                        div()
+                            .w(px(760.0))
+                            .mx_auto()
+                            .mt_8()
+                            .bg(background)
+                            .border_1()
+                            .border_color(border)
+                            .rounded_md()
+                            .child(templates),
+                    ),
                 )
             })
     }
@@ -165,6 +249,9 @@ fn main() {
     let app = gpui_kit::application().with_assets(gpui_kit::assets::Assets);
     app.run(move |cx| {
         gpui_kit::init(cx);
+        // The component library starts in its light theme; a photo editor
+        // judges colour against a dark surround.
+        Theme::change(ThemeMode::Dark, None, cx);
 
         // Keyboard shortcut target: focus lands in browse views too, so the
         // ingest / template shortcuts are gated on `Workspace && !Input` to
@@ -172,6 +259,7 @@ fn main() {
         cx.bind_keys([
             KeyBinding::new("i", OpenIngest, Some("Workspace && !Input")),
             KeyBinding::new("t", OpenTemplates, Some("Workspace && !Input")),
+            KeyBinding::new("o", OpenFolder, Some("Workspace && !Input")),
         ]);
 
         let window_options = TitleBar::window_options();
@@ -223,8 +311,10 @@ fn main() {
         })
         .expect("Failed to open window");
 
-        // Keyboard shortcut target: focus the shell so `i` dispatches.
-        let focus_handle = shell.read(cx).focus_handle.clone();
+        // Focus the browse view: its arrow/G/Z/rating handlers only run on
+        // the focused element and its ancestors, while the shell above it
+        // still supplies the `Workspace` context for `i`/`t`/`o`.
+        let focus_handle = shell.read(cx).browser.read(cx).focus_handle();
         let _ = window_handle.update(cx, |_view, window, cx| {
             window.focus(&focus_handle, cx);
         });
@@ -270,6 +360,11 @@ fn main() {
             }
         })
         .detach();
+
+        let open_folder_browser = shell.read(cx).browser.clone();
+        cx.on_action(move |_action: &OpenFolder, cx: &mut App| {
+            open_folder_browser.update(cx, |browser, cx| browser.prompt_open_folder(cx));
+        });
 
         let shortcuts_state = shell.read(cx).state.clone();
         cx.on_action(move |_action: &OpenTemplates, cx: &mut App| {

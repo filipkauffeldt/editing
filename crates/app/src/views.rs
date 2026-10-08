@@ -18,6 +18,7 @@
 //! | Scroll | zoom (from fit it starts a free scale) |
 //! | Drag | pan while zoomed |
 //! | `0`–`5` | rating |
+//! | `O` | open a folder (native picker) |
 
 use std::cell::Cell;
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet, VecDeque};
@@ -27,7 +28,13 @@ use std::rc::Rc;
 use std::sync::Arc;
 
 use edit_catalog::{Catalog, JobEvent, JobEventKind, JobId, JobKind};
-use gpui_kit::component::{TitleBar, h_flex, status_bar::StatusBar, v_flex};
+use gpui_kit::component::button::{Button, ButtonVariants as _};
+use gpui_kit::component::label::Label;
+use gpui_kit::component::tooltip::Tooltip;
+use gpui_kit::component::{
+    ActiveTheme as _, Disableable as _, Icon, IconName, Sizable as _, h_flex,
+    status_bar::StatusBar, v_flex,
+};
 use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::*;
 
@@ -89,6 +96,7 @@ gpui_kit::actions!(
         ToggleView,
         FitView,
         HundredView,
+        OpenFolder,
         SelectAllItems,
         Rate0,
         Rate1,
@@ -191,6 +199,7 @@ impl Browser {
                             .min(spec.min as f32)
                             .max(spec.max as f32)
                             .step(spec.step as f32)
+                            .default_value(spec.default as f32)
                     }),
                     None => cx.new(|_| SliderState::new()),
                 };
@@ -247,9 +256,9 @@ impl Browser {
             current: 0,
             mode: Mode::Grid,
             zoom: ZoomState::default(),
-            root_label: "No folder open".to_string(),
+            root_label: String::new(),
             root_id: None,
-            scan_status: "Ready".to_string(),
+            scan_status: String::new(),
             rows: Arc::new(Vec::new()),
             thumbs: HashMap::new(),
             thumb_order: VecDeque::new(),
@@ -266,7 +275,7 @@ impl Browser {
             develop_image: None,
             develop_image_item: None,
             develop_dirty: false,
-            develop_status: "Ready".to_string(),
+            develop_status: String::new(),
             renderer,
             scan_jobs: Vec::new(),
             template_status: String::new(),
@@ -276,6 +285,22 @@ impl Browser {
         };
         cx.on_app_quit(|this, cx| this.flush_for_quit(cx)).detach();
         browser
+    }
+
+    /// Name of the open folder (its last path component), empty before one
+    /// is opened.
+    pub fn folder_name(&self) -> String {
+        Path::new(&self.root_label)
+            .file_name()
+            .map(|name| name.to_string_lossy().into_owned())
+            .unwrap_or_else(|| self.root_label.clone())
+    }
+
+    /// The handle the browse key bindings hang off. Focus has to sit on it
+    /// (or below it): actions only reach handlers on the focused element and
+    /// its ancestors.
+    pub fn focus_handle(&self) -> FocusHandle {
+        self.focus.clone()
     }
 
     /// Catalog root currently shown, if a scan has landed one.
@@ -320,6 +345,34 @@ impl Browser {
         .detach();
     }
 
+    /// Ask the platform for a folder (native picker) and open the choice.
+    /// A cancelled or failed picker leaves the current folder alone.
+    pub fn prompt_open_folder(&mut self, cx: &mut Context<Self>) {
+        let picked = cx.prompt_for_paths(PathPromptOptions {
+            files: false,
+            directories: true,
+            multiple: false,
+            prompt: Some("Open folder".into()),
+        });
+        cx.spawn(async move |this, cx| match picked.await {
+            Ok(Ok(Some(paths))) => {
+                if let Some(path) = paths.into_iter().next() {
+                    this.update(cx, |this, cx| this.open_folder(path, cx)).ok();
+                }
+            }
+            Ok(Ok(None)) => {}
+            Ok(Err(e)) => {
+                this.update(cx, |this, cx| {
+                    this.scan_status = format!("Could not open the folder picker: {e}");
+                    cx.notify();
+                })
+                .ok();
+            }
+            Err(_) => {}
+        })
+        .detach();
+    }
+
     /// Pick a folder: enqueue a `catalog_scan` job and show live progress.
     /// Workers do the catalog writes; progress events refresh the rows.
     /// The path is canonicalized first, so `photos` and `photos/` share one
@@ -327,6 +380,11 @@ impl Browser {
     pub fn open_folder(&mut self, path: PathBuf, cx: &mut Context<Self>) {
         // Reopening is an explicit reload: failed renders get another try.
         self.queue.navigate();
+        // A folder opens on its contact sheet with the first photo selected.
+        self.mode = Mode::Grid;
+        self.current = 0;
+        self.selection = SelectionModel::new(self.rows.len());
+        self.zoom.reset();
         let canon = canonical_root(&path);
         let label = canon.to_string_lossy().into_owned();
         let payload = serde_json::to_string(&CatalogScanPayload {
@@ -337,12 +395,12 @@ impl Browser {
             Ok(id) => {
                 self.scan_jobs.push(id);
                 self.root_label = label.clone();
-                self.scan_status = format!("Scan queued: {label}");
+                self.scan_status = format!("Scanning {label}");
                 // The root row may already exist from an earlier open.
                 self.resolve_scan_root(id);
                 self.refresh_items();
             }
-            Err(e) => self.scan_status = format!("Scan failed to queue: {e}"),
+            Err(e) => self.scan_status = format!("Could not start the scan: {e}"),
         }
         cx.notify();
     }
@@ -586,7 +644,7 @@ impl Browser {
             JobEventKind::Started { .. } => {
                 if self.scan_jobs.contains(&event.id) {
                     self.resolve_scan_root(event.id);
-                    self.scan_status = "Scanning folder…".to_string();
+                    self.scan_status = "Scanning…".to_string();
                 } else if let Some(path) = self.thumb_path_for(event.id) {
                     self.mark_thumb(&path, ThumbState::Running);
                 } else if let Some(item_id) = self.meta_item_id(event.id) {
@@ -599,7 +657,7 @@ impl Browser {
             JobEventKind::Progress { done, total } => {
                 if self.scan_jobs.contains(&event.id) {
                     self.resolve_scan_root(event.id);
-                    self.scan_status = format!("Scanning: {done}/{total}");
+                    self.scan_status = format!("Scanning {done} of {total}");
                     self.refresh_items();
                 } else if self.meta_jobs.contains_key(&event.id) {
                     self.template_status = format!("Writing template metadata: {done}/{total}");
@@ -608,7 +666,7 @@ impl Browser {
             JobEventKind::Succeeded => {
                 if self.scan_jobs.contains(&event.id) {
                     self.resolve_scan_root(event.id);
-                    self.scan_status = "Scan complete".to_string();
+                    self.scan_status.clear();
                     self.refresh_items();
                 } else if let Some(path) = self.thumb_jobs.remove(&event.id) {
                     self.mark_thumb(&path, ThumbState::Ready);
@@ -724,7 +782,7 @@ impl Browser {
         self.prewarm_token.cancel();
         self.prewarm_token = CancelToken::new();
         if self.unsaved.is_empty() {
-            self.develop_status = "Ready".to_string();
+            self.develop_status.clear();
         }
     }
 
@@ -866,7 +924,7 @@ impl Browser {
                     self.develop.load_edit(item_id, buffer);
                     self.develop_dirty = false;
                 }
-                self.develop_status = "Ready".to_string();
+                self.develop_status.clear();
                 self.request_render(
                     RenderSize::Proxy(PROXY_DRAG_LONG_EDGE),
                     Some(RenderSize::Proxy(PROXY_RELEASE_LONG_EDGE)),
@@ -885,59 +943,91 @@ impl Browser {
     /// The develop panel (plan sections 2.1 and 2.3): Presets placeholder on
     /// top, then the six LR-style tone sliders driving `DevelopSettings`
     /// through the render service.
-    fn render_develop_panel(&mut self) -> impl IntoElement {
+    fn render_develop_panel(&mut self, cx: &mut Context<Self>) -> impl IntoElement {
+        let theme = cx.theme();
+        let (bg, fg, border, muted) = (
+            theme.sidebar,
+            theme.sidebar_foreground,
+            theme.sidebar_border,
+            theme.muted_foreground,
+        );
         let status = self.develop_status.clone();
         v_flex()
-            .w(px(220.0))
+            .w(px(240.0))
             .h_full()
-            .px_2()
-            .py_1()
-            .gap_2()
-            .bg(rgb(0x181818))
-            .child(div().text_sm().child("Develop (M2)".to_string()))
-            .child(
-                div()
-                    .text_xs()
-                    .text_color(rgb(0x888888))
-                    .child("Presets land in D2.".to_string()),
-            )
-            .children(self.render_develop_rows())
-            .child(div().text_xs().text_color(rgb(0x888888)).child(status))
+            .p_3()
+            .gap_3()
+            .bg(bg)
+            .text_color(fg)
+            .border_l_1()
+            .border_color(border)
+            .children(self.render_develop_rows(cx))
+            .when(!status.is_empty(), |panel| {
+                panel.child(Label::new(status).text_xs().text_color(muted))
+            })
     }
 
-    /// One row per slider: label, then the slider (which dispatches actions
-    /// from its own listeners against the browser entity).
-    fn render_develop_rows(&mut self) -> Vec<impl IntoElement> {
+    /// One block per slider: name, live value readout, a reset button, then
+    /// the slider (which dispatches actions from its own listeners against
+    /// the browser entity). Double-clicking the name row resets too.
+    fn render_develop_rows(&mut self, cx: &mut Context<Self>) -> Vec<impl IntoElement> {
+        let muted = cx.theme().muted_foreground;
         let mut rows = Vec::with_capacity(SliderId::ALL.len());
         for (id, control) in &self.develop_sliders {
             let id = *id;
-            let spec = match id.spec() {
-                Some(spec) => spec,
-                None => continue,
-            };
-            let name = spec.label.to_owned();
+            let Some(spec) = id.spec() else { continue };
+            let value = self.develop.slider_value(id);
+            let at_default = (value - spec.default).abs() < 1e-6;
+            let entity_id = control.entity_id().as_u64();
             rows.push(
-                h_flex()
+                v_flex()
                     .w_full()
-                    .items_center()
-                    .gap_2()
+                    .gap_1()
                     .child(
-                        div()
-                            .text_xs()
-                            .text_color(rgb(0xCCCCCC))
-                            .w(px(64.0))
-                            .child(name),
+                        h_flex()
+                            .id(("develop-row", entity_id))
+                            .w_full()
+                            .items_center()
+                            .justify_between()
+                            .on_click(cx.listener(move |this, event: &ClickEvent, _, cx| {
+                                if event.click_count() == 2 {
+                                    this.reset_develop_slider(id, cx);
+                                }
+                            }))
+                            .child(Label::new(spec.label).text_xs())
+                            .child(
+                                h_flex()
+                                    .items_center()
+                                    .gap_1()
+                                    .child(
+                                        Label::new(spec.format(value)).text_xs().text_color(muted),
+                                    )
+                                    .child(
+                                        Button::new(("develop-reset", entity_id))
+                                            .ghost()
+                                            .xsmall()
+                                            .icon(IconName::Undo2)
+                                            .tooltip("Reset")
+                                            .disabled(at_default)
+                                            .on_click(cx.listener(move |this, _, _, cx| {
+                                                this.reset_develop_slider(id, cx);
+                                            })),
+                                    ),
+                            ),
                     )
-                    .child(
-                        div()
-                            .id(("develop-slider", control.entity_id().as_u64()))
-                            .flex_1()
-                            .h(px(20.0))
-                            .child(DevelopSliderElement::new(control)),
-                    ),
+                    .child(DevelopSliderElement::new(control)),
             );
         }
         rows
+    }
+
+    /// Put one slider back to its default: the same commit a released drag
+    /// makes, so the render and the saved edit follow.
+    fn reset_develop_slider(&mut self, id: SliderId, cx: &mut Context<Self>) {
+        if let Some(spec) = id.spec() {
+            self.on_develop_release(id, spec.default as f32, cx);
+            cx.notify();
+        }
     }
 
     /// Sync the edit buffer's slider values into the widget states. A live
@@ -1281,63 +1371,100 @@ impl Browser {
         cx.notify();
     }
 
-    fn render_header(&mut self, _cx: &mut Context<Self>) -> impl IntoElement {
+    fn render_header(&mut self, cx: &mut Context<Self>) -> impl IntoElement {
+        let theme = cx.theme();
+        let (muted, border) = (theme.muted_foreground, theme.border);
         let count = self.rows.len();
-        let status = self.scan_status.clone();
-        let root = self.root_label.clone();
-        let mode_label = match self.mode {
-            Mode::Grid => "Grid (G for single)",
-            Mode::Single => "Single (G for grid)",
-        };
         h_flex()
-            .gap_2()
+            .gap_3()
             .items_center()
             .px_2()
             .py_1()
-            .child(div().text_sm().child(format!("Session: {root}")))
-            .child(div().text_sm().child(format!("{count} items")))
+            .border_b_1()
+            .border_color(border)
             .child(
-                div()
-                    .text_sm()
-                    .child(format!("Sort: {:?}", self.sort_label())),
+                Label::new(format!(
+                    "{count} {}",
+                    if count == 1 { "photo" } else { "photos" }
+                ))
+                .text_sm(),
             )
-            .child(div().text_sm().child(mode_label.to_string()))
-            .child(div().text_sm().child(status))
+            .child(
+                Label::new(format!("Sorted by {}", self.sort_label()))
+                    .text_sm()
+                    .text_color(muted),
+            )
     }
 
     fn sort_label(&self) -> &'static str {
         match self.sort {
             SortOrder::IngestOrder => "ingest order",
-            SortOrder::FileName => "filename",
+            SortOrder::FileName => "file name",
         }
     }
 
-    /// Badge line for a cell: rating stars, thumb state, upload state, and
-    /// the amber "new" marker while ingest is still landing.
-    fn cell_badges(item: &BrowseItem) -> String {
-        let stars = "★".repeat(item.rating.clamp(0, 5) as usize);
-        let thumb = match item.thumb {
-            ThumbState::Queued => "queued",
-            ThumbState::Running => "…",
-            ThumbState::Ready => "ready",
-            ThumbState::Failed => "failed",
-        };
-        let upload = match item.upload {
-            UploadBadge::None => String::new(),
-            UploadBadge::Queued => " ● queued".to_string(),
-            UploadBadge::Uploading => " ● uploading".to_string(),
-            UploadBadge::Done => " ● done".to_string(),
-            UploadBadge::Failed => " ● failed".to_string(),
-        };
-        let meta = match item.meta {
-            MetaBadge::None => String::new(),
-            MetaBadge::Queued => " ⊘ meta:queued".to_string(),
-            MetaBadge::Writing => " ⊘ meta:writing".to_string(),
-            MetaBadge::Done => " ⊘ meta:done".to_string(),
-            MetaBadge::Failed => " ⊘ meta:failed".to_string(),
-        };
-        let fresh = if item.ingest_fresh { " ◌ new" } else { "" };
-        format!("{stars} {} · {thumb}{upload}{meta}{fresh}", item.base_name)
+    /// Caption of a grid cell: the base name, with stars once rated.
+    fn cell_caption(item: &BrowseItem) -> String {
+        match item.rating.clamp(0, 5) {
+            0 => item.base_name.clone(),
+            n => format!("{} {}", item.base_name, "★".repeat(n as usize)),
+        }
+    }
+
+    /// Short state words for a grid cell (new, upload and metadata work);
+    /// empty when there is nothing to say.
+    fn cell_flags(item: &BrowseItem) -> String {
+        let mut flags = Vec::new();
+        if item.ingest_fresh {
+            flags.push("new");
+        }
+        match item.upload {
+            UploadBadge::None => {}
+            UploadBadge::Queued => flags.push("upload queued"),
+            UploadBadge::Uploading => flags.push("uploading"),
+            UploadBadge::Done => flags.push("uploaded"),
+            UploadBadge::Failed => flags.push("upload failed"),
+        }
+        match item.meta {
+            MetaBadge::None => {}
+            MetaBadge::Queued => flags.push("metadata queued"),
+            MetaBadge::Writing => flags.push("writing metadata"),
+            MetaBadge::Done => flags.push("metadata written"),
+            MetaBadge::Failed => flags.push("metadata failed"),
+        }
+        flags.join(", ")
+    }
+
+    /// The picture area of a cell. A thumbnail still loading is a quiet
+    /// placeholder; one that failed is a warning icon with the reason on hover.
+    fn thumb_art(
+        item: &BrowseItem,
+        art: Option<&Arc<RenderImage>>,
+        height: Pixels,
+        empty_bg: Hsla,
+        warning: Hsla,
+    ) -> AnyElement {
+        if let Some(art) = art {
+            return img(Arc::clone(art)).w_full().h(height).into_any_element();
+        }
+        let placeholder = div()
+            .w_full()
+            .h(height)
+            .flex()
+            .items_center()
+            .justify_center()
+            .bg(empty_bg);
+        if item.thumb == ThumbState::Failed {
+            placeholder
+                .id(("thumb-failed", item.item_id as u64))
+                .child(Icon::new(IconName::TriangleAlert).text_color(warning))
+                .tooltip(|window, cx| {
+                    Tooltip::new("The thumbnail could not be created").build(window, cx)
+                })
+                .into_any_element()
+        } else {
+            placeholder.into_any_element()
+        }
     }
 
     fn render_grid(&mut self, cx: &mut Context<Self>) -> impl IntoElement {
@@ -1369,10 +1496,18 @@ impl Browser {
         // The row closure is 'static, so cell clicks update through an
         // owned entity handle instead of a borrowed context.
         let entity = cx.entity();
-        div().size_full().overflow_hidden().child(uniform_list(
-            "contact-sheet",
-            row_count,
-            move |range, _window, _cx| {
+        let theme = cx.theme();
+        let (current_border, selected_border, idle_border) =
+            (theme.primary, theme.muted_foreground, theme.border);
+        let (cell_bg, empty_bg, warning, text_fg, muted_fg) = (
+            theme.secondary,
+            theme.muted,
+            theme.warning,
+            theme.foreground,
+            theme.muted_foreground,
+        );
+        div().size_full().overflow_hidden().child(
+            uniform_list("contact-sheet", row_count, move |range, _window, _cx| {
                 let mut cells = Vec::new();
                 for row in range {
                     let span = row * GRID_COLS..((row + 1) * GRID_COLS).min(rows.len());
@@ -1383,30 +1518,22 @@ impl Browser {
                     for index in span {
                         let item = &rows[index];
                         let border = if index == current {
-                            rgb(0x4C9AFF)
+                            current_border
                         } else if selected.contains(&index) {
-                            rgb(0x8A8A8A)
+                            selected_border
                         } else {
-                            rgb(0x2A2A2A)
+                            idle_border
                         };
-                        let art: AnyElement = match thumbs.get(&item.item_id) {
-                            Some(art) => {
-                                img(Arc::clone(art)).w_full().h(px(96.0)).into_any_element()
-                            }
-                            None => div()
-                                .w_full()
-                                .h(px(96.0))
-                                .flex()
-                                .items_center()
-                                .justify_center()
-                                .bg(rgb(0x111111))
-                                .text_color(rgb(0x999999))
-                                .text_sm()
-                                .child(item.label())
-                                .into_any_element(),
-                        };
+                        let art = Self::thumb_art(
+                            item,
+                            thumbs.get(&item.item_id),
+                            px(96.0),
+                            empty_bg,
+                            warning,
+                        );
                         let item_id = item.item_id;
-                        let badges = Self::cell_badges(item);
+                        let caption = Self::cell_caption(item);
+                        let flags = Self::cell_flags(item);
                         let entity = entity.clone();
                         row_el = row_el.child(
                             div()
@@ -1418,26 +1545,42 @@ impl Browser {
                                 .border_2()
                                 .border_color(border)
                                 .rounded_md()
-                                .bg(rgb(0x1E1E1E))
+                                .bg(cell_bg)
                                 .cursor_pointer()
                                 .on_click(move |_, _, cx| {
                                     entity.update(cx, |this, cx| this.goto_item(item_id, cx));
                                 })
                                 .child(art)
-                                .child(div().text_xs().text_color(rgb(0xCCCCCC)).child(badges)),
+                                .child(
+                                    div()
+                                        .text_xs()
+                                        .text_color(text_fg)
+                                        .truncate()
+                                        .child(caption),
+                                )
+                                .when(!flags.is_empty(), |cell| {
+                                    cell.child(
+                                        div()
+                                            .text_xs()
+                                            .text_color(muted_fg)
+                                            .truncate()
+                                            .child(flags),
+                                    )
+                                }),
                         );
                     }
                     cells.push(row_el);
                 }
                 cells
-            },
-        ))
+            })
+            .size_full(),
+        )
     }
 
     fn render_single(&mut self, cx: &mut Context<Self>) -> impl IntoElement {
         let item = self.current_item();
         let zoom_label = match self.zoom.mode {
-            ZoomMode::Fit => "fit".to_string(),
+            ZoomMode::Fit => "Fit".to_string(),
             ZoomMode::Hundred => "100%".to_string(),
             ZoomMode::Scale(s) => format!("{:.0}%", s * 100.0),
         };
@@ -1463,16 +1606,18 @@ impl Browser {
         let fit_cell = Rc::clone(&self.fit_scale);
         let title = item
             .as_ref()
-            .map(|row| row.label())
-            .unwrap_or_else(|| "No item".to_string());
+            .map(|row| row.base_name.clone())
+            .unwrap_or_default();
+        let muted = cx.theme().muted_foreground;
         v_flex()
             .size_full()
             .child(
-                div()
+                h_flex()
                     .px_2()
                     .py_1()
-                    .text_sm()
-                    .child(format!("{title} · {zoom_label}")),
+                    .gap_2()
+                    .child(Label::new(title).text_sm())
+                    .child(Label::new(zoom_label).text_sm().text_color(muted)),
             )
             .child(
                 div()
@@ -1480,40 +1625,46 @@ impl Browser {
                     .flex_1()
                     .size_full()
                     .overflow_hidden()
-                    .bg(rgb(0x0E0E0E))
-                    .child(canvas(
-                        |bounds, _, _| bounds,
-                        move |bounds, bounds_state, window, _| {
-                            if let Some(image) = image.clone() {
-                                let img_size = image.size(0);
-                                let w = img_size.width.0 as f32;
-                                let h = img_size.height.0 as f32;
-                                if w > 0.0 && h > 0.0 {
-                                    let bw: f32 = bounds.size.width.into();
-                                    let bh: f32 = bounds.size.height.into();
-                                    let fit = (bw / w).min(bh / h).max(0.01);
-                                    fit_cell.set(fit);
-                                    let scale = zoom.scale_in(w, h, bw, bh);
-                                    let (ox, oy) = paint_origin(w, h, bw, bh, scale, zoom);
-                                    let dw = px(w * scale);
-                                    let dh = px(h * scale);
-                                    let origin = point(
-                                        bounds.origin.x + ox.into(),
-                                        bounds.origin.y + oy.into(),
-                                    );
-                                    let image_bounds = Bounds::new(origin, gpui_kit::size(dw, dh));
-                                    let _ = window.paint_image(
-                                        bounds_state,
-                                        image_bounds,
-                                        Corners::default(),
-                                        image,
-                                        0,
-                                        false,
-                                    );
+                    .bg(cx.theme().background)
+                    .child(
+                        canvas(
+                            |bounds, _, _| bounds,
+                            move |bounds, bounds_state, window, _| {
+                                if let Some(image) = image.clone() {
+                                    let img_size = image.size(0);
+                                    let w = img_size.width.0 as f32;
+                                    let h = img_size.height.0 as f32;
+                                    if w > 0.0 && h > 0.0 {
+                                        let bw: f32 = bounds.size.width.into();
+                                        let bh: f32 = bounds.size.height.into();
+                                        let fit = (bw / w).min(bh / h).max(0.01);
+                                        fit_cell.set(fit);
+                                        let scale = zoom.scale_in(w, h, bw, bh);
+                                        let (ox, oy) = paint_origin(w, h, bw, bh, scale, zoom);
+                                        let dw = px(w * scale);
+                                        let dh = px(h * scale);
+                                        let origin = point(
+                                            bounds.origin.x + ox.into(),
+                                            bounds.origin.y + oy.into(),
+                                        );
+                                        let image_bounds =
+                                            Bounds::new(origin, gpui_kit::size(dw, dh));
+                                        let _ = window.paint_image(
+                                            bounds_state,
+                                            image_bounds,
+                                            Corners::default(),
+                                            image,
+                                            0,
+                                            false,
+                                        );
+                                    }
                                 }
-                            }
-                        },
-                    ))
+                            },
+                        )
+                        // A canvas lays out as 0x0 unless told otherwise, which
+                        // handed the paint closure empty bounds.
+                        .size_full(),
+                    )
                     .on_scroll_wheel(cx.listener(|this, event: &ScrollWheelEvent, _, cx| {
                         let dy: f32 = match &event.delta {
                             ScrollDelta::Pixels(p) => p.y.into(),
@@ -1574,63 +1725,80 @@ impl Browser {
                 budget -= 1;
             }
         }
+        let theme = cx.theme();
+        let (current_outline, cell_bg, empty_bg, warning, caption_fg) = (
+            theme.primary,
+            theme.secondary,
+            theme.muted,
+            theme.warning,
+            theme.muted_foreground,
+        );
+        let (idle_outline, strip_bg) = (theme.transparent, theme.sidebar);
+        // Every cell has the same size and the same border width (clear when
+        // not selected), so selecting one moves and overlaps nothing.
         let cells: Vec<_> = rows
             .iter()
             .enumerate()
             .map(|(index, item)| {
                 let outline = if index == current {
-                    rgb(0x4C9AFF)
+                    current_outline
                 } else {
-                    rgb(0x2A2A2A)
+                    idle_outline
                 };
                 let item_id = item.item_id;
-                let badges = Self::cell_badges(item);
-                let art: AnyElement = match self.thumbs.get(&item_id) {
-                    Some(art) => img(Arc::clone(art)).w_full().h(px(44.0)).into_any_element(),
-                    None => div()
-                        .w_full()
-                        .h(px(44.0))
-                        .flex()
-                        .items_center()
-                        .justify_center()
-                        .bg(rgb(0x111111))
-                        .text_xs()
-                        .text_color(rgb(0x999999))
-                        .child(item.base_name.clone())
-                        .into_any_element(),
-                };
-                div()
+                let art =
+                    Self::thumb_art(item, self.thumbs.get(&item_id), px(56.0), empty_bg, warning);
+                v_flex()
                     .id(("strip", index))
-                    .w(px(96.0))
-                    .h(px(72.0))
-                    .m(px(2.0))
+                    .flex_none()
+                    .w(px(104.0))
+                    .h(px(88.0))
+                    .p_1()
                     .border_2()
                     .border_color(outline)
-                    .rounded_sm()
-                    .bg(rgb(0x1A1A1A))
+                    .rounded_md()
+                    .bg(cell_bg)
                     .cursor_pointer()
                     .on_click(cx.listener(move |this, _: &ClickEvent, _, cx| {
                         this.goto_item(item_id, cx);
                     }))
                     .child(art)
-                    .child(div().text_xs().text_color(rgb(0xAAAAAA)).child(badges))
+                    .child(
+                        div()
+                            .w_full()
+                            .text_xs()
+                            .text_color(caption_fg)
+                            .truncate()
+                            .child(item.base_name.clone()),
+                    )
             })
             .collect();
         div()
             .id("film-strip")
             .w_full()
-            .h(px(96.0))
+            .h(px(104.0))
             .flex()
             .flex_row()
+            .items_center()
+            .gap_2()
+            .px_2()
             .overflow_x_scroll()
             .track_scroll(&self.strip_scroll)
-            .bg(rgb(0x141414))
+            .bg(strip_bg)
             .children(cells)
     }
 
     /// Left metadata panel: item summary plus the template entry point
     /// (plan section 2.7: the template editor opens over the shell).
-    fn render_metadata(&self, _cx: &mut Context<Self>) -> impl IntoElement {
+    fn render_metadata(&self, cx: &mut Context<Self>) -> impl IntoElement {
+        let theme = cx.theme();
+        let (panel_bg, panel_fg, panel_border, muted, warning) = (
+            theme.sidebar,
+            theme.sidebar_foreground,
+            theme.sidebar_border,
+            theme.muted_foreground,
+            theme.warning,
+        );
         let (title, dir, rating, meta_state) = match self.current_item() {
             Some(row) => (
                 row.base_name.clone(),
@@ -1638,7 +1806,7 @@ impl Browser {
                 row.rating,
                 Self::meta_text(row.meta),
             ),
-            None => ("—".to_string(), String::new(), 0, String::new()),
+            None => (String::new(), String::new(), 0, String::new()),
         };
         v_flex()
             .w(px(220.0))
@@ -1646,29 +1814,32 @@ impl Browser {
             .px_2()
             .py_1()
             .gap_1()
-            .bg(rgb(0x181818))
-            .child(div().text_sm().child("Metadata".to_string()))
-            .child(div().text_xs().child(format!("File: {title}")))
-            .child(div().text_xs().child(format!("Dir: {dir}")))
-            .child(div().text_xs().child(format!("Rating: {rating}/5")))
-            .when(!meta_state.is_empty(), |panel| {
-                panel.child(div().text_xs().text_color(rgb(0xBBBB88)).child(meta_state))
-            })
+            .bg(panel_bg)
+            .text_color(panel_fg)
+            .border_r_1()
+            .border_color(panel_border)
+            .child(Label::new(title).text_sm())
+            .child(Label::new(dir).text_xs().text_color(muted))
             .child(
-                div()
-                    .text_xs()
-                    .text_color(rgb(0x888888))
-                    .child("T — open the IPTC template editor.".to_string()),
+                Label::new(if rating > 0 {
+                    "★".repeat(rating.clamp(0, 5) as usize)
+                } else {
+                    "Not rated".to_string()
+                })
+                .text_xs(),
             )
+            .when(!meta_state.is_empty(), |panel| {
+                panel.child(Label::new(meta_state).text_xs().text_color(warning))
+            })
     }
 
     fn meta_text(meta: MetaBadge) -> String {
         match meta {
             MetaBadge::None => String::new(),
-            MetaBadge::Queued => "Template: queued".to_string(),
-            MetaBadge::Writing => "Template: writing…".to_string(),
-            MetaBadge::Done => "Template: applied".to_string(),
-            MetaBadge::Failed => "Template: failed".to_string(),
+            MetaBadge::Queued => "Template queued".to_string(),
+            MetaBadge::Writing => "Writing template…".to_string(),
+            MetaBadge::Done => "Template applied".to_string(),
+            MetaBadge::Failed => "Template failed".to_string(),
         }
     }
 }
@@ -1683,20 +1854,10 @@ impl Render for Browser {
         // Right column collapses in grid mode (plan section 2.1).
         let right: AnyElement = match self.mode {
             Mode::Grid => div().into_any_element(),
-            Mode::Single => self.render_develop_panel().into_any_element(),
+            Mode::Single => self.render_develop_panel(cx).into_any_element(),
         };
         v_flex()
             .size_full()
-            .child(
-                TitleBar::new().child(
-                    h_flex()
-                        .w_full()
-                        .pr_2()
-                        .justify_between()
-                        .child("editing — browse (M1)")
-                        .child("[Open Folder] [Ingest] [Finish & next ▾]"),
-                ),
-            )
             .child(
                 div()
                     .id("browser-root")
@@ -1759,15 +1920,12 @@ impl Render for Browser {
             )
             .child(
                 StatusBar::new()
-                    .left(if self.template_status.is_empty() {
-                        self.scan_status.clone()
-                    } else {
-                        format!("{} · {}", self.template_status, self.scan_status)
+                    .left(match (self.template_status.is_empty(), self.scan_status.is_empty()) {
+                        (true, _) => self.scan_status.clone(),
+                        (false, true) => self.template_status.clone(),
+                        (false, false) => format!("{}; {}", self.template_status, self.scan_status),
                     })
-                    .right(format!(
-                        "{} shown · G grid/single · Z fit · ⇧Z 100% · T templates",
-                        self.rows.len()
-                    )),
+                    .right("O open folder, I ingest, G grid or single, Z fit, Shift Z 100%, T templates"),
             )
     }
 }
