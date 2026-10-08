@@ -14,7 +14,6 @@ use gpui_kit::*;
 use ingest::{AppState, IngestDialog, OpenIngest, apply_ingest_event};
 use templates::{OpenTemplates, TemplateEditor};
 
-use app::browse::CatalogScanPayload;
 use app::ingest_job::handle_job;
 use app::views::Browser;
 use edit_metadata::Writer;
@@ -175,14 +174,6 @@ fn main() {
             KeyBinding::new("t", OpenTemplates, Some("Workspace && !Input")),
         ]);
 
-        if let Some(folder) = pending_folder.clone() {
-            let payload = serde_json::to_string(&CatalogScanPayload {
-                root: folder.to_string_lossy().into_owned(),
-            })
-            .unwrap_or_else(|_| "{}".to_string());
-            catalog.enqueue_job(JobKind::CatalogScan, &payload).ok();
-        }
-
         let window_options = TitleBar::window_options();
         let (window_handle, shell) = gpui_kit::open_window(window_options, cx, |window, cx| {
             let browser_catalog = Arc::clone(&catalog);
@@ -237,6 +228,14 @@ fn main() {
         let _ = window_handle.update(cx, |_view, window, cx| {
             window.focus(&focus_handle, cx);
         });
+
+        // Open argv[1] through the browser, so it tracks the scan job and
+        // shows the folder and its progress. Queueing the job straight into
+        // the catalog would leave the browser blind to its events.
+        if let Some(folder) = pending_folder.clone() {
+            let browser = shell.read(cx).browser.clone();
+            browser.update(cx, |browser, cx| browser.open_folder(folder, cx));
+        }
 
         // Global shortcut handler: the action can come from anywhere in the
         // shell focus tree, so act on the shared ingest state directly.
