@@ -44,6 +44,7 @@ use crate::browse::{
     list_browse_items, pair_key, plan_template_apply, run_catalog_scan,
     template_apply_payloads_with,
 };
+use crate::crop::CropSession;
 use crate::develop::{
     DevelopSession, EditJson, LoadedEdit, RenderQueue, SidecarQueue, SliderId, edit_json,
 };
@@ -54,6 +55,8 @@ use edit_render::{PROXY_DRAG_LONG_EDGE, PROXY_RELEASE_LONG_EDGE, RenderService};
 use gpui_kit::component::slider::{
     Slider as DevelopSliderElement, SliderEvent, SliderState, SliderValue,
 };
+
+mod crop_ui;
 
 /// Cells per contact-sheet row over `uniform_list`.
 pub const GRID_COLS: usize = 4;
@@ -105,7 +108,10 @@ gpui_kit::actions!(
         Rate2,
         Rate3,
         Rate4,
-        Rate5
+        Rate5,
+        ToggleCrop,
+        ApplyCrop,
+        CancelCrop
     ]
 );
 
@@ -119,6 +125,8 @@ pub enum Mode {
 
 /// One develop render the worker takes: what to draw and how.
 struct RenderJob {
+    /// Whether it draws the whole straightened canvas for crop mode.
+    straightened: bool,
     item_id: i64,
     path: String,
     size: RenderSize,
@@ -179,6 +187,15 @@ pub struct Browser {
     develop_dirty: bool,
     /// Diagnostics for the develop panel status line.
     develop_status: String,
+    /// Crop mode's draft, while the mode is active.
+    crop: Option<CropSession>,
+    /// The straighten slider in the crop panel.
+    straighten: Entity<SliderState>,
+    straighten_dragging: bool,
+    /// Whether `develop_image` is the straightened canvas crop mode edits.
+    straightened_image: bool,
+    /// Where the canvas last painted the image, for crop pointer mapping.
+    crop_frame: Rc<Cell<Option<crop_ui::ImageFrame>>>,
     /// The resolved rendered develop output through `render_path`.
     renderer: Arc<RenderService>,
     scan_jobs: Vec<JobId>,
@@ -256,6 +273,9 @@ impl Browser {
             KeyBinding::new("3", Rate3, None),
             KeyBinding::new("4", Rate4, None),
             KeyBinding::new("5", Rate5, None),
+            KeyBinding::new("c", ToggleCrop, None),
+            KeyBinding::new("enter", ApplyCrop, None),
+            KeyBinding::new("escape", CancelCrop, None),
         ]);
         let browser = Self {
             catalog,
@@ -288,6 +308,11 @@ impl Browser {
             develop_image_item: None,
             develop_dirty: false,
             develop_status: String::new(),
+            crop: None,
+            straighten: crop_ui::straighten_slider(cx),
+            straighten_dragging: false,
+            straightened_image: false,
+            crop_frame: Rc::new(Cell::new(None)),
             renderer,
             scan_jobs: Vec::new(),
             template_status: String::new(),
@@ -756,6 +781,7 @@ impl Browser {
             return;
         }
         // An outgoing item commits its edit buffer before the cursor moves.
+        self.finish_crop(true, cx);
         self.persist_current_edit(cx);
         self.selection.move_cursor(delta, extend, len);
         self.current = self.selection.cursor;
@@ -771,6 +797,7 @@ impl Browser {
             return;
         }
         // An outgoing item commits its edit buffer before the cursor moves.
+        self.finish_crop(true, cx);
         self.persist_current_edit(cx);
         self.selection.select_single(index, self.rows.len());
         self.current = self.selection.cursor;
@@ -1111,12 +1138,14 @@ impl Browser {
         loop {
             let (size, token) = self.queue.take()?;
             if let Some(item) = self.current_item() {
+                let (crop, straightened) = self.render_crop();
                 return Some(RenderJob {
+                    straightened,
                     item_id: item.item_id,
                     path: item.display_path.clone(),
                     size,
                     develop: self.develop.buffer().clone(),
-                    crop: self.develop.crop().cloned(),
+                    crop,
                     token,
                 });
             }
@@ -1136,6 +1165,7 @@ impl Browser {
                     .ok()
                     .flatten();
                 let Some(RenderJob {
+                    straightened,
                     item_id,
                     path,
                     size,
@@ -1162,7 +1192,7 @@ impl Browser {
                 };
                 let applied = this
                     .update(cx, |this, cx| {
-                        this.finish_render(item_id, frame, cx);
+                        this.finish_render(item_id, frame, straightened, cx);
                         cx.notify();
                     })
                     .is_ok();
@@ -1183,6 +1213,7 @@ impl Browser {
         &mut self,
         item_id: i64,
         frame: edit_core::Result<edit_core::Frame>,
+        straightened: bool,
         cx: &mut Context<Self>,
     ) {
         match frame {
@@ -1190,6 +1221,7 @@ impl Browser {
                 self.queue.complete(true);
                 self.queue.finish(item_id);
                 if self.develop_item_id() == item_id {
+                    self.note_frame_framing(straightened, frame.width, frame.height);
                     self.insert_develop_frame(item_id, frame);
                     self.prewarm_neighbors(cx);
                 }
@@ -1647,6 +1679,8 @@ impl Browser {
         });
         let zoom = self.zoom;
         let fit_cell = Rc::clone(&self.fit_scale);
+        let crop_frame = Rc::clone(&self.crop_frame);
+        let crop_overlay = self.crop_overlay(cx);
         let title = item
             .as_ref()
             .map(|row| row.base_name.clone())
@@ -1673,6 +1707,7 @@ impl Browser {
                         canvas(
                             |bounds, _, _| bounds,
                             move |bounds, bounds_state, window, _| {
+                                crop_frame.set(None);
                                 if let Some(image) = image.clone() {
                                     let img_size = image.size(0);
                                     let w = img_size.width.0 as f32;
@@ -1700,6 +1735,16 @@ impl Browser {
                                             0,
                                             false,
                                         );
+                                        let frame = crop_ui::ImageFrame {
+                                            x: origin.x.into(),
+                                            y: origin.y.into(),
+                                            w: dw.into(),
+                                            h: dh.into(),
+                                        };
+                                        crop_frame.set(Some(frame));
+                                        if let Some(overlay) = crop_overlay {
+                                            crop_ui::paint_overlay(window, frame, overlay);
+                                        }
                                     }
                                 }
                             },
@@ -1709,6 +1754,9 @@ impl Browser {
                         .size_full(),
                     )
                     .on_scroll_wheel(cx.listener(|this, event: &ScrollWheelEvent, _, cx| {
+                        if this.crop_active() {
+                            return;
+                        }
                         let dy: f32 = match &event.delta {
                             ScrollDelta::Pixels(p) => p.y.into(),
                             ScrollDelta::Lines(p) => p.y * 20.0,
@@ -1723,11 +1771,17 @@ impl Browser {
                     }))
                     .on_mouse_down(
                         MouseButton::Left,
-                        cx.listener(|this, event: &MouseDownEvent, _, _| {
+                        cx.listener(|this, event: &MouseDownEvent, _, cx| {
+                            if this.crop_pointer_down(event.position, cx) {
+                                return;
+                            }
                             this.drag_from = Some(event.position);
                         }),
                     )
                     .on_mouse_move(cx.listener(|this, event: &MouseMoveEvent, _, cx| {
+                        if this.crop_pointer_move(event.position, cx) {
+                            return;
+                        }
                         if let Some(from) = this.drag_from {
                             let dx_pixels: f32 = (event.position.x - from.x).into();
                             let dy_pixels: f32 = (event.position.y - from.y).into();
@@ -1739,7 +1793,10 @@ impl Browser {
                     }))
                     .on_mouse_up(
                         MouseButton::Left,
-                        cx.listener(|this, _: &MouseUpEvent, _, _| {
+                        cx.listener(|this, _: &MouseUpEvent, _, cx| {
+                            if this.crop_pointer_up(cx) {
+                                return;
+                            }
                             this.drag_from = None;
                         }),
                     ),
@@ -1890,6 +1947,7 @@ impl Browser {
 impl Render for Browser {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         self.sync_sliders(window, cx);
+        self.sync_straighten(window, cx);
         let center: AnyElement = match self.mode {
             Mode::Grid => self.render_grid(cx).into_any_element(),
             Mode::Single => self.render_single(cx).into_any_element(),
@@ -1897,6 +1955,7 @@ impl Render for Browser {
         // Right column collapses in grid mode (plan section 2.1).
         let right: AnyElement = match self.mode {
             Mode::Grid => div().into_any_element(),
+            Mode::Single if self.crop.is_some() => self.render_crop_panel(cx).into_any_element(),
             Mode::Single => self.render_develop_panel(cx).into_any_element(),
         };
         v_flex()
@@ -1921,7 +1980,19 @@ impl Render for Browser {
                     .on_action(cx.listener(|this, _: &ExtendPrevRow, _, cx| {
                         this.walk(-(GRID_COLS as isize), true, cx);
                     }))
+                    .on_action(cx.listener(|this, _: &ToggleCrop, _, cx| {
+                        if this.mode == Mode::Single {
+                            this.toggle_crop(cx);
+                        }
+                    }))
+                    .on_action(cx.listener(|this, _: &ApplyCrop, _, cx| {
+                        this.finish_crop(true, cx);
+                    }))
+                    .on_action(cx.listener(|this, _: &CancelCrop, _, cx| {
+                        this.finish_crop(false, cx);
+                    }))
                     .on_action(cx.listener(|this, _: &ToggleView, _, cx| {
+                        this.finish_crop(true, cx);
                         this.mode = match this.mode {
                             Mode::Grid => Mode::Single,
                             Mode::Single => Mode::Grid,
@@ -1968,7 +2039,7 @@ impl Render for Browser {
                         (false, true) => self.template_status.clone(),
                         (false, false) => format!("{}; {}", self.template_status, self.scan_status),
                     })
-                    .right("O open folder, I ingest, G grid or single, Z fit, Shift Z 100%, T templates"),
+                    .right("O open folder, I ingest, G grid or single, C crop, Z fit, Shift Z 100%, T templates"),
             )
     }
 }
