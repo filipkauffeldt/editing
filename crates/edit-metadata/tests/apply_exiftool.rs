@@ -5,8 +5,10 @@
 //! → tags land in the files. Reads verification back with the same
 //! mechanism Photo Mechanic-compatible tools use: exiftool itself.
 //!
-//! Requires the exiftool binary (`$EXIFTOOL`, else `PATH`); skips
-//! silently elsewhere, like `writer_exiftool.rs`.
+//! Requires the exiftool binary (`$EXIFTOOL`, else `PATH`); a missing one
+//! fails the test, see `Writer::binary_for_tests`. The selection-driven
+//! scenarios (pairs, re-apply, resume, non-ASCII, multi-line) live in
+//! `crates/app/tests/template_apply.rs`.
 
 use std::path::{Path, PathBuf};
 use std::process::Command;
@@ -68,8 +70,7 @@ fn read_tags(exiftool: &Path, file: &Path, tag: &str) -> Vec<String> {
 
 #[test]
 fn template_apply_recipe_writes_the_selection() {
-    let Some(exiftool) = Writer::find_binary() else {
-        eprintln!("SKIPPED: no exiftool binary ($EXIFTOOL or PATH)");
+    let Some(exiftool) = Writer::binary_for_tests() else {
         return;
     };
     let (dir, paths) = three_photos();
@@ -133,11 +134,7 @@ fn template_apply_recipe_writes_the_selection() {
             .unwrap();
     }
 
-    let writer = Arc::new(
-        Writer::find_binary()
-            .map(|bin| Writer::resident(&bin).unwrap())
-            .unwrap(),
-    );
+    let writer = Arc::new(Writer::resident(&exiftool).unwrap());
     let handler: edit_catalog::JobHandler =
         Arc::new(move |job: &ClaimedJob, tx| edit_metadata::run_metadata_write(job, &writer, tx));
     let pool = spawn_pool(&catalog, handler);

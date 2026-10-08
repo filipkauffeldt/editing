@@ -322,6 +322,26 @@ impl Writer {
         Self::is_available("exiftool").then(|| PathBuf::from("exiftool"))
     }
 
+    /// The exiftool binary for tests that need the real thing. A missing
+    /// binary fails the test loudly: CI installs `libimage-exiftool-perl`,
+    /// so skipping there would let the write path go untested unnoticed.
+    /// Set `EDITING_SKIP_EXIFTOOL_TESTS=1` to opt out locally, which
+    /// returns `None` after a SKIPPED notice.
+    #[doc(hidden)]
+    pub fn binary_for_tests() -> Option<PathBuf> {
+        if let Some(bin) = Self::find_binary() {
+            return Some(bin);
+        }
+        if std::env::var_os("EDITING_SKIP_EXIFTOOL_TESTS").is_some() {
+            eprintln!("SKIPPED: no exiftool binary ($EXIFTOOL or PATH), opted out by env");
+            return None;
+        }
+        panic!(
+            "exiftool not found ($EXIFTOOL or PATH): install libimage-exiftool-perl, \
+             or set EDITING_SKIP_EXIFTOOL_TESTS=1 to skip these tests locally"
+        );
+    }
+
     /// Set `tags` (`NAME=value`, exiftool `-TAG=value` form) on `target`.
     /// Restarts a dead process once and retries the command once.
     ///

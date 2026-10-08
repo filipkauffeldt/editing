@@ -74,8 +74,7 @@ fn sidecar_packet_carries_the_crs_tag_set() {
 
 #[test]
 fn exiftool_reads_every_sidecar_tag() {
-    let Some(bin) = Writer::find_binary() else {
-        eprintln!("SKIPPED: no exiftool binary ($EXIFTOOL or PATH)");
+    let Some(bin) = Writer::binary_for_tests() else {
         return;
     };
     let dir = tempfile::TempDir::new().unwrap();
