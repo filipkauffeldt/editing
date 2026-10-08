@@ -327,6 +327,11 @@ impl Browser {
     pub fn open_folder(&mut self, path: PathBuf, cx: &mut Context<Self>) {
         // Reopening is an explicit reload: failed renders get another try.
         self.queue.navigate();
+        // A folder opens on its contact sheet with the first photo selected.
+        self.mode = Mode::Grid;
+        self.current = 0;
+        self.selection = SelectionModel::new(self.rows.len());
+        self.zoom.reset();
         let canon = canonical_root(&path);
         let label = canon.to_string_lossy().into_owned();
         let payload = serde_json::to_string(&CatalogScanPayload {
