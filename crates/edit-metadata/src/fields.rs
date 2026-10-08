@@ -164,6 +164,17 @@ pub const RELEASE_STATUS: &[(&str, &str)] = &[
     ),
 ];
 
+pub const PROPERTY_RELEASE_STATUS: &[(&str, &str)] = &[
+    NOT_SET,
+    ("None", "None"),
+    ("Not applicable", "Not Applicable"),
+    ("Unlimited releases", "Unlimited Property Releases"),
+    (
+        "Limited or incomplete",
+        "Limited or Incomplete Property Releases",
+    ),
+];
+
 pub const MODEL_AGE: &[(&str, &str)] = &[
     NOT_SET,
     ("Age unknown", "Age Unknown"),
@@ -178,8 +189,7 @@ pub const MODEL_AGE: &[(&str, &str)] = &[
     ("17", "Age 17"),
     ("16", "Age 16"),
     ("15", "Age 15"),
-    ("14", "Age 14"),
-    ("13 or under", "Age 13 or Under"),
+    ("14 or under", "Age 14 or Under"),
 ];
 
 macro_rules! field {
@@ -199,398 +209,63 @@ use Kind::{CountryCode, Date, List, Multi, Select, Single};
 
 /// The table. Ids that match the original template keys (`caption`,
 /// `byline`, `copyright`, `rights`, ...) keep old stored templates loading.
+#[rustfmt::skip]
 pub static FIELDS: &[FieldSpec] = &[
     // Description
-    field!(
-        "title",
-        "Title",
-        Description,
-        Single,
-        ["XMP-dc:Title"],
-        ["IPTC:ObjectName"]
-    ),
-    field!(
-        "headline",
-        "Headline",
-        Description,
-        Single,
-        ["XMP-photoshop:Headline"],
-        ["IPTC:Headline"]
-    ),
-    field!(
-        "caption",
-        "Description",
-        Description,
-        Multi(4),
-        ["XMP-dc:Description"],
-        ["IPTC:Caption-Abstract"]
-    ),
-    field!(
-        "caption_writer",
-        "Description writer",
-        Description,
-        Single,
-        ["XMP-photoshop:CaptionWriter"],
-        ["IPTC:Writer-Editor"]
-    ),
-    field!(
-        "keywords",
-        "Keywords",
-        Description,
-        List,
-        ["XMP-dc:Subject"],
-        ["IPTC:Keywords"]
-    ),
-    field!(
-        "category",
-        "Category",
-        Description,
-        Single,
-        ["XMP-photoshop:Category"],
-        ["IPTC:Category"]
-    ),
-    field!(
-        "supplemental_categories",
-        "Other categories",
-        Description,
-        List,
-        ["XMP-photoshop:SupplementalCategories"],
-        ["IPTC:SupplementalCategories"]
-    ),
-    field!(
-        "event",
-        "Event",
-        Description,
-        Single,
-        ["XMP-iptcExt:Event"],
-        []
-    ),
-    field!(
-        "urgency",
-        "Urgency",
-        Description,
-        Select(URGENCY),
-        ["XMP-photoshop:Urgency"],
-        ["IPTC:Urgency"]
-    ),
-    field!(
-        "edit_status",
-        "Edit status",
-        Description,
-        Select(EDIT_STATUS),
-        [],
-        ["IPTC:EditStatus"]
-    ),
+    field!("title", "Title", Description, Single, ["XMP-dc:Title"], ["IPTC:ObjectName"]),
+    field!("headline", "Headline", Description, Single, ["XMP-photoshop:Headline"], ["IPTC:Headline"]),
+    field!("caption", "Description", Description, Multi(4), ["XMP-dc:Description"], ["IPTC:Caption-Abstract"]),
+    field!("caption_writer", "Description writer", Description, Single, ["XMP-photoshop:CaptionWriter"], ["IPTC:Writer-Editor"]),
+    field!("keywords", "Keywords", Description, List, ["XMP-dc:Subject"], ["IPTC:Keywords"]),
+    field!("category", "Category", Description, Single, ["XMP-photoshop:Category"], ["IPTC:Category"]),
+    field!("supplemental_categories", "Other categories", Description, List, ["XMP-photoshop:SupplementalCategories"], ["IPTC:SupplementalCategories"]),
+    field!("event", "Event", Description, Single, ["XMP-iptcExt:Event"], []),
+    field!("urgency", "Urgency", Description, Select(URGENCY), ["XMP-photoshop:Urgency"], ["IPTC:Urgency"]),
+    field!("edit_status", "Edit status", Description, Select(EDIT_STATUS), [], ["IPTC:EditStatus"]),
     // Creator and rights
-    field!(
-        "byline",
-        "Creator",
-        CreatorRights,
-        Single,
-        ["XMP-dc:Creator"],
-        ["IPTC:By-line"]
-    ),
-    field!(
-        "byline_title",
-        "Creator job title",
-        CreatorRights,
-        Single,
-        ["XMP-photoshop:AuthorsPosition"],
-        ["IPTC:By-lineTitle"]
-    ),
-    field!(
-        "credit",
-        "Credit line",
-        CreatorRights,
-        Single,
-        ["XMP-photoshop:Credit"],
-        ["IPTC:Credit"]
-    ),
-    field!(
-        "source",
-        "Source",
-        CreatorRights,
-        Single,
-        ["XMP-photoshop:Source"],
-        ["IPTC:Source"]
-    ),
-    field!(
-        "copyright",
-        "Copyright notice",
-        CreatorRights,
-        Single,
-        ["XMP-dc:Rights"],
-        ["IPTC:CopyrightNotice"]
-    ),
-    field!(
-        "copyright_status",
-        "Copyright status",
-        CreatorRights,
-        Select(COPYRIGHT_STATUS),
-        ["XMP-xmpRights:Marked"],
-        []
-    ),
-    field!(
-        "rights",
-        "Rights usage terms",
-        CreatorRights,
-        Single,
-        ["XMP-xmpRights:UsageTerms"],
-        []
-    ),
+    field!("byline", "Creator", CreatorRights, Single, ["XMP-dc:Creator"], ["IPTC:By-line"]),
+    field!("byline_title", "Creator job title", CreatorRights, Single, ["XMP-photoshop:AuthorsPosition"], ["IPTC:By-lineTitle"]),
+    field!("credit", "Credit line", CreatorRights, Single, ["XMP-photoshop:Credit"], ["IPTC:Credit"]),
+    field!("source", "Source", CreatorRights, Single, ["XMP-photoshop:Source"], ["IPTC:Source"]),
+    field!("copyright", "Copyright notice", CreatorRights, Single, ["XMP-dc:Rights"], ["IPTC:CopyrightNotice"]),
+    field!("copyright_status", "Copyright status", CreatorRights, Select(COPYRIGHT_STATUS), ["XMP-xmpRights:Marked"], []),
+    field!("rights", "Rights usage terms", CreatorRights, Single, ["XMP-xmpRights:UsageTerms"], []),
     // Job
-    field!(
-        "job_id",
-        "Job identifier",
-        Job,
-        Single,
-        ["XMP-photoshop:TransmissionReference"],
-        ["IPTC:OriginalTransmissionReference"]
-    ),
-    field!(
-        "instructions",
-        "Special instructions",
-        Job,
-        Single,
-        ["XMP-photoshop:Instructions"],
-        ["IPTC:SpecialInstructions"]
-    ),
-    field!(
-        "date_created",
-        "Date created",
-        Job,
-        Date,
-        ["XMP-photoshop:DateCreated"],
-        ["IPTC:DateCreated"]
-    ),
-    field!(
-        "genre",
-        "Intellectual genre",
-        Job,
-        Single,
-        ["XMP-iptcCore:IntellectualGenre"],
-        []
-    ),
+    field!("job_id", "Job identifier", Job, Single, ["XMP-photoshop:TransmissionReference"], ["IPTC:OriginalTransmissionReference"]),
+    field!("instructions", "Special instructions", Job, Single, ["XMP-photoshop:Instructions"], ["IPTC:SpecialInstructions"]),
+    field!("date_created", "Date created", Job, Date, ["XMP-photoshop:DateCreated"], ["IPTC:DateCreated"]),
+    field!("genre", "Intellectual genre", Job, Single, ["XMP-iptcCore:IntellectualGenre"], []),
     field!("scene", "Scene", Job, List, ["XMP-iptcCore:Scene"], []),
-    field!(
-        "subject_code",
-        "Subject code",
-        Job,
-        List,
-        ["XMP-iptcCore:SubjectCode"],
-        []
-    ),
+    field!("subject_code", "Subject code", Job, List, ["XMP-iptcCore:SubjectCode"], []),
     // Location
-    field!(
-        "city",
-        "City",
-        Location,
-        Single,
-        ["XMP-photoshop:City"],
-        ["IPTC:City"]
-    ),
-    field!(
-        "sublocation",
-        "Sub-location",
-        Location,
-        Single,
-        ["XMP-iptcCore:Location"],
-        ["IPTC:Sub-location"]
-    ),
-    field!(
-        "state",
-        "State or province",
-        Location,
-        Single,
-        ["XMP-photoshop:State"],
-        ["IPTC:Province-State"]
-    ),
-    field!(
-        "country",
-        "Country",
-        Location,
-        Single,
-        ["XMP-photoshop:Country"],
-        ["IPTC:Country-PrimaryLocationName"]
-    ),
-    field!(
-        "country_code",
-        "Country code",
-        Location,
-        CountryCode,
-        ["XMP-iptcCore:CountryCode"],
-        ["IPTC:Country-PrimaryLocationCode"]
-    ),
+    field!("city", "City", Location, Single, ["XMP-photoshop:City"], ["IPTC:City"]),
+    field!("sublocation", "Sub-location", Location, Single, ["XMP-iptcCore:Location"], ["IPTC:Sub-location"]),
+    field!("state", "State or province", Location, Single, ["XMP-photoshop:State"], ["IPTC:Province-State"]),
+    field!("country", "Country", Location, Single, ["XMP-photoshop:Country"], ["IPTC:Country-PrimaryLocationName"]),
+    field!("country_code", "Country code", Location, CountryCode, ["XMP-iptcCore:CountryCode"], ["IPTC:Country-PrimaryLocationCode"]),
     // Creator contact
-    field!(
-        "contact_address",
-        "Address",
-        Contact,
-        Single,
-        ["XMP-iptcCore:CreatorAddress"],
-        []
-    ),
-    field!(
-        "contact_city",
-        "City",
-        Contact,
-        Single,
-        ["XMP-iptcCore:CreatorCity"],
-        []
-    ),
-    field!(
-        "contact_state",
-        "State or province",
-        Contact,
-        Single,
-        ["XMP-iptcCore:CreatorRegion"],
-        []
-    ),
-    field!(
-        "contact_postal_code",
-        "Postal code",
-        Contact,
-        Single,
-        ["XMP-iptcCore:CreatorPostalCode"],
-        []
-    ),
-    field!(
-        "contact_country",
-        "Country",
-        Contact,
-        Single,
-        ["XMP-iptcCore:CreatorCountry"],
-        []
-    ),
-    field!(
-        "contact_phone",
-        "Phone",
-        Contact,
-        Single,
-        ["XMP-iptcCore:CreatorWorkTelephone"],
-        []
-    ),
-    field!(
-        "contact_email",
-        "Email",
-        Contact,
-        Single,
-        ["XMP-iptcCore:CreatorWorkEmail"],
-        []
-    ),
-    field!(
-        "contact_url",
-        "Website",
-        Contact,
-        Single,
-        ["XMP-iptcCore:CreatorWorkURL"],
-        []
-    ),
+    field!("contact_address", "Address", Contact, Single, ["XMP-iptcCore:CreatorAddress"], []),
+    field!("contact_city", "City", Contact, Single, ["XMP-iptcCore:CreatorCity"], []),
+    field!("contact_state", "State or province", Contact, Single, ["XMP-iptcCore:CreatorRegion"], []),
+    field!("contact_postal_code", "Postal code", Contact, Single, ["XMP-iptcCore:CreatorPostalCode"], []),
+    field!("contact_country", "Country", Contact, Single, ["XMP-iptcCore:CreatorCountry"], []),
+    field!("contact_phone", "Phone", Contact, Single, ["XMP-iptcCore:CreatorWorkTelephone"], []),
+    field!("contact_email", "Email", Contact, Single, ["XMP-iptcCore:CreatorWorkEmail"], []),
+    field!("contact_url", "Website", Contact, Single, ["XMP-iptcCore:CreatorWorkURL"], []),
     // Image rights and release
-    field!(
-        "image_supplier",
-        "Image supplier",
-        ImageRights,
-        Single,
-        ["XMP-plus:ImageSupplierName"],
-        []
-    ),
-    field!(
-        "copyright_owner",
-        "Copyright owner",
-        ImageRights,
-        Single,
-        ["XMP-plus:CopyrightOwnerName"],
-        []
-    ),
-    field!(
-        "licensor",
-        "Licensor",
-        ImageRights,
-        Single,
-        ["XMP-plus:LicensorName"],
-        []
-    ),
-    field!(
-        "person_shown",
-        "Person shown",
-        ImageRights,
-        List,
-        ["XMP-iptcExt:PersonInImage"],
-        []
-    ),
-    field!(
-        "org_name",
-        "Organisation in image name",
-        ImageRights,
-        List,
-        ["XMP-iptcExt:OrganisationInImageName"],
-        []
-    ),
-    field!(
-        "org_code",
-        "Organisation in image code",
-        ImageRights,
-        List,
-        ["XMP-iptcExt:OrganisationInImageCode"],
-        []
-    ),
-    field!(
-        "digital_source_type",
-        "Digital source type",
-        ImageRights,
-        Select(DIGITAL_SOURCE_TYPE),
-        ["XMP-iptcExt:DigitalSourceType"],
-        []
-    ),
-    field!(
-        "model_release_id",
-        "Model release ID",
-        ImageRights,
-        List,
-        ["XMP-plus:ModelReleaseID"],
-        []
-    ),
-    field!(
-        "model_release_status",
-        "Model release status",
-        ImageRights,
-        Select(RELEASE_STATUS),
-        ["XMP-plus:ModelReleaseStatus"],
-        []
-    ),
-    field!(
-        "property_release_id",
-        "Property release ID",
-        ImageRights,
-        List,
-        ["XMP-plus:PropertyReleaseID"],
-        []
-    ),
-    field!(
-        "property_release_status",
-        "Property release status",
-        ImageRights,
-        Select(RELEASE_STATUS),
-        ["XMP-plus:PropertyReleaseStatus"],
-        []
-    ),
-    field!(
-        "model_info",
-        "Additional model info",
-        ImageRights,
-        Single,
-        ["XMP-iptcExt:AdditionalModelInformation"],
-        []
-    ),
-    field!(
-        "minor_model_age",
-        "Minor model age disclosure",
-        ImageRights,
-        Select(MODEL_AGE),
-        ["XMP-plus:MinorModelAgeDisclosure"],
-        []
-    ),
+    field!("image_supplier", "Image supplier", ImageRights, Single, ["XMP-plus:ImageSupplierName"], []),
+    field!("copyright_owner", "Copyright owner", ImageRights, Single, ["XMP-plus:CopyrightOwnerName"], []),
+    field!("licensor", "Licensor", ImageRights, Single, ["XMP-plus:LicensorName"], []),
+    field!("person_shown", "Person shown", ImageRights, List, ["XMP-iptcExt:PersonInImage"], []),
+    field!("org_name", "Organisation in image name", ImageRights, List, ["XMP-iptcExt:OrganisationInImageName"], []),
+    field!("org_code", "Organisation in image code", ImageRights, List, ["XMP-iptcExt:OrganisationInImageCode"], []),
+    field!("digital_source_type", "Digital source type", ImageRights, Select(DIGITAL_SOURCE_TYPE), ["XMP-iptcExt:DigitalSourceType"], []),
+    field!("model_release_id", "Model release ID", ImageRights, List, ["XMP-plus:ModelReleaseID"], []),
+    field!("model_release_status", "Model release status", ImageRights, Select(RELEASE_STATUS), ["XMP-plus:ModelReleaseStatus"], []),
+    field!("property_release_id", "Property release ID", ImageRights, List, ["XMP-plus:PropertyReleaseID"], []),
+    field!("property_release_status", "Property release status", ImageRights, Select(PROPERTY_RELEASE_STATUS), ["XMP-plus:PropertyReleaseStatus"], []),
+    field!("model_info", "Additional model info", ImageRights, Single, ["XMP-iptcExt:AdditionalModelInformation"], []),
+    field!("minor_model_age", "Minor model age disclosure", ImageRights, Select(MODEL_AGE), ["XMP-plus:MinorModelAgeDisclosure"], []),
 ];
 
 /// Look a row up by id.
@@ -611,6 +286,19 @@ pub fn normalize_read(spec: &FieldSpec, raw: &str) -> String {
             let day = raw.split([' ', 'T']).next().unwrap_or(raw);
             day.replace(':', "-")
         }
+        // exiftool prints some choices with a gloss (`1 (most urgent)`).
+        Kind::Select(options) => options
+            .iter()
+            .map(|(_, value)| *value)
+            .filter(|value| !value.is_empty())
+            .find(|value| {
+                raw == *value
+                    || raw
+                        .strip_prefix(value)
+                        .is_some_and(|rest| rest.starts_with(" ("))
+            })
+            .unwrap_or(raw)
+            .to_owned(),
         _ => raw.to_owned(),
     }
 }
@@ -653,6 +341,14 @@ mod tests {
         let spec = field("date_created").unwrap();
         assert_eq!(normalize_read(spec, "2024:01:02"), "2024-01-02");
         assert_eq!(normalize_read(spec, "2024:01:02 10:00:00"), "2024-01-02");
+    }
+
+    #[test]
+    fn urgency_gloss_is_dropped() {
+        let spec = field("urgency").unwrap();
+        assert_eq!(normalize_read(spec, "1 (most urgent)"), "1");
+        assert_eq!(normalize_read(spec, "5 (normal urgency)"), "5");
+        assert_eq!(normalize_read(spec, "odd"), "odd");
     }
 
     #[test]

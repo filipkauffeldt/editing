@@ -10,6 +10,7 @@ pub mod crs;
 pub mod crs_keys;
 pub mod error;
 pub mod fields;
+pub mod iptc_read;
 pub mod persist;
 pub mod photo;
 pub mod template;
@@ -25,6 +26,7 @@ pub use crs::{
 };
 pub use error::{Error, Result};
 pub use fields::{FIELDS, FieldSpec, Group, Kind};
+pub use iptc_read::{FieldValues, Merged, merge_values, read_fields};
 pub use persist::{PersistOutcome, persist_edit, persist_sidecar};
 pub use photo::{
     PhotoMetadata, read_exif, read_photo_metadata, read_xmp_file, read_xmp_sidecar_for,
