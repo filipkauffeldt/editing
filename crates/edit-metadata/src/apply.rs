@@ -20,6 +20,7 @@ use edit_catalog::db::now_unix;
 use edit_catalog::{ClaimedJob, JobEvent, JobEventKind};
 use flume::Sender;
 
+use crate::CodeReplacements;
 use crate::read_photo_metadata;
 use crate::template::{TemplateFields, TemplateVars};
 use crate::writer::Writer;
@@ -57,6 +58,10 @@ pub struct MetadataWritePayload {
     pub captured_at: i64,
     /// The template row's `fields_json` verbatim.
     pub fields_json: String,
+    /// Parsed code replacement file at apply time, so a crash-resumed job
+    /// expands `=code=` / hot codes without re-reading the file.
+    #[serde(default)]
+    pub replacements: Option<CodeReplacements>,
 }
 
 /// True when `path` is a raw file (sidecar-stamped, never in place).
@@ -157,7 +162,18 @@ pub fn preview_fields(
     sequence: u64,
     now_unix: i64,
 ) -> Vec<(&'static str, String)> {
-    fields.preview(&vars_for(path, sequence, now_unix))
+    preview_fields_with(path, fields, sequence, now_unix, None)
+}
+
+/// [`preview_fields`] with code replacements and hot codes expanded.
+pub fn preview_fields_with(
+    path: &Path,
+    fields: &TemplateFields,
+    sequence: u64,
+    now_unix: i64,
+    replacements: Option<&CodeReplacements>,
+) -> Vec<(&'static str, String)> {
+    fields.preview_with(&vars_for(path, sequence, now_unix), replacements)
 }
 
 /// Run one claimed `metadata_write` job against a shared
@@ -191,10 +207,11 @@ pub fn run_metadata_write(
         // raw container itself is never rewritten in place. Plain stills
         // keep Photo-Mechanic-style in-place IIM+XMP.
         let raw = is_raw(path);
+        let codes = payload.replacements.as_ref();
         let tags = if raw {
-            fields.to_xmp_tags(&vars)
+            fields.to_xmp_tags_with(&vars, codes)
         } else {
-            fields.to_tags(&vars)
+            fields.to_tags_with(&vars, codes)
         };
         let outcome = if tags.is_empty() {
             Err("every field expanded empty; nothing written".to_owned())
@@ -407,5 +424,50 @@ mod tests {
         };
         let err = run_metadata_write(&job, &writer, &tx).unwrap_err();
         assert!(err.contains("no fields"), "{err}");
+    }
+
+    #[test]
+    fn run_metadata_write_expands_code_replacements_from_the_payload() {
+        use tempfile::TempDir;
+
+        let dir = TempDir::new().unwrap();
+        let jpeg = dir.path().join("A1.JPG");
+        std::fs::write(&jpeg, b"jpeg bytes").unwrap();
+
+        let fields = serde_json::json!({"caption": "\\h1\\ watch"});
+        let replacements = crate::CodeReplacements::parse("h1\tSHL\n");
+        let payload = serde_json::to_string(&MetadataWritePayload {
+            item_id: 5,
+            paths: vec![jpeg.to_string_lossy().into_owned()],
+            sequence: 1,
+            captured_at: 1_791_374_400,
+            fields_json: fields.to_string(),
+            replacements: Some(replacements),
+        })
+        .unwrap();
+        let captured = std::sync::Arc::new(std::sync::Mutex::new(Vec::<Vec<String>>::new()));
+        struct Cap(std::sync::Arc<std::sync::Mutex<Vec<Vec<String>>>>);
+        impl crate::Transport for Cap {
+            fn execute(&mut self, args: &[String]) -> crate::Result<String> {
+                self.0.lock().unwrap().push(args.to_vec());
+                Ok("    1 image files updated\n".into())
+            }
+        }
+        let writer = Writer::with_transport(Cap(std::sync::Arc::clone(&captured)));
+        let (tx, _rx) = flume::unbounded();
+        let job = ClaimedJob {
+            id: edit_catalog::JobId(14),
+            kind: edit_catalog::JobKind::MetadataWrite,
+            payload_json: payload,
+            attempts: 1,
+        };
+        run_metadata_write(&job, &writer, &tx).unwrap();
+        let blocks = captured.lock().unwrap().clone();
+        assert!(
+            blocks[0]
+                .iter()
+                .any(|arg| arg == "-XMP-dc:Description=SHL watch"),
+            "hot code expanded in the caption: {blocks:?}"
+        );
     }
 }

@@ -15,8 +15,14 @@
 //! entered replacements, so late variables never destroy typed text). A
 //! field whose variables expand to nothing is skipped instead of wiping
 //! what is already on the photo.
+//!
+//! [`expand_with_codes`] layers Photo Mechanic code replacements and hot
+//! codes (see `code_replacements`) on top of the variables, so a field can
+//! mix `{…}`, `=code=` and `\hot\` / `[hot]` invocations.
 
 use serde::{Deserialize, Serialize};
+
+use crate::code_replacements::CodeReplacements;
 
 /// Phase-1 IPTC field set (plan section 2.7): caption, keywords, headline,
 /// byline and title, credit, source, copyright, instructions, edit status,
@@ -158,6 +164,21 @@ pub fn expand(text: &str, vars: &TemplateVars) -> String {
     out
 }
 
+/// Expand `{…}` variables plus, when `codes` is a non-empty replacement
+/// set, Photo Mechanic code replacements and hot codes. The codes pass
+/// owns the whole expansion because it evaluates variables inside a code
+/// before lookup; without codes this is exactly [`expand`].
+pub fn expand_with_codes(
+    text: &str,
+    vars: &TemplateVars,
+    codes: Option<&CodeReplacements>,
+) -> String {
+    match codes {
+        Some(codes) if !codes.is_empty() => codes.expand(text, vars),
+        _ => expand(text, vars),
+    }
+}
+
 fn resolve(name: &str, spec: &str, vars: &TemplateVars) -> Resolved {
     // Each arm maps to `Some(value)`, `None` = recognized but unavailable
     // this photo, or `Unknown` for a token outside the set.
@@ -168,18 +189,23 @@ fn resolve(name: &str, spec: &str, vars: &TemplateVars) -> Resolved {
         "time" => vars
             .civil()
             .map(|c| format!("{:02}-{:02}-{:02}", c.hour, c.min, c.sec)),
-        "yyyy" => vars.civil().map(|c| format!("{:04}", c.year)),
+        // `year4` / `day` are Photo Mechanic's spellings of `yyyy` / `dd`,
+        // used by hot-code generators and macro rows.
+        "yyyy" | "year4" => vars.civil().map(|c| format!("{:04}", c.year)),
         "yy" => vars.civil().map(|c| format!("{:02}", c.year % 100)),
         "mm" => vars.civil().map(|c| format!("{:02}", c.month)),
-        "dd" => vars.civil().map(|c| format!("{:02}", c.day)),
+        "dd" | "day" => vars.civil().map(|c| format!("{:02}", c.day)),
         "hh" => vars.civil().map(|c| format!("{:02}", c.hour)),
         "mi" => vars.civil().map(|c| format!("{:02}", c.min)),
         "ss" => vars.civil().map(|c| format!("{:02}", c.sec)),
         "monthname" => vars
             .civil()
             .map(|c| MONTH_NAMES[(c.month - 1) as usize].to_string()),
-        "filename" => Some(vars.filename.clone()),
-        "base" => Some(vars.base_name.clone()),
+        // `fbas` is Photo Mechanic's shorthand for `filenamebase`; the
+        // `:start,len` spec is a substring (hot-code generators use it to
+        // pick the photographer initials out of the file name).
+        "filename" => Some(substring(&vars.filename, spec)),
+        "base" | "fbas" | "filenamebase" => Some(substring(&vars.base_name, spec)),
         "ext" => Some(vars.ext.clone()),
         "session" => Some(vars.session.clone()),
         "seq" | "iseq" => {
@@ -209,6 +235,21 @@ fn trim_f64(v: f64) -> String {
     if s.is_empty() { "0".to_string() } else { s }
 }
 
+/// `{value:start,len}` substring extraction (`chars`, so non-ASCII file
+/// names stay intact). No spec, or a malformed one, returns the value.
+fn substring(value: &str, spec: &str) -> String {
+    if spec.is_empty() {
+        return value.to_string();
+    }
+    let Some((start, len)) = spec.split_once(',') else {
+        return value.to_string();
+    };
+    let (Ok(start), Ok(len)) = (start.trim().parse::<usize>(), len.trim().parse::<usize>()) else {
+        return value.to_string();
+    };
+    value.chars().skip(start).take(len).collect()
+}
+
 impl TemplateFields {
     /// `TAG=value` pairs for the resident exiftool writer, dual XMP + IIM
     /// per field (tag names verified against exiftool 13.x `-listx` and a
@@ -216,6 +257,15 @@ impl TemplateFields {
     /// that expands empty is skipped, so an unavailable variable cannot
     /// wipe existing metadata.
     pub fn to_tags(&self, vars: &TemplateVars) -> Vec<(String, String)> {
+        self.to_tags_with(vars, None)
+    }
+
+    /// [`Self::to_tags`] with code replacements and hot codes expanded.
+    pub fn to_tags_with(
+        &self,
+        vars: &TemplateVars,
+        codes: Option<&CodeReplacements>,
+    ) -> Vec<(String, String)> {
         let mut tags: Vec<(String, String)> = Vec::new();
         let pairs: [(&Option<String>, &[&str]); 10] = [
             (
@@ -240,7 +290,7 @@ impl TemplateFields {
         ];
         for (raw, names) in pairs {
             let Some(text) = raw else { continue };
-            let value = expand(text, vars).trim().to_owned();
+            let value = expand_with_codes(text, vars, codes).trim().to_owned();
             if value.is_empty() {
                 continue;
             }
@@ -248,7 +298,7 @@ impl TemplateFields {
                 tags.push(((*name).to_owned(), value.clone()));
             }
         }
-        for keyword in self.keywords_list(vars) {
+        for keyword in self.keywords_list_with(vars, codes) {
             tags.push(("XMP-dc:Subject".into(), keyword.clone()));
             tags.push(("IPTC:Keywords".into(), keyword));
         }
@@ -259,6 +309,15 @@ impl TemplateFields {
     /// form order, for the editor's preview. An empty value is a field
     /// the write would skip.
     pub fn preview(&self, vars: &TemplateVars) -> Vec<(&'static str, String)> {
+        self.preview_with(vars, None)
+    }
+
+    /// [`Self::preview`] with code replacements and hot codes expanded.
+    pub fn preview_with(
+        &self,
+        vars: &TemplateVars,
+        codes: Option<&CodeReplacements>,
+    ) -> Vec<(&'static str, String)> {
         let single = [
             ("Caption", &self.caption),
             ("Headline", &self.headline),
@@ -273,11 +332,14 @@ impl TemplateFields {
         ];
         let mut lines = Vec::new();
         if self.keywords.is_some() {
-            lines.push(("Keywords", self.keywords_list(vars).join(" | ")));
+            lines.push(("Keywords", self.keywords_list_with(vars, codes).join(" | ")));
         }
         for (label, raw) in single {
             if let Some(text) = raw {
-                lines.push((label, expand(text, vars).trim().to_owned()));
+                lines.push((
+                    label,
+                    expand_with_codes(text, vars, codes).trim().to_owned(),
+                ));
             }
         }
         lines
@@ -290,17 +352,30 @@ impl TemplateFields {
     /// the IIM-only dialect pairs lose their IIM copy and keep the XMP
     /// side (or nothing, for `edit_status`).
     pub fn to_xmp_tags(&self, vars: &TemplateVars) -> Vec<(String, String)> {
-        self.to_tags(vars)
+        self.to_xmp_tags_with(vars, None)
+    }
+
+    /// [`Self::to_xmp_tags`] with code replacements and hot codes expanded.
+    pub fn to_xmp_tags_with(
+        &self,
+        vars: &TemplateVars,
+        codes: Option<&CodeReplacements>,
+    ) -> Vec<(String, String)> {
+        self.to_tags_with(vars, codes)
             .into_iter()
             .filter(|(name, _)| name.starts_with("XMP-"))
             .collect()
     }
 
-    fn keywords_list(&self, vars: &TemplateVars) -> Vec<String> {
+    fn keywords_list_with(
+        &self,
+        vars: &TemplateVars,
+        codes: Option<&CodeReplacements>,
+    ) -> Vec<String> {
         let Some(raw) = &self.keywords else {
             return vec![];
         };
-        let expanded = expand(raw, vars);
+        let expanded = expand_with_codes(raw, vars, codes);
         // Semicolons only: a comma is ordinary text (`Smith, John`), so
         // splitting on it would chop names apart.
         expanded
@@ -391,6 +466,43 @@ mod tests {
     }
 
     #[test]
+    fn substring_variables_slice_the_file_name() {
+        let v = vars();
+        assert_eq!(expand("{fbas:0,3}", &v), "AHQ");
+        assert_eq!(expand("{fbas:1,3}", &v), "HQ_");
+        assert_eq!(expand("{filenamebase}", &v), "AHQ_0701");
+        assert_eq!(expand("{day}/{year4}", &v), "07/2026");
+    }
+
+    #[test]
+    fn code_replacements_expand_in_tags_and_preview() {
+        use crate::code_replacements::CodeReplacements;
+
+        let codes = CodeReplacements::parse("h1\tSHL\n");
+        let f = TemplateFields {
+            caption: Some("\\h1\\ {date}".into()),
+            credit: Some("=h1=".into()),
+            ..Default::default()
+        };
+        assert_eq!(
+            f.to_tags_with(&vars(), Some(&codes)),
+            vec![
+                ("XMP-dc:Description".into(), "SHL 2026-10-07".into()),
+                ("IPTC:Caption-Abstract".into(), "SHL 2026-10-07".into()),
+                ("XMP-photoshop:Credit".into(), "SHL".into()),
+                ("IPTC:Credit".into(), "SHL".into()),
+            ]
+        );
+        assert_eq!(
+            f.preview_with(&vars(), Some(&codes)),
+            vec![
+                ("Caption", "SHL 2026-10-07".to_owned()),
+                ("Credit", "SHL".to_owned()),
+            ]
+        );
+    }
+
+    #[test]
     fn to_tags_dual_writes_each_field() {
         let f = TemplateFields {
             caption: Some("{date} run".into()),
@@ -453,7 +565,7 @@ mod tests {
             keywords: Some("Smith, John; ice".into()),
             ..Default::default()
         };
-        let pairs: Vec<String> = f.keywords_list(&vars()).into_iter().collect();
+        let pairs: Vec<String> = f.keywords_list_with(&vars(), None).into_iter().collect();
         assert_eq!(pairs, vec!["Smith, John", "ice"]);
     }
 
