@@ -867,12 +867,21 @@ impl Catalog {
         })
     }
 
+    /// Delete a template row. Ingest batches that used it keep their
+    /// history: the reference is cleared (the batch's job payload still
+    /// holds the frozen fields), so a used template can be deleted.
     pub fn delete_iptc_template(&self, id: i64) -> Result<()> {
         self.with_conn(|conn| {
-            let n = conn.execute("DELETE FROM iptc_templates WHERE id = ?1", [id])?;
+            let tx = conn.unchecked_transaction()?;
+            tx.execute(
+                "UPDATE ingest_batches SET template_id = NULL WHERE template_id = ?1",
+                [id],
+            )?;
+            let n = tx.execute("DELETE FROM iptc_templates WHERE id = ?1", [id])?;
             if n == 0 {
                 return Err(not_found("iptc_template", id));
             }
+            tx.commit()?;
             Ok(())
         })
     }
@@ -1565,6 +1574,40 @@ mod tests {
         assert_eq!(completed.jpeg_photo_id, Some(jpeg));
 
         assert!(db.set_item_side(999_999, jpeg, false).is_err());
+        std::fs::remove_file(path).ok();
+    }
+
+    fn batch_fixture(template_id: Option<i64>) -> NewIngestBatch {
+        NewIngestBatch {
+            volume_uuid: None,
+            volume_label: None,
+            session_name: Some("shoot".into()),
+            dest_dir: "/photos".into(),
+            backup_dir: None,
+            template_id,
+            state: "running".into(),
+        }
+    }
+
+    #[test]
+    fn deleting_a_used_template_keeps_the_batch_history() {
+        let path = scratch_db("template-delete");
+        let db = Catalog::open(&path).unwrap();
+        let template = db
+            .insert_iptc_template("press", r#"{"credit":"x"}"#, "global")
+            .unwrap();
+        let batch = db
+            .create_ingest_batch(&batch_fixture(Some(template)))
+            .unwrap();
+        assert_eq!(
+            db.get_ingest_batch(batch).unwrap().template_id,
+            Some(template)
+        );
+
+        db.delete_iptc_template(template).unwrap();
+        assert!(db.get_iptc_template(template).is_err());
+        assert_eq!(db.get_ingest_batch(batch).unwrap().template_id, None);
+        assert!(db.delete_iptc_template(template).is_err());
         std::fs::remove_file(path).ok();
     }
 
