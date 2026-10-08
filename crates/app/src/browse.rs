@@ -824,6 +824,7 @@ pub fn template_apply_payloads_with(
                 session: None,
                 fields_json: fields_json.to_owned(),
                 replacements: replacements.clone(),
+                clear_empty: false,
             })
             .unwrap_or_else(|_| "{}".to_string())
         })

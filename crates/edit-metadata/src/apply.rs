@@ -22,7 +22,7 @@ use flume::Sender;
 
 use crate::CodeReplacements;
 use crate::read_photo_metadata;
-use crate::template::{TemplateFields, TemplateVars};
+use crate::template::{TemplateFields, TemplateVars, xmp_only};
 use crate::writer::Writer;
 
 /// Raw extensions stamped through the XMP sidecar instead of in place
@@ -67,6 +67,11 @@ pub struct MetadataWritePayload {
     /// expands `=code=` / hot codes without re-reading the file.
     #[serde(default)]
     pub replacements: Option<CodeReplacements>,
+    /// Form writes: a field that expands empty clears its tags instead of
+    /// being skipped (templates keep the skip so a missing variable cannot
+    /// wipe existing metadata).
+    #[serde(default)]
+    pub clear_empty: bool,
 }
 
 /// True when `path` is a raw file (sidecar-stamped, never in place).
@@ -194,7 +199,7 @@ pub fn run_metadata_write(
         .map_err(|e| format!("bad metadata_write payload: {e}"))?;
     let fields: TemplateFields = serde_json::from_str(&payload.fields_json)
         .map_err(|e| format!("bad template fields: {e}"))?;
-    if fields == TemplateFields::default() {
+    if fields.is_empty() {
         return Err("template has no fields to write".into());
     }
 
@@ -216,11 +221,8 @@ pub fn run_metadata_write(
         // keep Photo-Mechanic-style in-place IIM+XMP.
         let raw = is_raw(path);
         let codes = payload.replacements.as_ref();
-        let tags = if raw {
-            fields.to_xmp_tags_with(&vars, codes)
-        } else {
-            fields.to_tags_with(&vars, codes)
-        };
+        let tags = fields.to_tags_opts(&vars, codes, payload.clear_empty);
+        let tags = if raw { xmp_only(tags) } else { tags };
         let outcome = if tags.is_empty() {
             Err("every field expanded empty; nothing written".to_owned())
         } else if raw {
@@ -298,16 +300,14 @@ mod tests {
 
     #[test]
     fn preview_resolves_tokens_for_every_field() {
-        let fields = TemplateFields {
-            caption: Some("{base} #{seq:3}".into()),
-            credit: Some("{session}".into()),
-            ..Default::default()
-        };
+        let fields = TemplateFields::default()
+            .with("caption", "{base} #{seq:3}")
+            .with("credit", "{session}");
         assert_eq!(
             preview_fields(Path::new("/x/A1.JPG"), &fields, 2, 0),
             vec![
-                ("Caption", "A1 #002".to_owned()),
-                ("Credit", "x".to_owned())
+                ("Description", "A1 #002".to_owned()),
+                ("Credit line", "x".to_owned())
             ]
         );
     }
@@ -485,6 +485,7 @@ mod tests {
             session: None,
             fields_json: fields.to_string(),
             replacements: Some(replacements),
+            clear_empty: false,
         })
         .unwrap();
         let captured = std::sync::Arc::new(std::sync::Mutex::new(Vec::<Vec<String>>::new()));
