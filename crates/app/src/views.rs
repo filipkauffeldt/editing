@@ -1369,10 +1369,8 @@ impl Browser {
         // The row closure is 'static, so cell clicks update through an
         // owned entity handle instead of a borrowed context.
         let entity = cx.entity();
-        div().size_full().overflow_hidden().child(uniform_list(
-            "contact-sheet",
-            row_count,
-            move |range, _window, _cx| {
+        div().size_full().overflow_hidden().child(
+            uniform_list("contact-sheet", row_count, move |range, _window, _cx| {
                 let mut cells = Vec::new();
                 for row in range {
                     let span = row * GRID_COLS..((row + 1) * GRID_COLS).min(rows.len());
@@ -1430,8 +1428,9 @@ impl Browser {
                     cells.push(row_el);
                 }
                 cells
-            },
-        ))
+            })
+            .size_full(),
+        )
     }
 
     fn render_single(&mut self, cx: &mut Context<Self>) -> impl IntoElement {
@@ -1481,39 +1480,45 @@ impl Browser {
                     .size_full()
                     .overflow_hidden()
                     .bg(rgb(0x0E0E0E))
-                    .child(canvas(
-                        |bounds, _, _| bounds,
-                        move |bounds, bounds_state, window, _| {
-                            if let Some(image) = image.clone() {
-                                let img_size = image.size(0);
-                                let w = img_size.width.0 as f32;
-                                let h = img_size.height.0 as f32;
-                                if w > 0.0 && h > 0.0 {
-                                    let bw: f32 = bounds.size.width.into();
-                                    let bh: f32 = bounds.size.height.into();
-                                    let fit = (bw / w).min(bh / h).max(0.01);
-                                    fit_cell.set(fit);
-                                    let scale = zoom.scale_in(w, h, bw, bh);
-                                    let (ox, oy) = paint_origin(w, h, bw, bh, scale, zoom);
-                                    let dw = px(w * scale);
-                                    let dh = px(h * scale);
-                                    let origin = point(
-                                        bounds.origin.x + ox.into(),
-                                        bounds.origin.y + oy.into(),
-                                    );
-                                    let image_bounds = Bounds::new(origin, gpui_kit::size(dw, dh));
-                                    let _ = window.paint_image(
-                                        bounds_state,
-                                        image_bounds,
-                                        Corners::default(),
-                                        image,
-                                        0,
-                                        false,
-                                    );
+                    .child(
+                        canvas(
+                            |bounds, _, _| bounds,
+                            move |bounds, bounds_state, window, _| {
+                                if let Some(image) = image.clone() {
+                                    let img_size = image.size(0);
+                                    let w = img_size.width.0 as f32;
+                                    let h = img_size.height.0 as f32;
+                                    if w > 0.0 && h > 0.0 {
+                                        let bw: f32 = bounds.size.width.into();
+                                        let bh: f32 = bounds.size.height.into();
+                                        let fit = (bw / w).min(bh / h).max(0.01);
+                                        fit_cell.set(fit);
+                                        let scale = zoom.scale_in(w, h, bw, bh);
+                                        let (ox, oy) = paint_origin(w, h, bw, bh, scale, zoom);
+                                        let dw = px(w * scale);
+                                        let dh = px(h * scale);
+                                        let origin = point(
+                                            bounds.origin.x + ox.into(),
+                                            bounds.origin.y + oy.into(),
+                                        );
+                                        let image_bounds =
+                                            Bounds::new(origin, gpui_kit::size(dw, dh));
+                                        let _ = window.paint_image(
+                                            bounds_state,
+                                            image_bounds,
+                                            Corners::default(),
+                                            image,
+                                            0,
+                                            false,
+                                        );
+                                    }
                                 }
-                            }
-                        },
-                    ))
+                            },
+                        )
+                        // A canvas lays out as 0x0 unless told otherwise, which
+                        // handed the paint closure empty bounds.
+                        .size_full(),
+                    )
                     .on_scroll_wheel(cx.listener(|this, event: &ScrollWheelEvent, _, cx| {
                         let dy: f32 = match &event.delta {
                             ScrollDelta::Pixels(p) => p.y.into(),
