@@ -52,6 +52,7 @@ use crate::develop::{
 };
 use crate::preview::BrowsePreviewProvider;
 use edit_core::{CancelToken, Crop, DevelopSettings, RenderSize};
+use edit_ingest::{IngestCopyPayload, dest_root_path};
 use edit_metadata::{CodeReplacements, MetadataWritePayload, TemplateFields};
 use edit_render::{PROXY_DRAG_LONG_EDGE, PROXY_RELEASE_LONG_EDGE, RenderService};
 use gpui_kit::component::slider::{
@@ -138,6 +139,20 @@ struct RenderJob {
     token: CancelToken,
 }
 
+/// Minimum gap between grid refreshes while an ingest reports per-file
+/// progress. Each refresh re-reads the root's photos, so a 1000-file card
+/// must not do it 1000 times; the terminal event always refreshes.
+const INGEST_REFRESH_GAP: std::time::Duration = std::time::Duration::from_millis(250);
+
+/// An ingest job the contact sheet follows while it lands files.
+struct IngestFollow {
+    /// Canonical destination root the job fills (its catalog root path).
+    root_path: String,
+    /// Whether the sheet has already switched to that root once; later
+    /// events only refresh it, so opening another folder is not undone.
+    switched: bool,
+}
+
 /// Root browse entity: snapshot rows plus the interaction state around them.
 pub struct Browser {
     catalog: Arc<Catalog>,
@@ -167,6 +182,11 @@ pub struct Browser {
     /// `metadata_write` job id → item id, resolved from the payload so
     /// per-item badges flip on the right row even across restarts.
     meta_jobs: HashMap<JobId, i64>,
+    /// `ingest_copy` job id → the destination it fills, resolved from the
+    /// payload so a crash-resumed ingest is followed too.
+    ingest_jobs: HashMap<JobId, IngestFollow>,
+    last_ingest_refresh: Option<std::time::Instant>,
+    ingest_refresh_gap: std::time::Duration,
     develop: DevelopSession,
     develop_sliders: Vec<(SliderId, Entity<SliderState>)>,
     /// Develop render scheduling: the latest wanted size for the one worker,
@@ -310,6 +330,9 @@ impl Browser {
             thumb_pending: HashSet::new(),
             thumb_jobs: HashMap::new(),
             meta_jobs: HashMap::new(),
+            ingest_jobs: HashMap::new(),
+            last_ingest_refresh: None,
+            ingest_refresh_gap: INGEST_REFRESH_GAP,
             develop: DevelopSession::new(DevelopSettings::default()),
             develop_sliders,
             queue: RenderQueue::default(),
@@ -688,9 +711,93 @@ impl Browser {
     }
 
     fn set_meta(&mut self, item_id: i64, badge: MetaBadge) {
-        if self.set_meta_quiet(item_id, badge) {
+        let mut hit = self.set_meta_quiet(item_id, badge);
+        if !hit && self.root_id.is_some() {
+            // An item an ingest landed since the last (throttled) refresh.
+            self.refresh_items();
+            hit = self.set_meta_quiet(item_id, badge);
+        }
+        if hit {
             self.rebuild_rows();
         }
+    }
+
+    /// Shorten the gap between grid refreshes during an ingest (tests).
+    pub fn set_ingest_refresh_gap(&mut self, gap: std::time::Duration) {
+        self.ingest_refresh_gap = gap;
+    }
+
+    /// The destination an `ingest_copy` job fills, remembered from its
+    /// durable payload. `None` for any other kind of job.
+    fn ingest_follow(&mut self, id: JobId) -> Option<&mut IngestFollow> {
+        if !self.ingest_jobs.contains_key(&id) {
+            let job = self.catalog.job(id).ok()?;
+            if job.kind != JobKind::IngestCopy {
+                return None;
+            }
+            let payload: IngestCopyPayload = serde_json::from_str(&job.payload_json).ok()?;
+            self.ingest_jobs.insert(
+                id,
+                IngestFollow {
+                    root_path: dest_root_path(&payload.dest_dir_template)
+                        .to_string_lossy()
+                        .into_owned(),
+                    switched: false,
+                },
+            );
+        }
+        self.ingest_jobs.get_mut(&id)
+    }
+
+    /// Contact sheet side of an ingest event (plan section 2.2: photos
+    /// appear as they land). The first event that finds the destination
+    /// root switches the sheet to it; every landed file already has its
+    /// catalog rows and a queued thumbnail job, so a refresh shows it.
+    /// Returns false when `id` is not an ingest job.
+    fn on_ingest_event(&mut self, id: JobId, kind: &JobEventKind) -> bool {
+        let Some(follow) = self.ingest_follow(id) else {
+            return false;
+        };
+        let root_path = follow.root_path.clone();
+        let already_switched = follow.switched;
+        let terminal = matches!(kind, JobEventKind::Succeeded | JobEventKind::Failed { .. });
+        let root = self.catalog.get_root_by_path(&root_path).ok().flatten();
+        let mut following = false;
+        if let Some(root) = &root {
+            if !already_switched {
+                self.root_id = Some(root.id);
+                self.root_label = root_path.clone();
+                self.queue.navigate();
+                following = true;
+                if let Some(follow) = self.ingest_jobs.get_mut(&id) {
+                    follow.switched = true;
+                }
+            } else {
+                following = self.root_id == Some(root.id);
+            }
+        }
+        match kind {
+            JobEventKind::Started { .. } => self.scan_status = "Ingest started…".to_string(),
+            JobEventKind::Progress { done, total } => {
+                self.scan_status = format!("Ingesting: {done}/{total}");
+            }
+            JobEventKind::Succeeded => self.scan_status = "Ingest complete".to_string(),
+            JobEventKind::Failed { error } => self.scan_status = format!("Ingest failed: {error}"),
+        }
+        if terminal {
+            self.ingest_jobs.remove(&id);
+        }
+        let due = terminal
+            || !already_switched
+            || self
+                .last_ingest_refresh
+                .is_none_or(|at| at.elapsed() >= self.ingest_refresh_gap)
+            || matches!(kind, JobEventKind::Progress { done, total } if done == total);
+        if following && due {
+            self.last_ingest_refresh = Some(std::time::Instant::now());
+            self.refresh_items();
+        }
+        true
     }
 
     /// Apply one worker event to the visible rows.
@@ -707,6 +814,8 @@ impl Browser {
                     if self.template_status.is_empty() {
                         self.template_status = "Writing template metadata…".into();
                     }
+                } else {
+                    self.on_ingest_event(event.id, &event.kind);
                 }
             }
             JobEventKind::Progress { done, total } => {
@@ -716,6 +825,8 @@ impl Browser {
                     self.refresh_items();
                 } else if self.meta_jobs.contains_key(&event.id) {
                     self.template_status = format!("Writing template metadata: {done}/{total}");
+                } else {
+                    self.on_ingest_event(event.id, &event.kind);
                 }
             }
             JobEventKind::Succeeded => {
@@ -747,6 +858,8 @@ impl Browser {
                     } else {
                         format!("Template applied: {done_count} done, {in_flight} in flight…")
                     };
+                } else {
+                    self.on_ingest_event(event.id, &event.kind);
                 }
             }
             JobEventKind::Failed { error } => {
@@ -759,6 +872,8 @@ impl Browser {
                     self.meta_jobs.remove(&event.id);
                     self.set_meta(item_id, MetaBadge::Failed);
                     self.template_status = format!("Template apply failed: {error}");
+                } else {
+                    self.on_ingest_event(event.id, &event.kind);
                 }
             }
         }
