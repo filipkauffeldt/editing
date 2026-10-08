@@ -1160,8 +1160,26 @@ impl Catalog {
         blake3: &str,
         photo_id: Option<i64>,
     ) -> Result<()> {
+        self.complete_ingest_file_with_job(id, dest_path, backup_path, blake3, photo_id, None)
+    }
+
+    /// [`Catalog::complete_ingest_file`] plus one follow-up job, in a single
+    /// transaction. The file is `cataloged` exactly when its job is queued:
+    /// a crash before the commit leaves a recoverable `renaming` row with
+    /// no job, and a crash after leaves both, so the job is never lost and
+    /// never queued for a file that is not complete.
+    pub fn complete_ingest_file_with_job(
+        &self,
+        id: i64,
+        dest_path: &str,
+        backup_path: Option<&str>,
+        blake3: &str,
+        photo_id: Option<i64>,
+        job: Option<(crate::jobs::JobKind, &str)>,
+    ) -> Result<()> {
         self.with_conn(|conn| {
-            let n = conn.execute(
+            let tx = conn.unchecked_transaction()?;
+            let n = tx.execute(
                 "UPDATE ingest_files
                     SET state = 'cataloged', dest_path = ?1, backup_path = ?2,
                         blake3 = ?3, photo_id = ?4, error = NULL
@@ -1171,6 +1189,10 @@ impl Catalog {
             if n == 0 {
                 return Err(not_found("ingest_file", id));
             }
+            if let Some((kind, payload)) = job {
+                crate::jobs::enqueue(&tx, kind, payload)?;
+            }
+            tx.commit()?;
             Ok(())
         })
     }
@@ -1244,6 +1266,7 @@ impl Catalog {
 mod tests {
     use super::*;
     use crate::db::tests::scratch_db;
+    use crate::jobs::JobKind;
     use edit_core::IngestFileState;
 
     fn photo_fixture(root_id: i64, n: i64) -> NewPhoto {
@@ -1608,6 +1631,56 @@ mod tests {
         assert!(db.get_iptc_template(template).is_err());
         assert_eq!(db.get_ingest_batch(batch).unwrap().template_id, None);
         assert!(db.delete_iptc_template(template).is_err());
+        std::fs::remove_file(path).ok();
+    }
+
+    #[test]
+    fn completing_an_ingest_file_queues_its_job_in_the_same_commit() {
+        let path = scratch_db("complete-with-job");
+        let db = Catalog::open(&path).unwrap();
+        let batch = db.create_ingest_batch(&batch_fixture(None)).unwrap();
+        let file = db
+            .record_ingest_file(&NewIngestFile {
+                batch_id: batch,
+                original_name: "DSC01234.NEF".into(),
+                taken_at: Some(1_700_000_000),
+                bytes: 1024,
+                source_path: "/card/DSC01234.NEF".into(),
+                state: IngestFileState::Queued,
+            })
+            .unwrap();
+
+        // A failed completion (unknown row) must not leave a stray job.
+        assert!(
+            db.complete_ingest_file_with_job(
+                999_999,
+                "/photos/a.NEF",
+                None,
+                "ab12",
+                None,
+                Some((JobKind::MetadataWrite, "{}")),
+            )
+            .is_err()
+        );
+        assert!(db.list_jobs(10).unwrap().is_empty());
+
+        db.complete_ingest_file_with_job(
+            file,
+            "/photos/a.NEF",
+            None,
+            "ab12",
+            None,
+            Some((JobKind::MetadataWrite, r#"{"item_id":1}"#)),
+        )
+        .unwrap();
+        let jobs = db.list_jobs(10).unwrap();
+        assert_eq!(jobs.len(), 1);
+        assert_eq!(jobs[0].kind, JobKind::MetadataWrite);
+        assert_eq!(jobs[0].payload_json, r#"{"item_id":1}"#);
+        assert_eq!(
+            db.list_ingest_files(batch).unwrap()[0].state,
+            IngestFileState::Cataloged
+        );
         std::fs::remove_file(path).ok();
     }
 
