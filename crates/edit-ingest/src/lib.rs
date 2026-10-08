@@ -25,8 +25,9 @@ pub use copy::{
     sweep_temp_files, unique_path,
 };
 pub use ingest::{
-    CardFile, FileMetadata, IngestCopyPayload, IngestError, IngestPlan, IngestPlanRequest,
-    IngestSummary, batch_volume_identity, enumerate_card, plan_card, plan_ingest, run_ingest_copy,
+    CardFile, FileMetadata, FollowUpJob, IngestCopyPayload, IngestError, IngestPlan,
+    IngestPlanRequest, IngestSummary, IngestTemplate, LandedPhoto, batch_volume_identity,
+    enumerate_card, plan_card, plan_ingest, run_ingest_copy, run_ingest_copy_with,
 };
 pub use naming::{
     NamingContext, NamingError, expand_tilde, render_dir, render_filename, static_prefix, validate,

@@ -114,6 +114,7 @@ mod tests {
             backup_dir: None,
             session: "shoot".into(),
             start_seq: 1,
+            iptc_fields_json: None,
         };
         let job = ClaimedJob {
             id: JobId(1),

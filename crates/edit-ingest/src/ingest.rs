@@ -10,6 +10,11 @@
 //! keeping `edit-ingest` free of a dependency on `edit-metadata` (services do
 //! not depend on each other; the app composes them).
 //!
+//! A caller can also hook each landed photo ([`LandedPhoto`]) to queue one
+//! follow-up job for it (the app stamps the ingest IPTC snapshot this way).
+//! The job is queued in the same commit that marks the file cataloged, so a
+//! crash can neither lose it nor queue it for a file that is not complete.
+//!
 //! Crash safety: landed paths and the verified hash are persisted (state
 //! `Renaming`) before the catalog insert, and the duplicate lookup also sees
 //! non-terminal rows, so a card job that died after the rename resumes by
@@ -62,6 +67,11 @@ pub struct IngestCopyPayload {
     pub session: String,
     /// First sequence number of the batch.
     pub start_seq: u64,
+    /// The chosen IPTC template's fields, frozen when the batch was planned.
+    /// Later edits to the template do not reach a running (or resumed)
+    /// ingest; `None` ingests without stamping.
+    #[serde(default)]
+    pub iptc_fields_json: Option<String>,
 }
 
 /// One supported file found on a card.
@@ -84,6 +94,20 @@ pub struct IngestSummary {
     pub failed: usize,
 }
 
+/// A photo that just landed and was cataloged, handed to the landed hook.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct LandedPhoto {
+    pub item_id: i64,
+    pub photo_id: i64,
+    /// Where the file landed (never the backup copy).
+    pub path: PathBuf,
+    /// The batch sequence number; a RAW+JPEG pair shares one.
+    pub sequence: u64,
+}
+
+/// A durable job to queue with a landed photo, as `(kind, payload_json)`.
+pub type FollowUpJob = Option<(JobKind, String)>;
+
 /// A failure that stops a whole card (a per-file failure is recorded on the
 /// file row and the card continues).
 #[derive(Debug, thiserror::Error)]
@@ -92,6 +116,15 @@ pub enum IngestError {
     Io(#[from] std::io::Error),
     #[error("catalog: {0}")]
     Catalog(#[from] edit_catalog::Error),
+}
+
+/// The IPTC template an ingest stamps onto what it lands.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct IngestTemplate<'a> {
+    /// `iptc_templates.id`, kept on the batch row as history.
+    pub id: i64,
+    /// The template's `fields_json` at the moment the ingest starts.
+    pub fields_json: &'a str,
 }
 
 /// Inputs for planning one card's ingest.
@@ -105,6 +138,7 @@ pub struct IngestPlanRequest<'a> {
     pub backup_dir: Option<&'a str>,
     pub session: &'a str,
     pub start_seq: u64,
+    pub template: Option<IngestTemplate<'a>>,
 }
 
 /// A planned batch: the `ingest_batches` row and the job payload.
@@ -136,7 +170,7 @@ pub fn plan_ingest(request: &IngestPlanRequest<'_>) -> Result<IngestPlan, Naming
             session_name: Some(request.session.to_string()),
             dest_dir: static_prefix(dest),
             backup_dir: backup_dir.clone(),
-            template_id: None,
+            template_id: request.template.map(|template| template.id),
             state: "running".to_string(),
         },
         payload: IngestCopyPayload {
@@ -147,6 +181,9 @@ pub fn plan_ingest(request: &IngestPlanRequest<'_>) -> Result<IngestPlan, Naming
             backup_dir,
             session: request.session.to_string(),
             start_seq: request.start_seq,
+            iptc_fields_json: request
+                .template
+                .map(|template| template.fields_json.to_string()),
         },
     })
 }
@@ -280,7 +317,27 @@ pub fn run_ingest_copy<F>(
 where
     F: Fn(&Path) -> FileMetadata,
 {
-    match run_card(catalog, payload, &metadata, on_progress) {
+    run_ingest_copy_with(catalog, payload, metadata, &|_| None, on_progress)
+}
+
+/// [`run_ingest_copy`] with a landed hook: `on_landed` runs for every photo
+/// that lands (or is recovered after a crash) and may return one job to
+/// queue atomically with the file's completion.
+pub fn run_ingest_copy_with<F>(
+    catalog: &Catalog,
+    payload: &IngestCopyPayload,
+    metadata: F,
+    on_landed: &dyn Fn(&LandedPhoto) -> FollowUpJob,
+    on_progress: &dyn Fn(usize, usize),
+) -> Result<IngestSummary, IngestError>
+where
+    F: Fn(&Path) -> FileMetadata,
+{
+    let hooks = Hooks {
+        on_landed,
+        on_progress,
+    };
+    match run_card(catalog, payload, &metadata, &hooks) {
         Ok(summary) => {
             let state = if summary.failed > 0
                 && summary.copied == 0
@@ -302,15 +359,22 @@ where
     }
 }
 
+/// The caller's callbacks, bundled so the per-file helpers take one argument.
+struct Hooks<'a> {
+    on_landed: &'a dyn Fn(&LandedPhoto) -> FollowUpJob,
+    on_progress: &'a dyn Fn(usize, usize),
+}
+
 fn run_card<F>(
     catalog: &Catalog,
     payload: &IngestCopyPayload,
     metadata: &F,
-    on_progress: &dyn Fn(usize, usize),
+    hooks: &Hooks<'_>,
 ) -> Result<IngestSummary, IngestError>
 where
     F: Fn(&Path) -> FileMetadata,
 {
+    let on_progress = hooks.on_progress;
     let (files, seqs) = plan_card(Path::new(&payload.source_root), payload.start_seq)?;
     let dest_root = resolve_dest_root(&payload.dest_dir_template)?;
     // Get-or-create races safely when two cards land in a fresh destination.
@@ -360,7 +424,7 @@ where
                 continue;
             }
             Existing::Recoverable(row) => {
-                match recover(catalog, file, &row, root_id, taken_at) {
+                match recover(catalog, file, &row, root_id, taken_at, seqs[index], hooks) {
                     Ok(()) => summary.recovered += 1,
                     Err(error) => {
                         summary.failed += 1;
@@ -386,7 +450,7 @@ where
         };
 
         match land_one(
-            catalog, payload, &dest_root, root_id, file, row_id, &context, taken_at,
+            catalog, payload, &dest_root, root_id, file, row_id, &context, taken_at, hooks,
         ) {
             Ok(()) => summary.copied += 1,
             Err(error) => {
@@ -445,6 +509,7 @@ fn land_one(
     row_id: i64,
     context: &NamingContext,
     taken_at: i64,
+    hooks: &Hooks<'_>,
 ) -> Result<(), String> {
     let dest_folder = render_dir(&payload.dest_dir_template, context).map_err(naming_error)?;
     let dest_folder = if dest_folder.is_absolute() {
@@ -497,10 +562,38 @@ fn land_one(
         )
         .map_err(|e| e.to_string())?;
 
-    let photo_id =
+    let cataloged =
         catalog_photo(catalog, root_id, &outcome, file, taken_at).map_err(|e| e.to_string())?;
+    complete(
+        catalog,
+        row_id,
+        &outcome,
+        &cataloged,
+        context.seq,
+        hooks.on_landed,
+    )
+}
+
+/// Mark the file cataloged and queue the landed hook's follow-up job in one
+/// commit.
+fn complete(
+    catalog: &Catalog,
+    row_id: i64,
+    outcome: &CopyOutcome,
+    cataloged: &Cataloged,
+    sequence: u64,
+    on_landed: &dyn Fn(&LandedPhoto) -> FollowUpJob,
+) -> Result<(), String> {
+    let job = cataloged.photo_id.and_then(|photo_id| {
+        on_landed(&LandedPhoto {
+            item_id: cataloged.item_id,
+            photo_id,
+            path: outcome.dest_path.clone(),
+            sequence,
+        })
+    });
     catalog
-        .complete_ingest_file(
+        .complete_ingest_file_with_job(
             row_id,
             &outcome.dest_path.to_string_lossy(),
             outcome
@@ -509,10 +602,11 @@ fn land_one(
                 .map(|p| p.to_string_lossy().into_owned())
                 .as_deref(),
             &outcome.blake3,
-            photo_id,
+            cataloged.photo_id,
+            job.as_ref()
+                .map(|(kind, payload)| (*kind, payload.as_str())),
         )
-        .map_err(|e| e.to_string())?;
-    Ok(())
+        .map_err(|e| e.to_string())
 }
 
 /// Finish cataloging a copy that a crash interrupted after the rename.
@@ -522,6 +616,8 @@ fn recover(
     row: &IngestFile,
     root_id: i64,
     taken_at: i64,
+    sequence: u64,
+    hooks: &Hooks<'_>,
 ) -> Result<(), String> {
     let dest = row.dest_path.clone().ok_or("no landed path")?;
     let actual = hash_file(Path::new(&dest)).map_err(|e| e.to_string())?;
@@ -534,22 +630,18 @@ fn recover(
         bytes: file.bytes,
         blake3: actual,
     };
-    let photo_id = match row.photo_id {
-        Some(id) => Some(id),
-        None => {
-            catalog_photo(catalog, root_id, &outcome, file, taken_at).map_err(|e| e.to_string())?
-        }
-    };
-    catalog
-        .complete_ingest_file(
-            row.id,
-            &dest,
-            row.backup_path.as_deref(),
-            &outcome.blake3,
-            photo_id,
-        )
-        .map_err(|e| e.to_string())?;
-    Ok(())
+    // Re-run the catalog step even when the row has a photo id: it is
+    // idempotent, and it yields the item the follow-up job needs.
+    let cataloged =
+        catalog_photo(catalog, root_id, &outcome, file, taken_at).map_err(|e| e.to_string())?;
+    complete(
+        catalog,
+        row.id,
+        &outcome,
+        &cataloged,
+        sequence,
+        hooks.on_landed,
+    )
 }
 
 /// Resolve the stable destination root (`static_prefix`, tilde-expanded and
@@ -565,6 +657,13 @@ fn resolve_dest_root(template: &str) -> Result<String, IngestError> {
     Ok(canonical.to_string_lossy().into_owned())
 }
 
+/// What [`catalog_photo`] resolved for one landed file.
+struct Cataloged {
+    /// `None` only when a unique violation could not be resolved to a row.
+    photo_id: Option<i64>,
+    item_id: i64,
+}
+
 /// Insert the landed photo (or reuse the row a crash left behind), pair it
 /// into an `items` row, and queue its thumbnail job.
 fn catalog_photo(
@@ -573,7 +672,7 @@ fn catalog_photo(
     outcome: &CopyOutcome,
     file: &CardFile,
     taken_at: i64,
-) -> Result<Option<i64>, edit_catalog::Error> {
+) -> Result<Cataloged, edit_catalog::Error> {
     let dest = &outcome.dest_path;
     let stem = dest
         .file_stem()
@@ -628,10 +727,8 @@ fn catalog_photo(
     } else {
         (None, photo_id)
     };
-    match catalog.get_item_by_dir_base(&dir, &folded)? {
-        None => {
-            catalog.insert_item(&dir, &folded, raw_id, jpeg_id)?;
-        }
+    let item_id = match catalog.get_item_by_dir_base(&dir, &folded)? {
+        None => catalog.insert_item(&dir, &folded, raw_id, jpeg_id)?,
         Some(item) => {
             let occupied = if kind == "raw" {
                 item.raw_photo_id
@@ -643,14 +740,15 @@ fn catalog_photo(
             {
                 catalog.set_item_side(item.id, photo_id, kind == "raw")?;
             }
+            item.id
         }
-    }
+    };
 
     if let Some(photo_id) = photo_id {
         let payload = serde_json::json!({ "photo_id": photo_id, "path": path });
         catalog.enqueue_job(JobKind::Thumb, &payload.to_string())?;
     }
-    Ok(photo_id)
+    Ok(Cataloged { photo_id, item_id })
 }
 
 /// Convenience for the app: derive the volume identity a batch is keyed by.
@@ -701,6 +799,7 @@ mod tests {
             backup_dir: backup.map(|p| p.to_string_lossy().into_owned()),
             session: "shoot".to_string(),
             start_seq: 1,
+            iptc_fields_json: None,
         }
     }
 
@@ -918,6 +1017,151 @@ mod tests {
         fs::remove_dir_all(&card).ok();
     }
 
+    /// A landed hook that queues one `metadata_write`-shaped job per photo.
+    fn stamp_hook(landed: &LandedPhoto) -> FollowUpJob {
+        Some((
+            JobKind::MetadataWrite,
+            serde_json::json!({
+                "item_id": landed.item_id,
+                "path": landed.path,
+                "sequence": landed.sequence,
+            })
+            .to_string(),
+        ))
+    }
+
+    fn stamp_jobs(catalog: &Catalog) -> Vec<serde_json::Value> {
+        catalog
+            .list_jobs(100)
+            .unwrap()
+            .into_iter()
+            .filter(|job| job.kind == JobKind::MetadataWrite)
+            .map(|job| serde_json::from_str(&job.payload_json).unwrap())
+            .collect()
+    }
+
+    #[test]
+    fn the_landed_hook_queues_one_job_per_photo_and_pairs_share_a_sequence() {
+        let card = card_with(&[
+            ("DSC0001.JPG", b"one jpg"),
+            ("DSC0001.NEF", b"one raw"),
+            ("DSC0002.JPG", b"two jpg"),
+        ]);
+        let base = scratch("hook");
+        let dest = base.join("Photos");
+        let catalog = Catalog::open(&base.join("catalog.sqlite")).unwrap();
+        let batch = new_batch(&catalog, &dest, None);
+        let p = payload(batch, &card, &dest, None);
+
+        run_ingest_copy_with(&catalog, &p, fixed_metadata, &stamp_hook, &|_, _| {}).unwrap();
+        let jobs = stamp_jobs(&catalog);
+        assert_eq!(jobs.len(), 3);
+        let seq_of = |suffix: &str| {
+            jobs.iter()
+                .find(|job| job["path"].as_str().unwrap().ends_with(suffix))
+                .map(|job| {
+                    (
+                        job["sequence"].as_u64().unwrap(),
+                        job["item_id"].as_i64().unwrap(),
+                    )
+                })
+                .unwrap()
+        };
+        let (jpg_seq, jpg_item) = seq_of("shoot_0001.JPG");
+        let (raw_seq, raw_item) = seq_of("shoot_0001.NEF");
+        assert_eq!(jpg_seq, raw_seq);
+        assert_eq!(jpg_item, raw_item, "a pair stamps both sides of one item");
+        assert_ne!(seq_of("shoot_0002.JPG").0, jpg_seq);
+
+        // A second pass over the same card finds only duplicates: no hook,
+        // no new jobs.
+        let again = new_batch(&catalog, &dest, None);
+        let summary = run_ingest_copy_with(
+            &catalog,
+            &payload(again, &card, &dest, None),
+            fixed_metadata,
+            &stamp_hook,
+            &|_, _| {},
+        )
+        .unwrap();
+        assert_eq!(summary.duplicates, 3);
+        assert_eq!(stamp_jobs(&catalog).len(), 3);
+
+        fs::remove_dir_all(&base).ok();
+        fs::remove_dir_all(&card).ok();
+    }
+
+    #[test]
+    fn a_crash_after_rename_queues_the_hook_job_exactly_once_on_recovery() {
+        let card = card_with(&[("DSC0001.JPG", b"recover me")]);
+        let base = scratch("hook-recover");
+        let dest = base.join("Photos");
+        let catalog = Catalog::open(&base.join("catalog.sqlite")).unwrap();
+        let batch = new_batch(&catalog, &dest, None);
+        let p = payload(batch, &card, &dest, None);
+
+        // The previous run landed the file and died before completing it:
+        // no hook job exists yet.
+        let landed = dest.join("2026-10-07/shoot_0001.JPG");
+        fs::create_dir_all(landed.parent().unwrap()).unwrap();
+        fs::write(&landed, b"recover me").unwrap();
+        let hash = hash_file(&landed).unwrap();
+        let row = catalog
+            .record_ingest_file(&NewIngestFile {
+                batch_id: batch,
+                original_name: "DSC0001.JPG".into(),
+                taken_at: Some(1_791_374_400),
+                bytes: 10,
+                source_path: "/card/DCIM/DSC0001.JPG".into(),
+                state: IngestFileState::Queued,
+            })
+            .unwrap();
+        catalog
+            .mark_ingest_file_landed(row, &landed.to_string_lossy(), None, &hash)
+            .unwrap();
+        assert!(stamp_jobs(&catalog).is_empty());
+
+        let summary =
+            run_ingest_copy_with(&catalog, &p, fixed_metadata, &stamp_hook, &|_, _| {}).unwrap();
+        assert_eq!(summary.recovered, 1);
+        let jobs = stamp_jobs(&catalog);
+        assert_eq!(jobs.len(), 1);
+        assert_eq!(jobs[0]["path"].as_str().unwrap(), landed.to_string_lossy());
+
+        // Resuming the finished batch again adds nothing.
+        run_ingest_copy_with(&catalog, &p, fixed_metadata, &stamp_hook, &|_, _| {}).unwrap();
+        assert_eq!(stamp_jobs(&catalog).len(), 1);
+
+        fs::remove_dir_all(&base).ok();
+        fs::remove_dir_all(&card).ok();
+    }
+
+    #[test]
+    fn plan_ingest_freezes_the_chosen_template_onto_batch_and_payload() {
+        let plan = plan_ingest(&IngestPlanRequest {
+            template: Some(IngestTemplate {
+                id: 7,
+                fields_json: r#"{"credit":"SHL"}"#,
+            }),
+            ..plan_request_defaults()
+        })
+        .unwrap();
+        assert_eq!(plan.batch.template_id, Some(7));
+        assert_eq!(
+            plan.payload.iptc_fields_json.as_deref(),
+            Some(r#"{"credit":"SHL"}"#)
+        );
+
+        let none = plan_ingest(&plan_request_defaults()).unwrap();
+        assert_eq!(none.batch.template_id, None);
+        assert_eq!(none.payload.iptc_fields_json, None);
+
+        // A payload from before the snapshot existed still decodes.
+        let old = r#"{"batch_id":1,"source_root":"/c","dest_dir_template":"/d","filename_template":"{seq}","backup_dir":null,"session":"s","start_seq":1}"#;
+        let decoded: IngestCopyPayload = serde_json::from_str(old).unwrap();
+        assert_eq!(decoded.iptc_fields_json, None);
+    }
+
     #[test]
     fn a_bad_rule_fails_only_its_file_and_the_batch() {
         let card = card_with(&[("DSC0001.JPG", b"a"), ("DSC0002.JPG", b"b")]);
@@ -955,6 +1199,7 @@ mod tests {
             backup_dir: None,
             session: "shoot".into(),
             start_seq: 1,
+            iptc_fields_json: None,
         };
         assert!(run_ingest_copy(&catalog, &p, fixed_metadata, &|_, _| {}).is_err());
         assert_eq!(catalog.get_ingest_batch(batch).unwrap().state, "failed");
@@ -972,6 +1217,7 @@ mod tests {
             backup_dir: Some("  /mnt/backup  "),
             session: "shoot",
             start_seq: 1,
+            template: None,
         })
         .unwrap();
         assert_eq!(plan.batch.volume_label.as_deref(), Some("CARD"));
@@ -1008,6 +1254,7 @@ mod tests {
             backup_dir: None,
             session: "shoot",
             start_seq: 1,
+            template: None,
         }
     }
 }

@@ -450,6 +450,7 @@ impl IngestDialog {
             backup_dir: Some(backup.as_str()),
             session: &session,
             start_seq: 1,
+            template: None,
         }) {
             Ok(plan) => plan,
             Err(error) => {
