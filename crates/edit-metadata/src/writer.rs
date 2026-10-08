@@ -11,8 +11,8 @@
 //!   containing `\r` or `\n` (a Textarea caption) goes out-of-band via
 //!   `-TAG<=tempfile`, because an argfile line break splits the arg and
 //!   would desync the `{ready}` protocol.
-//! - IIM writes run with `-charset iptc=UTF8`, embedded IIM without it
-//!   is Latin-1.
+//! - IIM writes run with `-charset iptc=UTF8` and flag the record with
+//!   `IPTC:CodedCharacterSet=UTF8`; embedded IIM without them is Latin-1.
 //! - A target that could parse as an option (leading `-`), is not UTF-8
 //!   or contains a line break is rejected before send; `--` cannot guard
 //!   it, see [`Writer::write_tags`].
@@ -367,6 +367,12 @@ impl Writer {
         args.push("-charset".to_owned());
         args.push("iptc=UTF8".to_owned());
         args.push("-overwrite_original".to_owned());
+        // `-charset iptc=UTF8` only encodes the bytes; without the record's
+        // own CodedCharacterSet flag every other reader decodes them as
+        // Latin-1 (mojibake). Verified against exiftool 13.59.
+        if tags.iter().any(|(name, _)| name.starts_with("IPTC:")) {
+            args.push("-IPTC:CodedCharacterSet=UTF8".to_owned());
+        }
         for (name, value) in tags {
             if value.contains('\n') || value.contains('\r') {
                 let file = temp.create(value)?;
@@ -543,15 +549,20 @@ mod tests {
             .unwrap();
         let args = captured.lock().unwrap().clone();
         assert_eq!(
-            &args[0..3],
-            &["-charset", "iptc=UTF8", "-overwrite_original"]
+            &args[0..4],
+            &[
+                "-charset",
+                "iptc=UTF8",
+                "-overwrite_original",
+                "-IPTC:CodedCharacterSet=UTF8"
+            ]
         );
-        let tag_arg = &args[3];
+        let tag_arg = &args[4];
         assert!(
             tag_arg.starts_with("-IPTC:Caption-Abstract<="),
             "multiline value must ride a value file, got {tag_arg:?}"
         );
-        assert_eq!(args[4], "p.JPG");
+        assert_eq!(args[5], "p.JPG");
         let file = tag_arg
             .strip_prefix("-IPTC:Caption-Abstract<=")
             .expect("value file path");
