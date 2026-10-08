@@ -1,13 +1,14 @@
-mod ingest;
-mod templates;
-
 use edit_render::RenderService;
 
 use std::path::PathBuf;
 use std::sync::Arc;
 
+use app::ingest::{
+    AppState, IngestDialog, IngestFooter, OpenIngest, apply_ingest_event, open_ingest_dialog,
+};
+use app::templates::{OpenTemplates, TemplateEditor, open_template_dialog};
 use edit_catalog::{Catalog, JobKind};
-use edit_ingest::{DEFAULT_DEST_RULE, DEFAULT_FILENAME_RULE};
+use edit_ingest::{DEFAULT_DEST_RULE, RENAME_EXAMPLE_RULE};
 use gpui_kit::component::button::Button;
 use gpui_kit::component::input::InputState;
 use gpui_kit::component::label::Label;
@@ -17,10 +18,7 @@ use gpui_kit::component::theme::{Theme, ThemeMode};
 use gpui_kit::component::{
     ActiveTheme as _, Disableable as _, IconName, Sizable as _, TitleBar, h_flex, v_flex,
 };
-use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::*;
-use ingest::{AppState, IngestDialog, OpenIngest, apply_ingest_event};
-use templates::{OpenTemplates, TemplateEditor};
 
 use app::ingest_job::handle_job;
 use app::views::{Browser, OpenFolder};
@@ -79,8 +77,10 @@ fn catalog_path() -> PathBuf {
 /// browser tree, but not while typing in the dialog inputs.
 struct BrowserShell {
     browser: Entity<Browser>,
+    /// Shared ingest state: the drain loops below feed it.
     state: Entity<AppState>,
     dialog: Entity<IngestDialog>,
+    footer: Entity<IngestFooter>,
     templates: Entity<TemplateEditor>,
     focus_handle: FocusHandle,
 }
@@ -90,6 +90,7 @@ impl BrowserShell {
         browser: Entity<Browser>,
         state: Entity<AppState>,
         dialog: Entity<IngestDialog>,
+        footer: Entity<IngestFooter>,
         templates: Entity<TemplateEditor>,
         cx: &mut Context<Self>,
     ) -> Self {
@@ -99,6 +100,7 @@ impl BrowserShell {
             browser,
             state,
             dialog,
+            footer,
             templates,
             focus_handle: cx.focus_handle(),
         }
@@ -142,9 +144,8 @@ impl BrowserShell {
                                 .small()
                                 .label("Ingest")
                                 .tooltip("Ingest from a card (I)")
-                                .on_click(cx.listener(|this, _, _, cx| {
-                                    this.state
-                                        .update(cx, |state, cx| state.set_ingest_open(true, cx));
+                                .on_click(cx.listener(|this, _, window, cx| {
+                                    this.open_ingest(window, cx);
                                 })),
                         )
                         .child(
@@ -159,6 +160,19 @@ impl BrowserShell {
     }
 }
 
+impl BrowserShell {
+    /// Show the ingest dialog as a modal over the window.
+    fn open_ingest(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let (dialog, footer) = (self.dialog.clone(), self.footer.clone());
+        open_ingest_dialog(&dialog, &footer, window, cx);
+    }
+
+    /// Show the IPTC template editor as a modal over the window.
+    fn open_templates(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        open_template_dialog(&self.templates.clone(), window, cx);
+    }
+}
+
 impl Focusable for BrowserShell {
     fn focus_handle(&self, _cx: &App) -> FocusHandle {
         self.focus_handle.clone()
@@ -168,53 +182,21 @@ impl Focusable for BrowserShell {
 impl Render for BrowserShell {
     fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let title_bar = self.render_title_bar(cx);
-        let (background, foreground, border) = (
-            cx.theme().background,
-            cx.theme().foreground,
-            cx.theme().border,
-        );
-        let dialog_open = self.state.read(cx).is_ingest_open();
-        let dialog = self.dialog.clone();
-        let templates_open = self.state.read(cx).is_templates_open();
-        let templates = self.templates.clone();
+        let (background, foreground) = (cx.theme().background, cx.theme().foreground);
         v_flex()
             .size_full()
             .bg(background)
             .text_color(foreground)
             .key_context("Workspace")
             .track_focus(&self.focus_handle)
+            .on_action(cx.listener(|this, _: &OpenIngest, window, cx| {
+                this.open_ingest(window, cx);
+            }))
+            .on_action(cx.listener(|this, _: &OpenTemplates, window, cx| {
+                this.open_templates(window, cx);
+            }))
             .child(title_bar)
             .child(div().flex_1().min_h_0().child(self.browser.clone()))
-            .when(dialog_open, |root| {
-                root.child(
-                    div().absolute().inset_0().child(
-                        div()
-                            .w(px(600.0))
-                            .mx_auto()
-                            .mt_16()
-                            .bg(background)
-                            .border_1()
-                            .border_color(border)
-                            .rounded_md()
-                            .child(dialog),
-                    ),
-                )
-            })
-            .when(templates_open, |root| {
-                root.child(
-                    div().absolute().inset_0().child(
-                        div()
-                            .w(px(760.0))
-                            .mx_auto()
-                            .mt_8()
-                            .bg(background)
-                            .border_1()
-                            .border_color(border)
-                            .rounded_md()
-                            .child(templates),
-                    ),
-                )
-            })
     }
 }
 
@@ -287,15 +269,15 @@ fn main() {
             });
             let file_rule = cx.new(|cx| {
                 InputState::new(window, cx)
-                    .placeholder(DEFAULT_FILENAME_RULE)
-                    .default_value(DEFAULT_FILENAME_RULE)
+                    .placeholder(RENAME_EXAMPLE_RULE)
+                    .default_value(RENAME_EXAMPLE_RULE)
             });
             let backup_dir =
                 cx.new(|cx| InputState::new(window, cx).placeholder("/mnt/backup (optional)"));
             let template_select = cx.new(|cx| {
                 SelectState::new(SearchableVec::new(Vec::<String>::new()), None, window, cx)
             });
-            let dialog = cx.new(|_| {
+            let dialog = cx.new(|cx| {
                 IngestDialog::new(
                     state.clone(),
                     Arc::clone(&catalog),
@@ -303,18 +285,13 @@ fn main() {
                     file_rule,
                     backup_dir,
                     template_select,
-                )
-            });
-            let templates = cx.new(|cx| {
-                TemplateEditor::new(
-                    state.clone(),
-                    browser.clone(),
-                    Arc::clone(&catalog),
-                    window,
                     cx,
                 )
             });
-            cx.new(|cx| BrowserShell::new(browser, state.clone(), dialog, templates, cx))
+            let footer = cx.new(|cx| IngestFooter::new(dialog.clone(), cx));
+            let templates =
+                cx.new(|cx| TemplateEditor::new(browser.clone(), Arc::clone(&catalog), window, cx));
+            cx.new(|cx| BrowserShell::new(browser, state.clone(), dialog, footer, templates, cx))
         })
         .expect("Failed to open window");
 
@@ -333,15 +310,6 @@ fn main() {
             let browser = shell.read(cx).browser.clone();
             browser.update(cx, |browser, cx| browser.open_folder(folder, cx));
         }
-
-        // Global shortcut handler: the action can come from anywhere in the
-        // shell focus tree, so act on the shared ingest state directly.
-        let shortcut_state = shell.read(cx).state.clone();
-        cx.on_action(move |_action: &OpenIngest, cx: &mut App| {
-            shortcut_state.update(cx, |state, cx| {
-                state.set_ingest_open(true, cx);
-            });
-        });
 
         // One drain loop for every durable job event, so background threads
         // never touch entities. It fans out to the contact sheet and to the
@@ -371,13 +339,6 @@ fn main() {
         let open_folder_browser = shell.read(cx).browser.clone();
         cx.on_action(move |_action: &OpenFolder, cx: &mut App| {
             open_folder_browser.update(cx, |browser, cx| browser.prompt_open_folder(cx));
-        });
-
-        let shortcuts_state = shell.read(cx).state.clone();
-        cx.on_action(move |_action: &OpenTemplates, cx: &mut App| {
-            shortcuts_state.update(cx, |state, cx| {
-                state.set_templates_open(true, cx);
-            });
         });
 
         // Volume detection: blocking poll + udev hotplug on a worker thread,

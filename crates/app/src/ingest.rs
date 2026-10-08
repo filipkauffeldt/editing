@@ -8,25 +8,31 @@
 //! file states and duplicates through the shared job-event drain.
 
 use std::collections::HashMap;
+use std::ops::Range;
 use std::sync::Arc;
 
 use edit_catalog::models::{IngestFile, IptcTemplate};
 use edit_catalog::{Catalog, JobEvent, JobEventKind, JobId, JobKind};
 use edit_core::IngestFileState;
-use edit_ingest::{
-    DEFAULT_DEST_RULE, DEFAULT_FILENAME_RULE, IngestCopyPayload, Volume, batch_volume_identity,
-};
+use edit_ingest::{IngestCopyPayload, Volume, batch_volume_identity};
 
-use app::ingest_job::{IngestStart, saved_code_replacements, start_ingest};
+use crate::ingest_job::{IngestStart, saved_code_replacements, start_ingest};
+use gpui_kit::component::WindowExt as _;
 use gpui_kit::component::alert::Alert;
-use gpui_kit::component::button::Button;
-use gpui_kit::component::dialog::DialogTitle;
+use gpui_kit::component::button::{Button, ButtonVariants as _};
+use gpui_kit::component::checkbox::Checkbox;
+use gpui_kit::component::dialog::DialogClose;
 use gpui_kit::component::input::{Input, InputState};
 use gpui_kit::component::label::Label;
 use gpui_kit::component::progress::Progress;
+use gpui_kit::component::radio::RadioGroup;
+use gpui_kit::component::scroll::{ScrollableElement as _, Scrollbar};
 use gpui_kit::component::searchable_list::SearchableVec;
 use gpui_kit::component::select::{Select, SelectState};
-use gpui_kit::component::{ActiveTheme as _, Disableable as _, StyledExt as _, h_flex, v_flex};
+use gpui_kit::component::switch::Switch;
+use gpui_kit::component::{
+    ActiveTheme as _, Disableable as _, IconName, Sizable as _, StyledExt as _, h_flex, v_flex,
+};
 use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::*;
 
@@ -161,25 +167,18 @@ impl IngestBatchProgress {
 /// dialog visibility, per-card batch progress, and the live file rows.
 pub struct AppState {
     volumes: Vec<Volume>,
-    ingest_open: bool,
-    templates_open: bool,
     batches: Vec<IngestBatchProgress>,
     files_by_batch: HashMap<i64, Vec<IngestFileRow>>,
     job_batches: HashMap<JobId, i64>,
-    /// Bumped each time the dialog opens, so it reloads its template list.
-    ingest_generation: u64,
 }
 
 impl AppState {
     pub fn new() -> Self {
         Self {
             volumes: Vec::new(),
-            ingest_open: false,
-            templates_open: false,
             batches: Vec::new(),
             files_by_batch: HashMap::new(),
             job_batches: HashMap::new(),
-            ingest_generation: 0,
         }
     }
 
@@ -187,23 +186,12 @@ impl AppState {
         &self.volumes
     }
 
-    pub fn is_ingest_open(&self) -> bool {
-        self.ingest_open
-    }
-
-    pub fn is_templates_open(&self) -> bool {
-        self.templates_open
-    }
-
-    /// All live file rows, batches in registration order.
-    pub fn files(&self) -> Vec<IngestFileRow> {
-        let mut rows: Vec<IngestFileRow> = Vec::new();
-        for batch in &self.batches {
-            if let Some(files) = self.files_by_batch.get(&batch.batch_id) {
-                rows.extend(files.iter().cloned());
-            }
-        }
-        rows
+    /// File rows of the newest batch for one source.
+    pub fn files_for_volume(&self, identity: &str) -> Vec<IngestFileRow> {
+        self.batch_for_volume(identity)
+            .and_then(|batch| self.files_by_batch.get(&batch.batch_id))
+            .cloned()
+            .unwrap_or_default()
     }
 
     /// Whether any card is still ingesting.
@@ -228,20 +216,6 @@ impl AppState {
             self.volumes = volumes;
             cx.notify();
         }
-    }
-
-    pub fn set_ingest_open(&mut self, open: bool, cx: &mut Context<Self>) {
-        if open != self.ingest_open {
-            self.ingest_open = open;
-            if open {
-                self.ingest_generation += 1;
-            }
-            cx.notify();
-        }
-    }
-
-    pub fn ingest_generation(&self) -> u64 {
-        self.ingest_generation
     }
 
     /// Remember the batch a queued `ingest_copy` job belongs to, so progress
@@ -347,13 +321,6 @@ impl AppState {
             cx.notify();
         }
     }
-
-    pub fn set_templates_open(&mut self, open: bool, cx: &mut Context<Self>) {
-        if open != self.templates_open {
-            self.templates_open = open;
-            cx.notify();
-        }
-    }
 }
 
 impl Default for AppState {
@@ -455,21 +422,69 @@ pub fn format_bytes(bytes: u64) -> String {
 /// Template choice meaning "ingest without stamping".
 const NO_TEMPLATE: &str = "None";
 
-/// Ingest dialog (plan section 2.8): card list with per-card progress,
-/// destination folder + filename rule inputs, backup destination input, the
-/// IPTC template selector, the live file table, and the Start / Retry actions.
+/// What to copy from the card, as in Photo Mechanic's ingest.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CopyScope {
+    All,
+    Tagged,
+}
+
+/// One photo on the chosen card, with its tag (checkbox) state.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CardPhoto {
+    pub path: String,
+    pub name: String,
+    pub bytes: u64,
+    pub tagged: bool,
+}
+
+/// Reading the chosen card's file list happens off the UI thread.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum CardScan {
+    Idle,
+    Reading,
+    Failed(String),
+}
+
+/// Photos the ingest would copy: every photo, or only the tagged ones.
+pub fn chosen_sources(photos: &[CardPhoto], scope: CopyScope) -> Option<Vec<String>> {
+    match scope {
+        CopyScope::All => None,
+        CopyScope::Tagged => Some(
+            photos
+                .iter()
+                .filter(|photo| photo.tagged)
+                .map(|photo| photo.path.clone())
+                .collect(),
+        ),
+    }
+}
+
+/// Ingest dialog body (plan section 2.8), hosted by a modal `Dialog`: the
+/// source (card or folder), what to copy, where it goes, optional renaming,
+/// an optional IPTC template, and the live file list. The footer is
+/// [`IngestFooter`].
 pub struct IngestDialog {
     state: Entity<AppState>,
     catalog: Arc<Catalog>,
-    /// Volume identity of the selected card, if any.
+    /// Identity of the chosen source, if any.
     pub selected: Option<String>,
+    /// Folders the user picked with "Choose folder…".
+    folders: Vec<Volume>,
+    photos: Vec<CardPhoto>,
+    scan: CardScan,
+    scan_task: Option<Task<()>>,
+    pub scope: CopyScope,
+    pub rename: bool,
     pub dest_dir: Entity<InputState>,
     pub file_rule: Entity<InputState>,
     pub backup_dir: Entity<InputState>,
     template_select: Entity<SelectState<SearchableVec<String>>>,
     /// Template rows behind the selector, refreshed each time the dialog opens.
     templates: Vec<IptcTemplate>,
-    seen_generation: u64,
+    files_scroll: UniformListScrollHandle,
+    /// After Start the list shows the ingest's progress instead of tags.
+    show_progress: bool,
     status: Option<String>,
     /// Whether `status` reports a rejected request (shown as an error).
     status_is_error: bool,
@@ -483,21 +498,66 @@ impl IngestDialog {
         file_rule: Entity<InputState>,
         backup_dir: Entity<InputState>,
         template_select: Entity<SelectState<SearchableVec<String>>>,
+        cx: &mut Context<Self>,
     ) -> Self {
+        // Cards come and go and progress events arrive; repaint on both.
+        cx.observe(&state, |_, _, cx| cx.notify()).detach();
         Self {
             state,
             catalog,
             selected: None,
+            folders: Vec::new(),
+            photos: Vec::new(),
+            scan: CardScan::Idle,
+            scan_task: None,
+            scope: CopyScope::All,
+            rename: false,
             dest_dir,
             file_rule,
             backup_dir,
             template_select,
             templates: Vec::new(),
-            // Differs from the state's generation, so the first render loads.
-            seen_generation: u64::MAX,
+            files_scroll: UniformListScrollHandle::new(),
+            show_progress: false,
             status: None,
             status_is_error: false,
         }
+    }
+
+    /// Called each time the dialog opens: fresh template list, no stale
+    /// message, and a lone card is chosen for the user.
+    pub fn prepare(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.reload_templates(window, cx);
+        self.status = None;
+        self.show_progress = false;
+        let sources = self.sources(cx);
+        let still_there = self
+            .selected
+            .as_deref()
+            .is_some_and(|id| sources.iter().any(|source| source.identity == id));
+        if !still_there {
+            self.selected = None;
+            self.photos.clear();
+            self.scan = CardScan::Idle;
+            if let [only] = sources.as_slice() {
+                self.select(only.identity.clone(), cx);
+            }
+        }
+        cx.notify();
+    }
+
+    /// Cards and external drives, plus folders chosen by hand.
+    fn sources(&self, cx: &App) -> Vec<Volume> {
+        let mut sources: Vec<Volume> = self
+            .state
+            .read(cx)
+            .volumes()
+            .iter()
+            .filter(|volume| volume.is_ingest_source())
+            .cloned()
+            .collect();
+        sources.extend(self.folders.iter().cloned());
+        sources
     }
 
     fn set_status(&mut self, is_error: bool, message: String) {
@@ -505,15 +565,150 @@ impl IngestDialog {
         self.status_is_error = is_error;
     }
 
-    fn close(&mut self, cx: &mut Context<Self>) {
-        self.state.update(cx, |state, cx| {
-            state.set_ingest_open(false, cx);
+    pub fn tagged_count(&self) -> usize {
+        self.photos.iter().filter(|photo| photo.tagged).count()
+    }
+
+    /// How many photos the primary button would copy.
+    pub fn photo_count(&self) -> usize {
+        match self.scope {
+            CopyScope::All => self.photos.len(),
+            CopyScope::Tagged => self.tagged_count(),
+        }
+    }
+
+    /// Label and enabled state of the primary footer button.
+    pub fn primary(&self) -> (String, bool) {
+        let count = self.photo_count();
+        let busy = matches!(self.scan, CardScan::Reading);
+        let label = match count {
+            _ if busy || self.selected.is_none() || count == 0 => "Ingest".to_string(),
+            1 => "Ingest 1 photo".to_string(),
+            n => format!("Ingest {n} photos"),
+        };
+        (label, self.selected.is_some() && !busy && count > 0)
+    }
+
+    /// Whether the chosen source has a finished batch with failed files.
+    pub fn can_retry(&self, cx: &App) -> bool {
+        self.selected.as_deref().is_some_and(|identity| {
+            self.state
+                .read(cx)
+                .batch_for_volume(identity)
+                .is_some_and(|batch| batch.state != BatchState::Running && batch.tally.failed > 0)
+        })
+    }
+
+    /// Whether the chosen source is still being copied.
+    pub fn is_running(&self, cx: &App) -> bool {
+        self.selected.as_deref().is_some_and(|identity| {
+            self.state
+                .read(cx)
+                .batch_for_volume(identity)
+                .is_some_and(|batch| batch.state == BatchState::Running)
+        })
+    }
+
+    /// Choose a source and read its photo list in the background.
+    pub fn select(&mut self, identity: String, cx: &mut Context<Self>) {
+        let Some(source) = self
+            .sources(cx)
+            .into_iter()
+            .find(|source| source.identity == identity)
+        else {
+            return;
+        };
+        self.selected = Some(identity);
+        self.photos.clear();
+        self.scan = CardScan::Reading;
+        self.show_progress = false;
+        let root = source.mount_point.clone();
+        let wanted = source.identity.clone();
+        self.scan_task = Some(cx.spawn(async move |this, cx| {
+            let found = cx
+                .background_executor()
+                .spawn(async move { edit_ingest::enumerate_card(&root) })
+                .await;
+            this.update(cx, |this, cx| {
+                // A newer choice replaced this one while it was reading.
+                if this.selected.as_deref() != Some(wanted.as_str()) {
+                    return;
+                }
+                match found {
+                    Ok(files) => {
+                        this.photos = files
+                            .into_iter()
+                            .map(|file| CardPhoto {
+                                path: file.path.to_string_lossy().into_owned(),
+                                name: file.original_name,
+                                bytes: file.bytes,
+                                tagged: true,
+                            })
+                            .collect();
+                        this.scan = CardScan::Idle;
+                    }
+                    Err(error) => this.scan = CardScan::Failed(error.to_string()),
+                }
+                cx.notify();
+            })
+            .ok();
+        }));
+        cx.notify();
+    }
+
+    /// Pick any folder as an ingest source.
+    fn choose_folder(&mut self, cx: &mut Context<Self>) {
+        let picked = cx.prompt_for_paths(PathPromptOptions {
+            files: false,
+            directories: true,
+            multiple: false,
+            prompt: Some("Choose folder".into()),
         });
+        cx.spawn(async move |this, cx| {
+            if let Ok(Ok(Some(paths))) = picked.await
+                && let Some(path) = paths.into_iter().next()
+            {
+                this.update(cx, |this, cx| {
+                    let folder = Volume::folder(&path);
+                    let identity = folder.identity.clone();
+                    if !this.folders.iter().any(|known| known.identity == identity) {
+                        this.folders.push(folder);
+                    }
+                    this.select(identity, cx);
+                })
+                .ok();
+            }
+        })
+        .detach();
+    }
+
+    pub fn set_all_tags(&mut self, tagged: bool, cx: &mut Context<Self>) {
+        for photo in &mut self.photos {
+            photo.tagged = tagged;
+        }
+        cx.notify();
+    }
+
+    pub fn set_tag(&mut self, index: usize, tagged: bool, cx: &mut Context<Self>) {
+        if let Some(photo) = self.photos.get_mut(index) {
+            photo.tagged = tagged;
+            cx.notify();
+        }
+    }
+
+    pub fn set_scope(&mut self, scope: CopyScope, cx: &mut Context<Self>) {
+        self.scope = scope;
+        cx.notify();
+    }
+
+    pub fn set_rename(&mut self, rename: bool, cx: &mut Context<Self>) {
+        self.rename = rename;
+        cx.notify();
     }
 
     /// Reload the template rows and rebuild the selector. The default is the
-    /// newest ingest-scoped template (the ingest snapshot), else "no
-    /// template"; a still-existing earlier pick is kept.
+    /// newest ingest-scoped template (the ingest snapshot), else "None"; a
+    /// still-existing earlier pick is kept.
     fn reload_templates(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         self.templates = self.catalog.list_iptc_templates().unwrap_or_default();
         self.templates.sort_by_key(|row| row.name.to_lowercase());
@@ -541,139 +736,88 @@ impl IngestDialog {
         self.templates.iter().find(|row| row.name == name).cloned()
     }
 
-    /// Put the defaults back into blank rule boxes, so what the box shows is
-    /// exactly what the ingest uses (a placeholder is never the rule).
-    fn fill_blank_rules(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        for (input, default) in [
-            (&self.dest_dir, DEFAULT_DEST_RULE),
-            (&self.file_rule, DEFAULT_FILENAME_RULE),
-        ] {
-            if input.read(cx).value().trim().is_empty() {
-                input.update(cx, |input, cx| input.set_value(default, window, cx));
-            }
-        }
-    }
-
-    /// Open an ingest batch for the selected card and queue its copy job.
-    /// Clicking it again after a failure retries: files already ingested are
-    /// skipped as duplicates and failed ones are copied again.
+    /// Open an ingest batch for the chosen source and queue its copy job.
+    /// Clicking Retry after a failure runs this again: files already
+    /// ingested are skipped as duplicates and failed ones are copied again.
     ///
     /// Enumeration, copying and dedupe all run inside the `ingest_copy` job,
     /// so this never blocks the UI thread.
-    fn start(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+    pub fn start(&mut self, cx: &mut Context<Self>) {
         let Some(identity) = self.selected.clone() else {
-            self.set_status(true, "Select a card.".to_string());
+            self.set_status(true, "Choose a card or folder first.".to_string());
             cx.notify();
             return;
         };
-        let volume = self
-            .state
-            .read(cx)
-            .volumes()
-            .iter()
-            .find(|volume| volume.identity == identity)
-            .cloned();
-        let Some(volume) = volume else {
+        if self.photo_count() == 0 {
+            self.set_status(true, "Tag at least one photo to copy.".to_string());
+            cx.notify();
+            return;
+        }
+        if self.is_running(cx) {
+            return;
+        }
+        let Some(source) = self
+            .sources(cx)
+            .into_iter()
+            .find(|source| source.identity == identity)
+        else {
             self.set_status(true, "The card was removed.".to_string());
             cx.notify();
             return;
         };
-        if self.start_card(&volume, window, cx) {
-            self.set_status(false, format!("Copying from {}…", volume.display_name()));
-        }
-        cx.notify();
-    }
-
-    /// Open one batch per detected card, so every card ingests in parallel.
-    fn start_all(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        let volumes = self.state.read(cx).volumes().to_vec();
-        if volumes.is_empty() {
-            self.set_status(true, "No cards found.".to_string());
-            cx.notify();
-            return;
-        }
-        let mut started = 0;
-        for volume in &volumes {
-            if self.start_card(volume, window, cx) {
-                started += 1;
-            }
-        }
-        if started > 0 {
-            self.set_status(
-                false,
-                format!("Copying from {started} of {} cards…", volumes.len()),
-            );
-        }
-        cx.notify();
-    }
-
-    /// Validate the inputs and queue the card. Returns false (with `status`
-    /// set) when the card cannot be started; a rejected request creates no
-    /// batch.
-    fn start_card(&mut self, volume: &Volume, window: &mut Window, cx: &mut Context<Self>) -> bool {
-        self.fill_blank_rules(window, cx);
         let dest = self.dest_dir.read(cx).value().to_string();
-        let file_rule = self.file_rule.read(cx).value().to_string();
+        // Without "Rename files" the card's own names are kept.
+        let file_rule = if self.rename {
+            self.file_rule.read(cx).value().to_string()
+        } else {
+            String::new()
+        };
         let backup = self.backup_dir.read(cx).value().to_string();
-        let session = volume.display_name();
+        let session = source.display_name();
         let template = self.selected_template(cx);
         let replacements = saved_code_replacements(&self.catalog);
+        let only = chosen_sources(&self.photos, self.scope);
         let started = start_ingest(
             &self.catalog,
             &IngestStart {
-                volume_uuid: volume.fs_uuid.as_deref(),
-                volume_label: volume.label.as_deref(),
-                source_root: &volume.mount_point,
+                volume_uuid: source.fs_uuid.as_deref(),
+                volume_label: source.label.as_deref(),
+                source_root: &source.mount_point,
                 dest_rule: &dest,
                 filename_rule: &file_rule,
                 backup_dir: &backup,
                 session: &session,
                 template: template.as_ref(),
                 replacements: replacements.as_ref(),
-                only_sources: None,
+                only_sources: only.as_deref(),
             },
         );
         match started {
             Ok(started) => {
-                let identity = volume.identity.clone();
                 self.state.update(cx, |state, cx| {
                     state.register_batch(started.batch_id, started.job_id, identity, session, cx);
                 });
-                true
+                self.show_progress = true;
+                self.set_status(false, format!("Copying from {}…", source.display_name()));
             }
-            Err(message) => {
-                self.set_status(true, message);
-                false
-            }
+            Err(message) => self.set_status(true, message),
         }
+        cx.notify();
     }
 
-    fn render_cards(&self, cx: &mut Context<Self>) -> impl IntoElement {
-        let volumes = self.state.read(cx).volumes().to_vec();
+    fn render_sources(&self, cx: &mut Context<Self>) -> impl IntoElement + use<> {
+        let sources = self.sources(cx);
         let selected = self.selected.clone();
-        let progress: Vec<(String, Option<IngestBatchProgress>)> = volumes
-            .iter()
-            .map(|volume| {
-                let batch = self
-                    .state
-                    .read(cx)
-                    .batch_for_volume(&volume.identity)
-                    .cloned();
-                (volume.identity.clone(), batch)
-            })
-            .collect();
-        v_flex().gap_2().children(volumes.into_iter().map(|volume| {
-            let identity = volume.identity.clone();
+        let state = self.state.read(cx);
+        let border = cx.theme().border;
+        let accent = cx.theme().tokens.list_active_border.color;
+        let rows = sources.into_iter().map(|source| {
+            let identity = source.identity.clone();
             let is_selected = selected.as_deref() == Some(identity.as_str());
-            let label = volume.display_name();
-            let detail = volume.mount_point.display().to_string();
-            let batch = progress
-                .iter()
-                .find(|(id, _)| id == &identity)
-                .and_then(|(_, batch)| batch.clone());
-            let (percent, progress_text, failure) = match batch {
+            let batch = state.batch_for_volume(&identity).cloned();
+            let (percent, caption, failure) = match batch {
                 Some(batch) => (
-                    batch.percent(),
+                    Some(batch.percent()),
                     batch.summary(),
                     batch
                         .tally
@@ -681,125 +825,265 @@ impl IngestDialog {
                         .clone()
                         .map(|error| format!("First error: {error}")),
                 ),
-                None => (
-                    volume.used_percent(),
+                None if source.capacity_bytes > 0 => (
+                    None,
                     format!(
                         "{} free of {}",
-                        format_bytes(volume.free_bytes),
-                        format_bytes(volume.capacity_bytes)
+                        format_bytes(source.free_bytes),
+                        format_bytes(source.capacity_bytes)
                     ),
                     None,
                 ),
+                None => (None, String::new(), None),
             };
-            let progress_id = format!("card-progress-{}", volume.identity);
-            let row_id = format!("card-row-{}", volume.identity);
-            let identity_for_click = identity.clone();
+            let click_identity = identity.clone();
             v_flex()
-                .id(row_id)
+                .id(format!("source-{identity}"))
                 .gap_1()
                 .p_2()
                 .rounded_md()
                 .border_1()
+                .border_color(if is_selected { accent } else { border })
                 .cursor_pointer()
-                .on_click(cx.listener(move |this, _event: &ClickEvent, _window, cx| {
-                    this.selected = Some(identity_for_click.clone());
-                    cx.notify();
+                .on_click(cx.listener(move |this, _: &ClickEvent, _, cx| {
+                    this.select(click_identity.clone(), cx);
                 }))
-                .when(is_selected, |row| {
-                    row.border_color(cx.theme().tokens.list_active_border.color)
-                })
                 .child(
                     h_flex()
                         .w_full()
                         .justify_between()
-                        .child(div().font_semibold().child(label))
-                        .child(div().text_sm().child(detail)),
+                        .child(Label::new(source.display_name()).text_sm().font_semibold())
+                        .child(
+                            Label::new(source.mount_point.display().to_string())
+                                .text_xs()
+                                .text_color(cx.theme().muted_foreground),
+                        ),
                 )
-                .child(Progress::new(progress_id).value(percent))
-                .child(Label::new(progress_text).text_xs())
-                .when_some(failure, |row, failure| {
-                    row.child(Alert::error(
-                        format!("card-failure-{}", volume.identity),
-                        failure,
-                    ))
+                .when_some(percent, |row, percent| {
+                    row.child(Progress::new(format!("progress-{identity}")).value(percent))
                 })
-        }))
+                .when(!caption.is_empty(), |row| {
+                    row.child(
+                        Label::new(caption)
+                            .text_xs()
+                            .text_color(cx.theme().muted_foreground),
+                    )
+                })
+                .when_some(failure, |row, failure| {
+                    row.child(Alert::error(format!("failure-{identity}"), failure))
+                })
+        });
+        let empty =
+            state.volumes().iter().all(|v| !v.is_ingest_source()) && self.folders.is_empty();
+        v_flex()
+            .gap_2()
+            .children(rows)
+            .when(empty, |list| {
+                list.child(
+                    Label::new("No cards found. Insert a card or choose a folder.")
+                        .text_sm()
+                        .text_color(cx.theme().muted_foreground),
+                )
+            })
+            .child(
+                h_flex().child(
+                    Button::new("choose-folder")
+                        .small()
+                        .outline()
+                        .icon(IconName::FolderOpen)
+                        .label("Choose folder…")
+                        .on_click(cx.listener(|this, _, _, cx| this.choose_folder(cx))),
+                ),
+            )
     }
 
-    fn render_field(
-        &self,
-        label: &str,
-        input: &Entity<InputState>,
-        id: &'static str,
-    ) -> impl IntoElement {
+    fn render_scope(&self, cx: &mut Context<Self>) -> impl IntoElement + use<> {
+        let selected = match self.scope {
+            CopyScope::All => 0,
+            CopyScope::Tagged => 1,
+        };
+        RadioGroup::horizontal("copy-scope")
+            .children(["All photos", "Only tagged photos"])
+            .selected_index(Some(selected))
+            .on_change(cx.listener(|this, index: &usize, _, cx| {
+                this.set_scope(
+                    if *index == 0 {
+                        CopyScope::All
+                    } else {
+                        CopyScope::Tagged
+                    },
+                    cx,
+                );
+            }))
+    }
+
+    /// The photo list: tag checkboxes before the copy, progress after it.
+    fn render_files(&mut self, cx: &mut Context<Self>) -> impl IntoElement {
+        let muted = cx.theme().muted_foreground;
+        if self.show_progress {
+            let files = self
+                .selected
+                .as_deref()
+                .map(|identity| self.state.read(cx).files_for_volume(identity))
+                .unwrap_or_default();
+            return v_flex()
+                .gap_2()
+                .child(Label::new("Files").text_sm().font_semibold())
+                .child(
+                    v_flex()
+                        .h(rems(14.))
+                        .overflow_y_scrollbar()
+                        .gap_1()
+                        .children(files.into_iter().map(|row| {
+                            h_flex()
+                                .w_full()
+                                .gap_4()
+                                .child(Label::new(row.name).text_sm().w_1_2())
+                                .child(
+                                    Label::new(format_bytes(row.bytes))
+                                        .text_sm()
+                                        .text_color(muted)
+                                        .w_1_4(),
+                                )
+                                .child(Label::new(state_label(row.state)).text_sm().w_1_4())
+                        })),
+                )
+                .into_any_element();
+        }
+        match (&self.scan, self.scope) {
+            (CardScan::Reading, _) => {
+                return Label::new("Reading the card…")
+                    .text_sm()
+                    .text_color(muted)
+                    .into_any_element();
+            }
+            (CardScan::Failed(error), _) => {
+                return Alert::error("scan-failed", format!("Could not read the card: {error}"))
+                    .into_any_element();
+            }
+            (CardScan::Idle, CopyScope::All) => {
+                let total: u64 = self.photos.iter().map(|photo| photo.bytes).sum();
+                let line = if self.selected.is_none() {
+                    "Choose a card or folder to see its photos.".to_string()
+                } else {
+                    format!("{} photos, {}", self.photos.len(), format_bytes(total))
+                };
+                return Label::new(line)
+                    .text_sm()
+                    .text_color(muted)
+                    .into_any_element();
+            }
+            (CardScan::Idle, CopyScope::Tagged) => {}
+        }
+        let count = self.photos.len();
+        let tagged = self.tagged_count();
+        v_flex()
+            .gap_2()
+            .child(
+                h_flex()
+                    .w_full()
+                    .justify_between()
+                    .items_center()
+                    .child(
+                        Label::new(format!("{tagged} of {count} tagged"))
+                            .text_sm()
+                            .font_semibold(),
+                    )
+                    .child(
+                        h_flex()
+                            .gap_1()
+                            .child(
+                                Button::new("tag-all")
+                                    .small()
+                                    .ghost()
+                                    .label("Tag all")
+                                    .on_click(cx.listener(|this, _, _, cx| {
+                                        this.set_all_tags(true, cx);
+                                    })),
+                            )
+                            .child(
+                                Button::new("untag-all")
+                                    .small()
+                                    .ghost()
+                                    .label("Untag all")
+                                    .on_click(cx.listener(|this, _, _, cx| {
+                                        this.set_all_tags(false, cx);
+                                    })),
+                            ),
+                    ),
+            )
+            .child(
+                div()
+                    .relative()
+                    .h(rems(14.))
+                    .border_1()
+                    .border_color(cx.theme().border)
+                    .rounded_md()
+                    .child(
+                        uniform_list(
+                            "card-photos",
+                            count,
+                            cx.processor(|this, range: Range<usize>, _window, cx| {
+                                let muted = cx.theme().muted_foreground;
+                                range
+                                    .filter_map(|index| {
+                                        let photo = this.photos.get(index)?;
+                                        Some(
+                                            h_flex()
+                                                .id(("photo", index))
+                                                .h_8()
+                                                .px_2()
+                                                .gap_2()
+                                                .items_center()
+                                                .child(
+                                                    Checkbox::new(("tag", index))
+                                                        .checked(photo.tagged)
+                                                        .on_change(cx.listener(
+                                                            move |this, next: &bool, _, cx| {
+                                                                this.set_tag(index, *next, cx);
+                                                            },
+                                                        )),
+                                                )
+                                                .child(
+                                                    Label::new(photo.name.clone())
+                                                        .text_sm()
+                                                        .flex_1(),
+                                                )
+                                                .child(
+                                                    Label::new(format_bytes(photo.bytes))
+                                                        .text_sm()
+                                                        .text_color(muted),
+                                                ),
+                                        )
+                                    })
+                                    .collect::<Vec<_>>()
+                            }),
+                        )
+                        .size_full()
+                        .track_scroll(&self.files_scroll),
+                    )
+                    .child(Scrollbar::vertical(&self.files_scroll)),
+            )
+            .into_any_element()
+    }
+
+    fn section(&self, title: &str, child: impl IntoElement) -> impl IntoElement {
+        v_flex()
+            .gap_2()
+            .child(Label::new(title.to_string()).text_sm().font_semibold())
+            .child(child)
+    }
+
+    fn field(&self, label: &str, input: &Entity<InputState>, id: &'static str) -> impl IntoElement {
         v_flex()
             .gap_1()
             .child(Label::new(label.to_string()).text_sm())
             .child(Input::new(input).id(id))
     }
-
-    fn render_template_picker(&self) -> impl IntoElement {
-        v_flex()
-            .gap_1()
-            .child(Label::new("IPTC template").text_sm())
-            .child(Select::new(&self.template_select).placeholder(NO_TEMPLATE))
-    }
-
-    fn render_file_table(&self, cx: &mut Context<Self>) -> impl IntoElement {
-        let files = self.state.read(cx).files();
-        v_flex()
-            .gap_1()
-            .child(Label::new("Files").text_sm().font_semibold())
-            .child(
-                h_flex()
-                    .w_full()
-                    .gap_4()
-                    .text_sm()
-                    .font_semibold()
-                    .child(Label::new("Name").w_1_2())
-                    .child(Label::new("Size").w_1_4())
-                    .child(Label::new("State").w_1_4()),
-            )
-            .children(files.iter().map(|row| {
-                h_flex()
-                    .w_full()
-                    .gap_4()
-                    .text_sm()
-                    .child(Label::new(row.name.clone()).w_1_2())
-                    .child(Label::new(format_bytes(row.bytes)).w_1_4())
-                    .child(Label::new(state_label(row.state)).w_1_4())
-            }))
-            .when(files.is_empty(), |table| {
-                table.child(Label::new("No files yet.").text_sm())
-            })
-    }
 }
 
 impl Render for IngestDialog {
-    fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
-        let generation = self.state.read(cx).ingest_generation();
-        if generation != self.seen_generation {
-            self.seen_generation = generation;
-            self.reload_templates(window, cx);
-        }
-        let volumes = self.state.read(cx).volumes().to_vec();
-        // Drop a selection whose card is gone so the highlight never points
-        // at a removed volume.
-        if let Some(selected) = self.selected.as_deref()
-            && !volumes.iter().any(|volume| volume.identity == selected)
-        {
-            self.selected = None;
-        }
-        let volume_count = volumes.len();
-        // Blank boxes are fine: Start refills them with the defaults.
-        let ready = self.selected.is_some();
-        let all_ready = volume_count > 0;
-        let can_retry = self.selected.as_deref().is_some_and(|identity| {
-            self.state
-                .read(cx)
-                .batch_for_volume(identity)
-                .is_some_and(|batch| batch.state != BatchState::Running && batch.tally.failed > 0)
-        });
+    fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         // A progress note is only true while something is ingesting; a
         // rejection stays until the next action.
         let busy = self.state.read(cx).has_running_batch();
@@ -808,80 +1092,126 @@ impl Render for IngestDialog {
             .clone()
             .filter(|_| self.status_is_error || busy)
             .map(|message| (self.status_is_error, message));
-        div()
-            .id("ingest-dialog")
+        let rename_on = self.rename;
+        let sources = self.render_sources(cx);
+        let scope = self.render_scope(cx);
+        v_flex()
             .w_full()
-            .rounded_lg()
-            .border_1()
-            .p_4()
-            .bg(cx.theme().tokens.popover)
+            .gap_5()
+            .pt_3()
+            .pb_2()
+            .child(self.section("Source", sources))
+            .child(self.section("Copy", scope))
+            .child(self.render_files(cx))
             .child(
                 v_flex()
                     .gap_3()
-                    .child(DialogTitle::new().child("Ingest".to_string()))
-                    .when(volume_count == 0, |panel| {
-                        panel.child(Label::new("No cards found.").text_sm())
-                    })
-                    .child(self.render_cards(cx))
-                    .child(self.render_field("Destination folder", &self.dest_dir, "ingest-dest"))
-                    .child(self.render_field("Filename rule", &self.file_rule, "ingest-rule"))
-                    .child(self.render_field(
-                        "Backup folder (optional)",
-                        &self.backup_dir,
-                        "ingest-backup",
-                    ))
-                    .child(self.render_template_picker())
-                    .child(self.render_file_table(cx))
-                    .when_some(status, |panel, (is_error, message)| {
-                        panel.child(if is_error {
-                            Alert::error("ingest-status", message)
-                        } else {
-                            Alert::info("ingest-status", message)
-                        })
-                    })
+                    .child(self.field("Destination folder", &self.dest_dir, "ingest-dest"))
                     .child(
-                        h_flex()
-                            .w_full()
-                            .justify_end()
-                            .gap_2()
-                            .child(
-                                Button::new("ingest-start-all")
-                                    .label("Ingest all")
-                                    .disabled(!all_ready)
-                                    .on_click(cx.listener(
-                                        |this, _event: &ClickEvent, window, cx| {
-                                            this.start_all(window, cx);
-                                        },
-                                    )),
-                            )
-                            .child(
-                                Button::new("ingest-retry")
-                                    .label("Retry failed")
-                                    .disabled(!can_retry)
-                                    .on_click(cx.listener(
-                                        |this, _event: &ClickEvent, window, cx| {
-                                            this.start(window, cx);
-                                        },
-                                    )),
-                            )
-                            .child(
-                                Button::new("ingest-start")
-                                    .label("Start")
-                                    .disabled(!ready)
-                                    .on_click(cx.listener(
-                                        |this, _event: &ClickEvent, window, cx| {
-                                            this.start(window, cx);
-                                        },
-                                    )),
-                            )
-                            .child(Button::new("ingest-close").label("Close").on_click(
-                                cx.listener(|this, _event: &ClickEvent, _window, cx| {
-                                    this.close(cx);
-                                }),
-                            )),
-                    ),
+                        Switch::new("rename-files")
+                            .label("Rename files")
+                            .checked(rename_on)
+                            .on_change(cx.listener(|this, next: &bool, _, cx| {
+                                this.set_rename(*next, cx);
+                            })),
+                    )
+                    .when(rename_on, |col| {
+                        col.child(self.field("Filename rule", &self.file_rule, "ingest-rule"))
+                    })
+                    .child(self.field("Back up to (optional)", &self.backup_dir, "ingest-backup")),
+            )
+            .child(
+                v_flex()
+                    .gap_1()
+                    .child(Label::new("IPTC template").text_sm())
+                    .child(Select::new(&self.template_select).placeholder(NO_TEMPLATE)),
+            )
+            .when_some(status, |panel, (is_error, message)| {
+                panel.child(if is_error {
+                    Alert::error("ingest-status", message)
+                } else {
+                    Alert::info("ingest-status", message)
+                })
+            })
+    }
+}
+
+/// Dialog footer: Cancel and the primary action, which names what it will
+/// copy. A separate view so the button follows the dialog's tag counts.
+pub struct IngestFooter {
+    dialog: Entity<IngestDialog>,
+}
+
+impl IngestFooter {
+    pub fn new(dialog: Entity<IngestDialog>, cx: &mut Context<Self>) -> Self {
+        cx.observe(&dialog, |_, _, cx| cx.notify()).detach();
+        Self { dialog }
+    }
+}
+
+impl Render for IngestFooter {
+    fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        let (label, enabled) = self.dialog.read(cx).primary();
+        let running = self.dialog.read(cx).is_running(cx);
+        let can_retry = self.dialog.read(cx).can_retry(cx);
+        let dialog = self.dialog.clone();
+        let retry_dialog = self.dialog.clone();
+        h_flex()
+            .w_full()
+            .justify_end()
+            .gap_2()
+            .child(div().child(
+                DialogClose::new().child(Button::new("ingest-cancel").label("Close").outline()),
+            ))
+            .when(can_retry, |row| {
+                row.child(
+                    Button::new("ingest-retry")
+                        .label("Retry failed")
+                        .outline()
+                        .on_click(move |_, _, cx| {
+                            retry_dialog.update(cx, |dialog, cx| dialog.start(cx));
+                        }),
+                )
+            })
+            .child(
+                Button::new("ingest-start")
+                    .label(label)
+                    .primary()
+                    .disabled(!enabled || running)
+                    .on_click(move |_, _, cx| {
+                        dialog.update(cx, |dialog, cx| dialog.start(cx));
+                    }),
             )
     }
+}
+
+/// Open the ingest dialog as a modal over the window: backdrop, focus trap,
+/// Escape, and a scrolling body come from the library's dialog layer.
+pub fn open_ingest_dialog(
+    dialog: &Entity<IngestDialog>,
+    footer: &Entity<IngestFooter>,
+    window: &mut Window,
+    cx: &mut App,
+) {
+    if window.has_active_dialog(cx) {
+        return;
+    }
+    dialog.update(cx, |dialog, cx| dialog.prepare(window, cx));
+    let (body, footer) = (dialog.clone(), footer.clone());
+    window.open_dialog(cx, move |dialog, _, _| {
+        let confirm = body.clone();
+        dialog
+            .title("Ingest")
+            // Enter starts the ingest and the dialog stays open to show it.
+            .on_ok(move |_, _, cx| {
+                confirm.update(cx, |dialog, cx| dialog.start(cx));
+                false
+            })
+            .w(px(736.))
+            .margin_top(px(32.))
+            .child(body.clone())
+            .footer(footer.clone())
+    });
 }
 
 #[cfg(test)]
