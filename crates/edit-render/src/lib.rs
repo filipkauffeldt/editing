@@ -1869,4 +1869,91 @@ mod tests {
         assert_eq!(service.raw_decodes(), 0);
         std::fs::remove_dir_all(&dir).ok();
     }
+
+    /// Real raw, by hand: `SP_TEST_RAW=/tmp/x.NEF cargo test --release -p edit-render
+    /// real_raw_smart_preview -- --ignored --nocapture`.
+    #[test]
+    #[ignore = "needs SP_TEST_RAW=<path to a raw file>"]
+    fn real_raw_smart_preview() {
+        let Some(src) = std::env::var_os("SP_TEST_RAW") else {
+            return;
+        };
+        let dir = std::env::temp_dir().join(format!("edit-render-real-{}", std::process::id()));
+        std::fs::remove_dir_all(&dir).ok();
+        std::fs::create_dir_all(&dir).unwrap();
+        let raw = dir.join("real.nef");
+        std::fs::copy(src, &raw).unwrap();
+        let store = SmartPreviewStore::new(dir.join("smart"), 1 << 30);
+        let service = RenderService::new().with_smart_previews(store.clone());
+        let cancel = CancelToken::new();
+        let develop = DevelopSettings::default();
+        let t = std::time::Instant::now();
+        let direct = service.decode_source(&raw, 1600, &cancel).unwrap();
+        eprintln!("raw proxy decode @1600: {:?}", t.elapsed());
+        let t = std::time::Instant::now();
+        service.ensure_smart_preview(&raw, false, &cancel).unwrap();
+        eprintln!(
+            "build smart preview (raw decode @2560 + save): {:?}",
+            t.elapsed()
+        );
+        let key = SmartPreviewKey::for_file(&raw);
+        let t = std::time::Instant::now();
+        let loaded = store.load(&key).unwrap();
+        eprintln!(
+            "load smart preview {}x{}: {:?}, file {:.1} MB",
+            loaded.image.width,
+            loaded.image.height,
+            t.elapsed(),
+            store.total_bytes() as f64 / 1e6
+        );
+        let fresh = RenderService::new().with_smart_previews(store.clone());
+        let t = std::time::Instant::now();
+        fresh
+            .render_path(&raw, RenderSize::Proxy(1600), &develop, None, &cancel)
+            .unwrap();
+        eprintln!(
+            "first drag frame from the saved copy (fresh process state): {:?}",
+            t.elapsed()
+        );
+        let mut d = develop.clone();
+        d.light.exposure = 0.5;
+        let t = std::time::Instant::now();
+        fresh
+            .render_path(&raw, RenderSize::Proxy(1600), &d, None, &cancel)
+            .unwrap();
+        eprintln!("warm drag frame: {:?}", t.elapsed());
+        assert_eq!(fresh.raw_decodes(), 0);
+        // Fidelity against the direct 1600 decode. The raw path bins by an
+        // integer factor, so its size differs a little (same aspect); compare
+        // both at a common 800 px edge.
+        let shrunk = shrink(&loaded.image, loaded.info, 1600);
+        eprintln!(
+            "sizes: derived {}x{}, direct {}x{}",
+            shrunk.img.width, shrunk.img.height, direct.img.width, direct.img.height
+        );
+        let common = |img: &lightcraft_raster::Rgb32f| {
+            lightcraft_raster::resample::fit(
+                img,
+                800,
+                800,
+                lightcraft_raster::resample::Filter::Box,
+            )
+        };
+        let (a, b) = (common(&shrunk.img), common(&direct.img));
+        assert_eq!((a.width, a.height), (b.width, b.height));
+        let diffs: Vec<f32> = a
+            .data
+            .iter()
+            .flatten()
+            .zip(b.data.iter().flatten())
+            .map(|(a, b)| (a - b).abs())
+            .collect();
+        let max = diffs.iter().copied().fold(0.0f32, f32::max);
+        let mean = diffs.iter().map(|d| *d as f64).sum::<f64>() / diffs.len() as f64;
+        eprintln!(
+            "derived 1600 vs direct 1600 decode: max channel error {max:.4}, mean {mean:.5}; info equal: {}",
+            shrunk.info == direct.info
+        );
+        std::fs::remove_dir_all(&dir).ok();
+    }
 }
