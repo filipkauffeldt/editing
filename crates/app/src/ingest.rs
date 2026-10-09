@@ -20,19 +20,18 @@ use crate::assets::LOCK_ICON;
 use crate::ingest_job::{IngestStart, saved_code_replacements, start_ingest};
 use gpui_kit::component::WindowExt as _;
 use gpui_kit::component::alert::Alert;
-use gpui_kit::component::button::{Button, ButtonVariants as _};
+use gpui_kit::component::button::{Button, ButtonGroup, ButtonVariants as _};
 use gpui_kit::component::dialog::DialogClose;
 use gpui_kit::component::input::{Input, InputState};
 use gpui_kit::component::label::Label;
 use gpui_kit::component::progress::Progress;
-use gpui_kit::component::radio::{Radio, RadioGroup};
 use gpui_kit::component::scroll::{ScrollableElement as _, Scrollbar};
 use gpui_kit::component::searchable_list::SearchableVec;
 use gpui_kit::component::select::{Select, SelectState};
 use gpui_kit::component::switch::Switch;
 use gpui_kit::component::{
-    ActiveTheme as _, Disableable as _, Icon, IconName, Sizable as _, StyledExt as _, h_flex,
-    v_flex,
+    ActiveTheme as _, Disableable as _, Icon, IconName, Selectable as _, Sizable as _,
+    StyledExt as _, h_flex, v_flex,
 };
 use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::*;
@@ -912,28 +911,30 @@ impl IngestDialog {
     }
 
     fn render_scope(&self, cx: &mut Context<Self>) -> impl IntoElement + use<> {
-        let selected = match self.scope {
-            CopyScope::All => 0,
-            CopyScope::Locked => 1,
-        };
+        let locked_on = self.scope == CopyScope::Locked;
         let unavailable = self.locked_unavailable();
-        let locked = Radio::new("scope-locked")
+        let locked = Button::new("scope-locked")
             .label("Only locked photos")
+            .selected(locked_on)
             .disabled(unavailable.is_some());
         let locked = match unavailable {
             Some(why) => locked.tooltip(why),
             None => locked,
         };
-        RadioGroup::horizontal("copy-scope")
-            .child(Radio::new("scope-all").label("All photos"))
+        ButtonGroup::new("copy-scope")
+            .outline()
+            .child(
+                Button::new("scope-all")
+                    .label("All photos")
+                    .selected(!locked_on),
+            )
             .child(locked)
-            .selected_index(Some(selected))
-            .on_change(cx.listener(|this, index: &usize, _, cx| {
+            .on_click(cx.listener(|this, indexes: &Vec<usize>, _, cx| {
                 this.set_scope(
-                    if *index == 0 {
-                        CopyScope::All
-                    } else {
+                    if indexes.contains(&1) {
                         CopyScope::Locked
+                    } else {
+                        CopyScope::All
                     },
                     cx,
                 );
