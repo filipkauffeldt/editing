@@ -197,6 +197,7 @@ mod tests {
             rect: edit_core::Rect::new(0.1, 0.2, 0.6, 0.5),
             rotation_degrees: 4.5,
             aspect: Some(edit_core::Aspect::FourThree),
+            aspect_flipped: false,
         })
         .unwrap();
 

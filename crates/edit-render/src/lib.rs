@@ -748,6 +748,7 @@ mod tests {
                     rect: edit_core::Rect::new(0.2, 0.3, 0.6, 0.4),
                     rotation_degrees: angle,
                     aspect: None,
+                    aspect_flipped: false,
                 }),
             )
         };
@@ -783,6 +784,7 @@ mod tests {
             rect: edit_core::Rect::new(0.2, 0.25, 0.6, 0.5),
             rotation_degrees: 12.0,
             aspect: None,
+            aspect_flipped: false,
         };
         let corners =
             edit_core::crop::source_corners(crop.rect, crop.rotation_degrees, (w as f64, h as f64));
@@ -838,6 +840,7 @@ mod tests {
             rect: edit_core::Rect::new(0.25, 0.25, 0.5, 0.5),
             rotation_degrees: 7.0,
             aspect: None,
+            aspect_flipped: false,
         };
         let engine = render_full(&path, Some(&crop));
         assert_eq!((engine.width, engine.height), (320, 200));
@@ -876,6 +879,7 @@ mod tests {
             rect: edit_core::Rect::new(0.25, 0.15, 0.6, 0.6),
             rotation_degrees: 7.0,
             aspect: Some(edit_core::Aspect::ThreeTwo),
+            aspect_flipped: false,
         };
         let service = RenderService::new();
         let cancel = CancelToken::new();

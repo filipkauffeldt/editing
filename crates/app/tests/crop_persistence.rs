@@ -38,6 +38,7 @@ fn crop_and_straighten_survive_a_restart() {
         rect: Rect::new(0.12, 0.2, 0.6, 0.4),
         rotation_degrees: 3.25,
         aspect: Some(Aspect::ThreeTwo),
+        aspect_flipped: false,
     };
     let mut develop = DevelopSettings::default();
     SliderId::Exposure.set(&mut develop, 0.7);
@@ -86,6 +87,7 @@ fn resetting_the_crop_clears_the_stored_crop() {
         rect: Rect::new(0.1, 0.1, 0.5, 0.5),
         rotation_degrees: -1.0,
         aspect: None,
+        aspect_flipped: false,
     };
     let first = edit_json(&develop, Some(&crop)).unwrap();
     persist_edit(

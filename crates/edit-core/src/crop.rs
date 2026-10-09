@@ -21,6 +21,10 @@ pub struct Crop {
     pub rotation_degrees: f32,
     /// Locked aspect preset, if any. `None` is a free crop.
     pub aspect: Option<Aspect>,
+    /// The lock turned on its side: 3:2 becomes 2:3, Original follows the
+    /// photo's other orientation. Ignored without a lock and for 1:1.
+    #[serde(default)]
+    pub aspect_flipped: bool,
 }
 
 impl Default for Crop {
@@ -29,6 +33,7 @@ impl Default for Crop {
             rect: Rect::full(),
             rotation_degrees: 0.0,
             aspect: None,
+            aspect_flipped: false,
         }
     }
 }
@@ -231,6 +236,17 @@ pub fn rect_ratio(rect: Rect, source: (f64, f64)) -> f64 {
 }
 
 impl Crop {
+    /// Width over height the frame is locked to, in pixels of the oriented
+    /// `source`, or `None` for a free crop.
+    pub fn aspect_ratio(&self, source: (f64, f64)) -> Option<f64> {
+        let ratio = self.aspect?.ratio(source);
+        Some(if self.aspect_flipped {
+            1.0 / ratio
+        } else {
+            ratio
+        })
+    }
+
     /// Whether the crop changes nothing.
     pub fn is_identity(&self) -> bool {
         self.rect == Rect::full() && self.rotation_degrees == 0.0
@@ -243,6 +259,7 @@ impl Crop {
             rect: Rect::full(),
             rotation_degrees: self.rotation_degrees,
             aspect: None,
+            aspect_flipped: false,
         }
     }
 
@@ -415,6 +432,7 @@ mod tests {
             rect: Rect::new(0.1, 0.2, 0.6, 0.5),
             rotation_degrees: -3.25,
             aspect: Some(Aspect::FourThree),
+            aspect_flipped: true,
         };
         let json = serde_json::to_string(&crop).unwrap();
         assert_eq!(serde_json::from_str::<Crop>(&json).unwrap(), crop);
@@ -422,5 +440,28 @@ mod tests {
         assert!(Crop::default().is_identity());
         assert_eq!(crop.straightened_canvas().rect, Rect::full());
         assert_eq!(crop.straightened_canvas().rotation_degrees, -3.25);
+    }
+
+    #[test]
+    fn a_flipped_lock_turns_the_ratio_on_its_side() {
+        let source = (6000.0, 4000.0);
+        let mut crop = Crop::default();
+        assert_eq!(crop.aspect_ratio(source), None);
+        crop.aspect = Some(Aspect::ThreeTwo);
+        assert!(near(crop.aspect_ratio(source).unwrap(), 1.5, 1e-12));
+        crop.aspect_flipped = true;
+        assert!(near(crop.aspect_ratio(source).unwrap(), 2.0 / 3.0, 1e-12));
+        crop.aspect = Some(Aspect::Original);
+        assert!(near(crop.aspect_ratio(source).unwrap(), 2.0 / 3.0, 1e-12));
+        crop.aspect = Some(Aspect::Square);
+        assert_eq!(crop.aspect_ratio(source), Some(1.0));
+    }
+
+    #[test]
+    fn a_crop_saved_before_the_flip_flag_still_loads() {
+        let json = r#"{"rect":{"x":0.1,"y":0.1,"w":0.5,"h":0.5},"rotation_degrees":2.0,"aspect":"ThreeTwo"}"#;
+        let crop: Crop = serde_json::from_str(json).unwrap();
+        assert!(!crop.aspect_flipped);
+        assert_eq!(crop.aspect, Some(Aspect::ThreeTwo));
     }
 }

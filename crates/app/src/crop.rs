@@ -588,6 +588,7 @@ mod tests {
             rect: Rect::new(0.2, 0.3, 0.5, 0.4),
             rotation_degrees: 2.0,
             aspect: Some(Aspect::FourThree),
+            aspect_flipped: false,
         };
         let mut s = CropSession::enter(Some(&committed));
         assert_eq!(*s.draft(), committed);

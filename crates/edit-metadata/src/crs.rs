@@ -373,6 +373,7 @@ mod tests {
             rect: Rect::full(),
             rotation_degrees: 0.0,
             aspect: None,
+            aspect_flipped: false,
         };
         assert_eq!(
             crop_attributes(Some(&full)),
@@ -386,6 +387,7 @@ mod tests {
             rect: Rect::new(0.05, 0.1, 0.9, 0.8),
             rotation_degrees: 0.0,
             aspect: None,
+            aspect_flipped: false,
         };
         let attrs: std::collections::HashMap<_, _> =
             crop_attributes(Some(&crop)).into_iter().collect();
@@ -402,6 +404,7 @@ mod tests {
             rect: Rect::new(0.1, 0.2, 0.7, 0.6),
             rotation_degrees: -3.5,
             aspect: Some(edit_core::Aspect::ThreeTwo),
+            aspect_flipped: false,
         };
         let attrs: std::collections::HashMap<_, _> =
             crop_attributes(Some(&crop)).into_iter().collect();
@@ -412,6 +415,7 @@ mod tests {
             rect: Rect::full(),
             rotation_degrees: 2.0,
             aspect: None,
+            aspect_flipped: false,
         };
         let attrs: std::collections::HashMap<_, _> =
             crop_attributes(Some(&tilted)).into_iter().collect();

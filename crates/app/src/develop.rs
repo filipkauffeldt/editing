@@ -537,6 +537,7 @@ mod tests {
             rect: edit_core::Rect::new(0.1, 0.15, 0.7, 0.6),
             rotation_degrees: -2.5,
             aspect: Some(edit_core::Aspect::ThreeTwo),
+            aspect_flipped: false,
         }
     }
 
