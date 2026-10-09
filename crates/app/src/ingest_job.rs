@@ -14,7 +14,6 @@
 use std::path::Path;
 use std::sync::Arc;
 
-use edit_catalog::models::IptcTemplate;
 use edit_catalog::{Catalog, ClaimedJob, JobEvent, JobEventKind, JobId, JobKind};
 use edit_ingest::{
     FileMetadata, FollowUpJob, IngestCopyPayload, IngestPlanRequest, IngestTemplate, LandedPhoto,
@@ -45,9 +44,10 @@ pub struct IngestStart<'a> {
     pub filename_rule: &'a str,
     pub backup_dir: &'a str,
     pub session: &'a str,
-    /// The chosen IPTC template; its fields are frozen onto the batch.
-    pub template: Option<&'a IptcTemplate>,
-    /// Frozen with the template; applied when the stamp expands.
+    /// The IPTC fields from the dialog form; frozen onto the batch as shown.
+    /// `None` or an all-empty set stamps nothing.
+    pub fields: Option<&'a TemplateFields>,
+    /// Frozen with the fields; applied when the stamp expands.
     pub replacements: Option<&'a CodeReplacements>,
     /// Copy only these source paths (the tagged files); `None` copies all.
     pub only_sources: Option<&'a [String]>,
@@ -66,13 +66,13 @@ pub struct StartedIngest {
 /// runs before the batch row exists, so a bad request leaves nothing behind.
 /// Errors are user-facing messages.
 pub fn start_ingest(catalog: &Catalog, start: &IngestStart<'_>) -> Result<StartedIngest, String> {
-    if let Some(template) = start.template {
-        let fields: TemplateFields = serde_json::from_str(&template.fields_json)
-            .map_err(|e| format!("Template \"{}\" is unreadable: {e}", template.name))?;
-        if fields == TemplateFields::default() {
-            return Err(format!("Template \"{}\" has no fields.", template.name));
-        }
-    }
+    // Fields left empty write nothing, so an empty set is no stamp at all.
+    let fields_json = start
+        .fields
+        .filter(|fields| !fields.is_empty())
+        .map(serde_json::to_string)
+        .transpose()
+        .map_err(|e| format!("Could not encode the IPTC fields: {e}"))?;
     let plan = plan_ingest(&IngestPlanRequest {
         volume_uuid: start.volume_uuid,
         volume_label: start.volume_label,
@@ -82,9 +82,9 @@ pub fn start_ingest(catalog: &Catalog, start: &IngestStart<'_>) -> Result<Starte
         backup_dir: Some(start.backup_dir),
         session: start.session,
         start_seq: 1,
-        template: start.template.map(|template| IngestTemplate {
-            id: template.id,
-            fields_json: &template.fields_json,
+        template: fields_json.as_deref().map(|fields_json| IngestTemplate {
+            id: None,
+            fields_json,
         }),
         only_sources: start.only_sources,
     })
@@ -96,7 +96,7 @@ pub fn start_ingest(catalog: &Catalog, start: &IngestStart<'_>) -> Result<Starte
         batch_id,
         iptc_replacements_json: start
             .replacements
-            .filter(|_| start.template.is_some())
+            .filter(|_| fields_json.is_some())
             .and_then(|codes| serde_json::to_string(codes).ok()),
         ..plan.payload
     };
@@ -397,7 +397,7 @@ mod tests {
             filename_rule: rule,
             backup_dir: "",
             session: "NIKON Z 6",
-            template: None,
+            fields: None,
             replacements: None,
             only_sources: None,
         }
@@ -452,17 +452,6 @@ mod tests {
         let unknown = start_ingest(&catalog, &start_request(&card, &dest, "{nope}")).unwrap_err();
         assert!(unknown.contains("nope"), "{unknown}");
 
-        let empty = catalog
-            .insert_iptc_template("blank", "{}", "global")
-            .unwrap();
-        let empty = catalog.get_iptc_template(empty).unwrap();
-        let request = IngestStart {
-            template: Some(&empty),
-            ..start_request(&card, &dest, "")
-        };
-        let error = start_ingest(&catalog, &request).unwrap_err();
-        assert!(error.contains("has no fields"), "{error}");
-
         assert!(catalog.list_jobs(10).unwrap().is_empty());
         assert!(
             catalog
@@ -474,41 +463,111 @@ mod tests {
     }
 
     #[test]
-    fn the_chosen_template_is_frozen_onto_the_batch_and_the_job() {
+    fn the_typed_fields_are_frozen_onto_the_job_without_a_template_id() {
         let base = scratch("freeze");
         let catalog = Catalog::open(&base.join("catalog.sqlite")).unwrap();
         let card = base.join("card");
         let dest = base.join("Photos").to_string_lossy().into_owned();
-        let id = catalog
-            .insert_iptc_template("press", r#"{"credit":"SHL"}"#, "global")
-            .unwrap();
-        let template = catalog.get_iptc_template(id).unwrap();
+        let fields = TemplateFields::default()
+            .with("credit", "SHL")
+            .with("caption", "{session} {date}");
         let started = start_ingest(
             &catalog,
             &IngestStart {
-                template: Some(&template),
+                fields: Some(&fields),
                 ..start_request(&card, &dest, "")
             },
         )
         .unwrap();
 
-        // Editing the template afterwards does not reach the queued ingest.
-        catalog
-            .update_iptc_template(id, "press", r#"{"credit":"changed"}"#, "global")
-            .unwrap();
         assert_eq!(
             catalog
                 .get_ingest_batch(started.batch_id)
                 .unwrap()
                 .template_id,
-            Some(id)
+            None
         );
         let job = catalog.job(started.job_id).unwrap();
         let payload: IngestCopyPayload = serde_json::from_str(&job.payload_json).unwrap();
-        assert_eq!(
-            payload.iptc_fields_json.as_deref(),
-            Some(r#"{"credit":"SHL"}"#)
-        );
+        let frozen: TemplateFields =
+            serde_json::from_str(payload.iptc_fields_json.as_deref().unwrap()).unwrap();
+        assert_eq!(frozen, fields);
+        std::fs::remove_dir_all(&base).ok();
+    }
+
+    #[test]
+    fn empty_fields_write_nothing_and_blank_values_are_not_a_stamp() {
+        let base = scratch("empty-fields");
+        let catalog = Catalog::open(&base.join("catalog.sqlite")).unwrap();
+        let card = base.join("card");
+        let dest = base.join("Photos").to_string_lossy().into_owned();
+        for fields in [None, Some(TemplateFields::default())] {
+            let started = start_ingest(
+                &catalog,
+                &IngestStart {
+                    fields: fields.as_ref(),
+                    ..start_request(&card, &dest, "")
+                },
+            )
+            .unwrap();
+            let job = catalog.job(started.job_id).unwrap();
+            let payload: IngestCopyPayload = serde_json::from_str(&job.payload_json).unwrap();
+            assert_eq!(payload.iptc_fields_json, None);
+            assert_eq!(payload.iptc_replacements_json, None);
+        }
+        std::fs::remove_dir_all(&base).ok();
+    }
+
+    /// A batch saved before the dialog had fields: its row references a
+    /// template id and its job carries the frozen fields. Resuming it stamps
+    /// those fields, even after the template was edited or deleted.
+    #[test]
+    fn a_saved_batch_that_references_a_template_id_still_resumes_and_stamps() {
+        let base = scratch("legacy");
+        let card = base.join("card/DCIM/100CANON");
+        std::fs::create_dir_all(&card).unwrap();
+        std::fs::write(card.join("DSC0001.JPG"), b"one").unwrap();
+        let dest = base.join("Photos");
+        let catalog = Arc::new(Catalog::open(&base.join("catalog.sqlite")).unwrap());
+        let template = catalog
+            .insert_iptc_template("press", r#"{"credit":"SHL"}"#, "global")
+            .unwrap();
+        let batch = catalog
+            .create_ingest_batch(&NewIngestBatch {
+                volume_uuid: None,
+                volume_label: None,
+                session_name: Some("Cup final".into()),
+                dest_dir: dest.to_string_lossy().into_owned(),
+                backup_dir: None,
+                template_id: Some(template),
+                state: "running".into(),
+            })
+            .unwrap();
+        let payload = IngestCopyPayload {
+            batch_id: batch,
+            source_root: base.join("card").to_string_lossy().into_owned(),
+            dest_dir_template: dest.to_string_lossy().into_owned(),
+            filename_template: "{session}_{seq:4}".into(),
+            backup_dir: None,
+            session: "Cup final".into(),
+            start_seq: 1,
+            iptc_fields_json: Some(r#"{"credit":"SHL"}"#.into()),
+            iptc_replacements_json: None,
+            only_sources: None,
+        };
+        catalog.delete_iptc_template(template).unwrap();
+        let job = ClaimedJob {
+            id: JobId(1),
+            kind: JobKind::IngestCopy,
+            payload_json: serde_json::to_string(&payload).unwrap(),
+            attempts: 2,
+        };
+        let (tx, _rx) = flume::unbounded();
+        ingest_job_handler(Arc::clone(&catalog), &job, &tx).unwrap();
+
+        let stamps = stamp_payloads(&catalog);
+        assert_eq!(stamps.len(), 1);
+        assert_eq!(stamps[0].fields_json, r#"{"credit":"SHL"}"#);
         std::fs::remove_dir_all(&base).ok();
     }
 
@@ -549,15 +608,12 @@ mod tests {
         let catalog = Catalog::open(&base.join("catalog.sqlite")).unwrap();
         let card = base.join("card");
         let dest = base.join("Photos").to_string_lossy().into_owned();
-        let id = catalog
-            .insert_iptc_template("press", r#"{"caption":"\\h1\\ win"}"#, "global")
-            .unwrap();
-        let template = catalog.get_iptc_template(id).unwrap();
+        let fields = TemplateFields::default().with("caption", "\\h1\\ win");
         let codes = CodeReplacements::parse("h1\tSHL\n");
         let started = start_ingest(
             &catalog,
             &IngestStart {
-                template: Some(&template),
+                fields: Some(&fields),
                 replacements: Some(&codes),
                 ..start_request(&card, &dest, "")
             },

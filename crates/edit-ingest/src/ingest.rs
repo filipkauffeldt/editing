@@ -133,9 +133,10 @@ pub enum IngestError {
 /// The IPTC template an ingest stamps onto what it lands.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct IngestTemplate<'a> {
-    /// `iptc_templates.id`, kept on the batch row as history.
-    pub id: i64,
-    /// The template's `fields_json` at the moment the ingest starts.
+    /// `iptc_templates.id`, kept on the batch row as history. `None` when
+    /// the fields were typed in rather than taken from a saved template.
+    pub id: Option<i64>,
+    /// The fields as JSON at the moment the ingest starts.
     pub fields_json: &'a str,
 }
 
@@ -191,7 +192,7 @@ pub fn plan_ingest(request: &IngestPlanRequest<'_>) -> Result<IngestPlan, Naming
             session_name: Some(request.session.to_string()),
             dest_dir: static_prefix(dest),
             backup_dir: backup_dir.clone(),
-            template_id: request.template.map(|template| template.id),
+            template_id: request.template.and_then(|template| template.id),
             state: "running".to_string(),
         },
         payload: IngestCopyPayload {
@@ -1283,13 +1284,28 @@ mod tests {
     fn plan_ingest_freezes_the_chosen_template_onto_batch_and_payload() {
         let plan = plan_ingest(&IngestPlanRequest {
             template: Some(IngestTemplate {
-                id: 7,
+                id: Some(7),
                 fields_json: r#"{"credit":"SHL"}"#,
             }),
             ..plan_request_defaults()
         })
         .unwrap();
         assert_eq!(plan.batch.template_id, Some(7));
+
+        // Typed-in fields have no template row behind them.
+        let typed = plan_ingest(&IngestPlanRequest {
+            template: Some(IngestTemplate {
+                id: None,
+                fields_json: r#"{"credit":"SHL"}"#,
+            }),
+            ..plan_request_defaults()
+        })
+        .unwrap();
+        assert_eq!(typed.batch.template_id, None);
+        assert_eq!(
+            typed.payload.iptc_fields_json,
+            plan.payload.iptc_fields_json
+        );
         assert_eq!(
             plan.payload.iptc_fields_json.as_deref(),
             Some(r#"{"credit":"SHL"}"#)

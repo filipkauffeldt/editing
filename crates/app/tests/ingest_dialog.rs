@@ -12,8 +12,6 @@ use edit_ingest::{IngestCopyPayload, Volume};
 use gpui_kit::component::WindowExt as _;
 use gpui_kit::component::button::Button;
 use gpui_kit::component::input::InputState;
-use gpui_kit::component::searchable_list::SearchableVec;
-use gpui_kit::component::select::SelectState;
 use gpui_kit::test::{TestSupportExt as _, TestWindowExt as _};
 use gpui_kit::{
     AnyWindowHandle, AppContext, Bounds, Context, Entity, ScrollDelta, ScrollHandle,
@@ -84,6 +82,10 @@ fn card(names: &[&str], locked: &[&str]) -> PathBuf {
 }
 
 fn fixture(cx: &mut TestAppContext, dir: &Path) -> Fixture {
+    fixture_sized(cx, dir, 900.)
+}
+
+fn fixture_sized(cx: &mut TestAppContext, dir: &Path, height: f32) -> Fixture {
     cx.update(gpui_kit::init);
     let catalog = Arc::new(Catalog::open(&dir.join("catalog.sqlite")).unwrap());
     let (handle, built) = cx.update(|cx| {
@@ -92,7 +94,7 @@ fn fixture(cx: &mut TestAppContext, dir: &Path) -> Fixture {
             WindowOptions {
                 window_bounds: Some(WindowBounds::Windowed(Bounds::new(
                     Default::default(),
-                    size(px(1000.), px(900.)),
+                    size(px(1000.), px(height)),
                 ))),
                 ..Default::default()
             },
@@ -102,9 +104,6 @@ fn fixture(cx: &mut TestAppContext, dir: &Path) -> Fixture {
                 let dest = cx.new(|cx| InputState::new(window, cx).default_value("~/Photos"));
                 let rule = cx.new(|cx| InputState::new(window, cx).default_value("{seq}"));
                 let backup = cx.new(|cx| InputState::new(window, cx));
-                let select = cx.new(|cx| {
-                    SelectState::new(SearchableVec::new(Vec::<String>::new()), None, window, cx)
-                });
                 let dialog = cx.new(|cx| {
                     IngestDialog::new(
                         state.clone(),
@@ -112,7 +111,7 @@ fn fixture(cx: &mut TestAppContext, dir: &Path) -> Fixture {
                         dest,
                         rule,
                         backup,
-                        select,
+                        window,
                         cx,
                     )
                 });
@@ -326,4 +325,136 @@ fn the_locked_option_is_off_when_nothing_is_locked_or_the_card_is_read_only(
         assert_eq!(dialog.primary(), ("Ingest 2 photos".to_string(), true));
     });
     std::fs::remove_dir_all(&ro_dir).ok();
+}
+
+fn summary(fx: &Fixture, cx: &mut TestAppContext) -> String {
+    cx.update(|cx| fx.dialog.read(cx).iptc_summary(cx))
+}
+
+fn render(fx: &Fixture, cx: &mut TestAppContext) {
+    cx.run_until_parked();
+    cx.update_window(fx.handle, |_, window, cx| window.render_frame(cx))
+        .unwrap();
+}
+
+#[gpui_kit::test]
+fn the_iptc_section_opens_fills_from_a_template_scrolls_and_escape_closes(cx: &mut TestAppContext) {
+    let dir = card(&["DSC_0001.NEF", "DSC_0002.NEF"], &[]);
+    // A window shorter than the expanded form.
+    let fx = fixture_sized(cx, &dir, 560.);
+    fx.catalog
+        .insert_iptc_template(
+            "press",
+            r#"{"credit":"SHL","source":"{session}"}"#,
+            "global",
+        )
+        .unwrap();
+    fx.open(cx, false);
+
+    // Collapsed: no fields on screen and nothing to summarise.
+    cx.update_window(fx.handle, |_, window, _| {
+        assert!(window.try_find("ingest-iptc-toggle").is_some());
+        assert!(window.try_find("ingest-iptc-headline").is_none());
+    })
+    .unwrap();
+    assert_eq!(summary(&fx, cx), "");
+
+    // The section sits below the fold of a short window: wheel to it.
+    cx.update_window(fx.handle, |_, window, cx| {
+        let footer = window.find("ingest-start").bounds();
+        assert!(
+            footer.bottom() <= px(560.),
+            "footer {footer:?} fits the window"
+        );
+        window.scroll(
+            "scope-locked",
+            ScrollDelta::Pixels(point(px(0.), px(-400.))),
+            cx,
+        );
+        window.click("ingest-iptc-toggle", cx)
+    })
+    .unwrap();
+    render(&fx, cx);
+    // Opened below the fold: wheel the body up to the first fields.
+    cx.update_window(fx.handle, |_, window, cx| {
+        window.scroll(
+            "ingest-iptc-toggle",
+            ScrollDelta::Pixels(point(px(0.), px(-200.))),
+            cx,
+        );
+    })
+    .unwrap();
+    cx.update_window(fx.handle, |_, window, cx| {
+        window.click("ingest-iptc-headline", cx);
+        window.input("Cup final", cx);
+    })
+    .unwrap();
+    render(&fx, cx);
+    assert_eq!(summary(&fx, cx), "1 field set");
+
+    // A template fills the draft and nothing else changes.
+    cx.update_window(fx.handle, |_, window, cx| {
+        window.click("ingest-iptc-template", cx);
+        window.press("down", cx);
+        window.press("enter", cx);
+    })
+    .unwrap();
+    render(&fx, cx);
+    assert_eq!(summary(&fx, cx), "3 fields set");
+    cx.update_window(fx.handle, |_, window, _| {
+        assert_eq!(
+            window.find("ingest-iptc-headline").value(),
+            Some("Cup final")
+        );
+    })
+    .unwrap();
+
+    // The footer stays inside the window and the wheel scrolls the body.
+    cx.update_window(fx.handle, |_, window, cx| {
+        let footer = window.find("ingest-start").bounds();
+        assert!(
+            footer.bottom() <= px(560.),
+            "footer {footer:?} fits the window"
+        );
+        let before = window.find("ingest-iptc-headline").bounds().top();
+        window.scroll(
+            "ingest-iptc-headline",
+            ScrollDelta::Pixels(point(px(0.), px(-120.))),
+            cx,
+        );
+        let after = window.find("ingest-iptc-headline").bounds().top();
+        assert!(
+            after < before,
+            "the body scrolled from {before:?} to {after:?}"
+        );
+    })
+    .unwrap();
+
+    // Start stamps exactly the fields the form showed.
+    cx.update_window(fx.handle, |_, window, cx| window.click("ingest-start", cx))
+        .unwrap();
+    let job = fx
+        .catalog
+        .list_jobs(10)
+        .unwrap()
+        .into_iter()
+        .find(|job| job.kind == JobKind::IngestCopy)
+        .expect("an ingest job is queued");
+    let payload: IngestCopyPayload = serde_json::from_str(&job.payload_json).unwrap();
+    assert_eq!(
+        payload.iptc_fields_json.as_deref(),
+        Some(r#"{"credit":"SHL","headline":"Cup final","source":"{session}"}"#)
+    );
+
+    cx.update_window(fx.handle, |_, window, cx| {
+        window.click("ingest-iptc-clear", cx)
+    })
+    .unwrap();
+    render(&fx, cx);
+    assert_eq!(summary(&fx, cx), "");
+
+    cx.update_window(fx.handle, |_, window, cx| window.press("escape", cx))
+        .unwrap();
+    assert!(!fx.is_open(cx), "Escape closes the dialog");
+    std::fs::remove_dir_all(&dir).ok();
 }

@@ -12,6 +12,7 @@ use app::ingest_job::{IngestStart, start_ingest};
 use app::views::Browser;
 use edit_catalog::{Catalog, JobEvent, JobEventKind, JobKind};
 use edit_ingest::{FileMetadata, IngestCopyPayload, run_ingest_copy_with};
+use edit_metadata::TemplateFields;
 use edit_render::RenderService;
 use gpui_kit::AppContext;
 
@@ -67,7 +68,7 @@ fn photos_appear_one_by_one_while_the_ingest_runs(cx: &mut gpui_kit::TestAppCont
             filename_rule: "",
             backup_dir: "",
             session: "shoot",
-            template: None,
+            fields: None,
             replacements: None,
             only_sources: None,
         },
@@ -170,7 +171,7 @@ fn an_ingest_switches_the_sheet_once_and_does_not_fight_the_user(
             filename_rule: "",
             backup_dir: "",
             session: "shoot",
-            template: None,
+            fields: None,
             replacements: None,
             only_sources: None,
         },
@@ -265,13 +266,7 @@ fn the_sheet_counts_every_stamped_photo_after_a_live_ingest(cx: &mut gpui_kit::T
             browser.set_ingest_refresh_gap(Duration::from_millis(250));
         })
     });
-    let template = catalog
-        .get_iptc_template(
-            catalog
-                .insert_iptc_template("press", r#"{"credit":"SHL"}"#, "ingest")
-                .unwrap(),
-        )
-        .unwrap();
+    let fields = TemplateFields::default().with("credit", "SHL");
     start_ingest(
         &catalog,
         &IngestStart {
@@ -282,7 +277,7 @@ fn the_sheet_counts_every_stamped_photo_after_a_live_ingest(cx: &mut gpui_kit::T
             filename_rule: "",
             backup_dir: "",
             session: "shoot",
-            template: Some(&template),
+            fields: Some(&fields),
             replacements: None,
             only_sources: None,
         },

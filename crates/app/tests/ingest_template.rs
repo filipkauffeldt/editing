@@ -15,7 +15,7 @@ use std::time::{Duration, Instant};
 
 use app::ingest_job::{IngestStart, handle_job, start_ingest};
 use edit_catalog::{Catalog, ClaimedJob, JobHandler, JobKind, JobState};
-use edit_metadata::{Writer, run_metadata_write};
+use edit_metadata::{CodeReplacements, TemplateFields, Writer, run_metadata_write};
 
 static NEXT_DIR: AtomicU64 = AtomicU64::new(0);
 
@@ -65,22 +65,16 @@ impl Card {
 
     /// Open a batch with the template and queue its ingest job.
     fn start(&self) -> edit_catalog::JobId {
-        let template = match self
-            .catalog
-            .list_iptc_templates()
-            .unwrap()
-            .into_iter()
-            .next()
-        {
-            Some(row) => row,
-            None => {
-                let id = self
-                    .catalog
-                    .insert_iptc_template("press", TEMPLATE, "ingest")
-                    .unwrap();
-                self.catalog.get_iptc_template(id).unwrap()
-            }
-        };
+        let fields: TemplateFields = serde_json::from_str(TEMPLATE).unwrap();
+        self.start_with(&fields, None)
+    }
+
+    /// Open a batch that stamps `fields`, as the dialog's form hands them over.
+    fn start_with(
+        &self,
+        fields: &TemplateFields,
+        replacements: Option<&CodeReplacements>,
+    ) -> edit_catalog::JobId {
         let rule = self.dest.to_string_lossy().into_owned();
         start_ingest(
             &self.catalog,
@@ -92,8 +86,8 @@ impl Card {
                 filename_rule: "{session}_{seq:4}",
                 backup_dir: "",
                 session: "Cup final",
-                template: Some(&template),
-                replacements: None,
+                fields: Some(fields),
+                replacements,
                 only_sources: None,
             },
         )
@@ -375,5 +369,37 @@ fn a_crash_and_a_second_run_leave_the_stamp_exactly_as_one_clean_run_does() {
     assert_eq!(
         card.stamp_of(&card.landed("Cup final_0001.xmp"), true),
         expected_raw
+    );
+}
+
+#[test]
+fn typed_fields_expand_variables_and_codes_per_photo_and_empty_ones_write_nothing() {
+    let Some(card) = Card::new() else { return };
+    let codes = CodeReplacements::parse("h1\tSHL Media\n");
+    // As the dialog form would hand them over: typed values only.
+    let fields = TemplateFields::default()
+        .with("credit", "=h1=")
+        .with("caption", "{base} #{seq:2}");
+    card.start_with(&fields, Some(&codes));
+    card.drain();
+    assert_eq!(card.failed_stamp_jobs(), Vec::<String>::new());
+
+    let jpg = card.landed("Cup final_0001.JPG");
+    let sidecar = card.landed("Cup final_0002.xmp");
+    for (file, caption) in [
+        (&jpg, "Cup final_0001 #01"),
+        (&sidecar, "Cup final_0002 #02"),
+    ] {
+        assert_eq!(card.list(file, "XMP-photoshop:Credit"), ["SHL Media"]);
+        assert_eq!(card.list(file, "XMP-dc:Description"), [caption]);
+        // Fields the form left empty wrote nothing.
+        assert!(card.list(file, "XMP-dc:Rights").is_empty());
+        assert!(card.list(file, "XMP-dc:Subject").is_empty());
+    }
+    assert_eq!(card.list(&jpg, "IPTC:Credit"), ["SHL Media"]);
+    assert_eq!(
+        std::fs::read(card.landed("Cup final_0002.NEF")).unwrap(),
+        b"opaque raw container two",
+        "the raw original stays untouched"
     );
 }
