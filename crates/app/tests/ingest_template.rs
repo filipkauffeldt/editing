@@ -15,7 +15,7 @@ use std::time::{Duration, Instant};
 
 use app::ingest_job::{IngestStart, handle_job, start_ingest};
 use edit_catalog::{Catalog, ClaimedJob, JobHandler, JobKind, JobState};
-use edit_metadata::{Writer, run_metadata_write};
+use edit_metadata::{TemplateFields, Writer, run_metadata_write};
 
 static NEXT_DIR: AtomicU64 = AtomicU64::new(0);
 
@@ -65,22 +65,7 @@ impl Card {
 
     /// Open a batch with the template and queue its ingest job.
     fn start(&self) -> edit_catalog::JobId {
-        let template = match self
-            .catalog
-            .list_iptc_templates()
-            .unwrap()
-            .into_iter()
-            .next()
-        {
-            Some(row) => row,
-            None => {
-                let id = self
-                    .catalog
-                    .insert_iptc_template("press", TEMPLATE, "ingest")
-                    .unwrap();
-                self.catalog.get_iptc_template(id).unwrap()
-            }
-        };
+        let fields: TemplateFields = serde_json::from_str(TEMPLATE).unwrap();
         let rule = self.dest.to_string_lossy().into_owned();
         start_ingest(
             &self.catalog,
@@ -92,7 +77,7 @@ impl Card {
                 filename_rule: "{session}_{seq:4}",
                 backup_dir: "",
                 session: "Cup final",
-                template: Some(&template),
+                fields: Some(&fields),
                 replacements: None,
                 only_sources: None,
             },

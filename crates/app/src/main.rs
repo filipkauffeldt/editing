@@ -13,8 +13,6 @@ use edit_ingest::{DEFAULT_DEST_RULE, RENAME_EXAMPLE_RULE};
 use gpui_kit::component::button::Button;
 use gpui_kit::component::input::InputState;
 use gpui_kit::component::label::Label;
-use gpui_kit::component::searchable_list::SearchableVec;
-use gpui_kit::component::select::SelectState;
 use gpui_kit::component::theme::{Theme, ThemeMode};
 use gpui_kit::component::{
     ActiveTheme as _, Disableable as _, IconName, Sizable as _, TitleBar, h_flex, v_flex,
@@ -288,9 +286,6 @@ fn main() {
             });
             let backup_dir =
                 cx.new(|cx| InputState::new(window, cx).placeholder("/mnt/backup (optional)"));
-            let template_select = cx.new(|cx| {
-                SelectState::new(SearchableVec::new(Vec::<String>::new()), None, window, cx)
-            });
             let dialog = cx.new(|cx| {
                 IngestDialog::new(
                     state.clone(),
@@ -298,7 +293,7 @@ fn main() {
                     dest_dir,
                     file_rule,
                     backup_dir,
-                    template_select,
+                    window,
                     cx,
                 )
             });

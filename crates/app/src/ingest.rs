@@ -15,8 +15,10 @@ use edit_catalog::models::{IngestFile, IptcTemplate};
 use edit_catalog::{Catalog, JobEvent, JobEventKind, JobId, JobKind};
 use edit_core::IngestFileState;
 use edit_ingest::{IngestCopyPayload, Volume, batch_volume_identity};
+use edit_metadata::TemplateFields;
 
 use crate::assets::LOCK_ICON;
+use crate::fields_form::FieldsForm;
 use crate::ingest_job::{IngestStart, saved_code_replacements, start_ingest};
 use gpui_kit::component::WindowExt as _;
 use gpui_kit::component::alert::Alert;
@@ -27,7 +29,7 @@ use gpui_kit::component::label::Label;
 use gpui_kit::component::progress::Progress;
 use gpui_kit::component::scroll::{ScrollableElement as _, Scrollbar};
 use gpui_kit::component::searchable_list::SearchableVec;
-use gpui_kit::component::select::{Select, SelectState};
+use gpui_kit::component::select::{Select, SelectEvent, SelectState};
 use gpui_kit::component::switch::Switch;
 use gpui_kit::component::{
     ActiveTheme as _, Disableable as _, Icon, IconName, Selectable as _, Sizable as _,
@@ -419,9 +421,6 @@ pub fn format_bytes(bytes: u64) -> String {
     }
 }
 
-/// Template choice meaning "ingest without stamping".
-const NO_TEMPLATE: &str = "None";
-
 /// What to copy from the card.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum CopyScope {
@@ -465,8 +464,8 @@ pub fn chosen_sources(photos: &[CardPhoto], scope: CopyScope) -> Option<Vec<Stri
 
 /// Ingest dialog body (plan section 2.8), hosted by a modal `Dialog`: the
 /// source (card or folder), what to copy (all, or only photos locked in the
-/// camera), where it goes, optional renaming, an optional IPTC template, and
-/// the file list. The footer is
+/// camera), where it goes, optional renaming, the IPTC fields to stamp (the
+/// sidebar's form, collapsed until opened), and the file list. The footer is
 /// [`IngestFooter`].
 pub struct IngestDialog {
     state: Entity<AppState>,
@@ -485,9 +484,15 @@ pub struct IngestDialog {
     pub dest_dir: Entity<InputState>,
     pub file_rule: Entity<InputState>,
     pub backup_dir: Entity<InputState>,
+    /// Fills the fields from a saved template; stamps nothing by itself.
     template_select: Entity<SelectState<SearchableVec<String>>>,
     /// Template rows behind the selector, refreshed each time the dialog opens.
     templates: Vec<IptcTemplate>,
+    /// The IPTC fields to stamp: what it shows is what gets written.
+    iptc_form: Entity<FieldsForm>,
+    iptc_open: bool,
+    /// Set once the form has its empty baseline and the select is wired.
+    iptc_ready: Option<Subscription>,
     files_scroll: UniformListScrollHandle,
     /// After Start the list shows the ingest's progress instead of tags.
     show_progress: bool,
@@ -503,11 +508,15 @@ impl IngestDialog {
         dest_dir: Entity<InputState>,
         file_rule: Entity<InputState>,
         backup_dir: Entity<InputState>,
-        template_select: Entity<SelectState<SearchableVec<String>>>,
+        window: &mut Window,
         cx: &mut Context<Self>,
     ) -> Self {
+        let template_select = cx
+            .new(|cx| SelectState::new(SearchableVec::new(Vec::<String>::new()), None, window, cx));
+        let iptc_form = cx.new(|cx| FieldsForm::new("ingest-iptc", window, cx));
         // Cards come and go and progress events arrive; repaint on both.
         cx.observe(&state, |_, _, cx| cx.notify()).detach();
+        cx.observe(&iptc_form, |_, _, cx| cx.notify()).detach();
         Self {
             state,
             catalog,
@@ -524,6 +533,9 @@ impl IngestDialog {
             backup_dir,
             template_select,
             templates: Vec::new(),
+            iptc_form,
+            iptc_open: false,
+            iptc_ready: None,
             files_scroll: UniformListScrollHandle::new(),
             show_progress: false,
             status: None,
@@ -534,6 +546,18 @@ impl IngestDialog {
     /// Called each time the dialog opens: fresh template list, no stale
     /// message, and a lone card is chosen for the user.
     pub fn prepare(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if self.iptc_ready.is_none() {
+            self.iptc_form.update(cx, |form, cx| form.clear(window, cx));
+            self.iptc_ready = Some(cx.subscribe_in(
+                &self.template_select.clone(),
+                window,
+                |this, _, event: &SelectEvent<SearchableVec<String>>, window, cx| {
+                    if let SelectEvent::Confirm(Some(name)) = event {
+                        this.fill_from_template(name, window, cx);
+                    }
+                },
+            ));
+        }
         self.reload_templates(window, cx);
         self.status = None;
         self.show_progress = false;
@@ -719,27 +743,54 @@ impl IngestDialog {
         cx.notify();
     }
 
-    /// Reload the template rows and rebuild the selector. No template is
-    /// required: the choice is "None" unless the user picked one earlier
-    /// and it still exists.
+    /// Reload the template rows and rebuild the selector. Choosing a row
+    /// only fills the fields, so nothing stays selected.
     fn reload_templates(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         self.templates = self.catalog.list_iptc_templates().unwrap_or_default();
         self.templates.sort_by_key(|row| row.name.to_lowercase());
-        let previous = self.template_select.read(cx).selected_value().cloned();
-        let mut names = vec![NO_TEMPLATE.to_string()];
-        names.extend(self.templates.iter().map(|row| row.name.clone()));
-        let pick = previous
-            .filter(|name| names.contains(name))
-            .unwrap_or_else(|| NO_TEMPLATE.to_string());
+        let names: Vec<String> = self.templates.iter().map(|row| row.name.clone()).collect();
         self.template_select.update(cx, |select, cx| {
             select.set_items(SearchableVec::new(names), window, cx);
-            select.set_selected_value(&pick, window, cx);
+            select.set_selected_index(None, window, cx);
         });
     }
 
-    fn selected_template(&self, cx: &App) -> Option<IptcTemplate> {
-        let name = self.template_select.read(cx).selected_value().cloned()?;
-        self.templates.iter().find(|row| row.name == name).cloned()
+    /// Put a saved template's values into the form. Variables stay as typed
+    /// and expand per photo when the files land.
+    fn fill_from_template(&mut self, name: &str, window: &mut Window, cx: &mut Context<Self>) {
+        if let Some(row) = self.templates.iter().find(|row| row.name == name) {
+            let fields: TemplateFields = serde_json::from_str(&row.fields_json).unwrap_or_default();
+            self.iptc_form
+                .update(cx, |form, cx| form.fill(&fields, window, cx));
+        }
+        self.template_select
+            .update(cx, |select, cx| select.set_selected_index(None, window, cx));
+        cx.notify();
+    }
+
+    /// Empty every IPTC field.
+    pub fn clear_fields(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.iptc_form.update(cx, |form, cx| form.clear(window, cx));
+        cx.notify();
+    }
+
+    pub fn set_iptc_open(&mut self, open: bool, cx: &mut Context<Self>) {
+        self.iptc_open = open;
+        cx.notify();
+    }
+
+    /// The fields that will be stamped: the ones with a value.
+    pub fn iptc_fields(&self, cx: &App) -> TemplateFields {
+        self.iptc_form.read(cx).changed(cx)
+    }
+
+    /// One line for the collapsed section; empty when nothing is set.
+    pub fn iptc_summary(&self, cx: &App) -> String {
+        match self.iptc_fields(cx).len() {
+            0 => String::new(),
+            1 => "1 field set".to_string(),
+            n => format!("{n} fields set"),
+        }
     }
 
     /// Open an ingest batch for the chosen source and queue its copy job.
@@ -780,7 +831,7 @@ impl IngestDialog {
         };
         let backup = self.backup_dir.read(cx).value().to_string();
         let session = source.display_name();
-        let template = self.selected_template(cx);
+        let fields = self.iptc_fields(cx);
         let replacements = saved_code_replacements(&self.catalog);
         let only = chosen_sources(&self.photos, self.scope);
         let started = start_ingest(
@@ -793,7 +844,7 @@ impl IngestDialog {
                 filename_rule: &file_rule,
                 backup_dir: &backup,
                 session: &session,
-                template: template.as_ref(),
+                fields: Some(&fields),
                 replacements: replacements.as_ref(),
                 only_sources: only.as_deref(),
             },
@@ -1049,6 +1100,61 @@ impl IngestDialog {
             .into_any_element()
     }
 
+    /// The collapsible IPTC section: a header with the summary, and when
+    /// open a template picker, Clear, and the shared field form.
+    fn render_iptc(&self, cx: &mut Context<Self>) -> impl IntoElement + use<> {
+        let open = self.iptc_open;
+        let summary = self.iptc_summary(cx);
+        let muted = cx.theme().muted_foreground;
+        let spacing = cx.theme().spacing_tokens();
+        v_flex()
+            .gap_2()
+            .child(
+                h_flex()
+                    .gap_2()
+                    .items_center()
+                    .child(
+                        Button::new("ingest-iptc-toggle")
+                            .ghost()
+                            .small()
+                            .icon(if open {
+                                IconName::ChevronDown
+                            } else {
+                                IconName::ChevronRight
+                            })
+                            .label("IPTC")
+                            .on_click(cx.listener(|this, _: &ClickEvent, _, cx| {
+                                this.set_iptc_open(!this.iptc_open, cx);
+                            })),
+                    )
+                    .child(Label::new(summary).text_xs().text_color(muted)),
+            )
+            .when(open, |col| {
+                col.child(
+                    h_flex()
+                        .gap(spacing.sm)
+                        .child(
+                            div().flex_1().child(
+                                Select::new(&self.template_select)
+                                    .small()
+                                    .placeholder("Fill from template")
+                                    .id("ingest-iptc-template"),
+                            ),
+                        )
+                        .child(
+                            Button::new("ingest-iptc-clear")
+                                .small()
+                                .outline()
+                                .label("Clear")
+                                .on_click(cx.listener(|this, _: &ClickEvent, window, cx| {
+                                    this.clear_fields(window, cx);
+                                })),
+                        ),
+                )
+                .child(self.iptc_form.clone())
+            })
+    }
+
     fn section(&self, title: &str, child: impl IntoElement) -> impl IntoElement {
         v_flex()
             .gap_2()
@@ -1102,12 +1208,7 @@ impl Render for IngestDialog {
                     })
                     .child(self.field("Back up to (optional)", &self.backup_dir, "ingest-backup")),
             )
-            .child(
-                v_flex()
-                    .gap_1()
-                    .child(Label::new("IPTC template").text_sm())
-                    .child(Select::new(&self.template_select).placeholder(NO_TEMPLATE)),
-            )
+            .child(self.render_iptc(cx))
             .when_some(status, |panel, (is_error, message)| {
                 panel.child(if is_error {
                     Alert::error("ingest-status", message)

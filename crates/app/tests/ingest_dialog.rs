@@ -12,8 +12,6 @@ use edit_ingest::{IngestCopyPayload, Volume};
 use gpui_kit::component::WindowExt as _;
 use gpui_kit::component::button::Button;
 use gpui_kit::component::input::InputState;
-use gpui_kit::component::searchable_list::SearchableVec;
-use gpui_kit::component::select::SelectState;
 use gpui_kit::test::{TestSupportExt as _, TestWindowExt as _};
 use gpui_kit::{
     AnyWindowHandle, AppContext, Bounds, Context, Entity, ScrollDelta, ScrollHandle,
@@ -102,9 +100,6 @@ fn fixture(cx: &mut TestAppContext, dir: &Path) -> Fixture {
                 let dest = cx.new(|cx| InputState::new(window, cx).default_value("~/Photos"));
                 let rule = cx.new(|cx| InputState::new(window, cx).default_value("{seq}"));
                 let backup = cx.new(|cx| InputState::new(window, cx));
-                let select = cx.new(|cx| {
-                    SelectState::new(SearchableVec::new(Vec::<String>::new()), None, window, cx)
-                });
                 let dialog = cx.new(|cx| {
                     IngestDialog::new(
                         state.clone(),
@@ -112,7 +107,7 @@ fn fixture(cx: &mut TestAppContext, dir: &Path) -> Fixture {
                         dest,
                         rule,
                         backup,
-                        select,
+                        window,
                         cx,
                     )
                 });
