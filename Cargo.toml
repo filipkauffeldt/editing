@@ -31,6 +31,8 @@ thiserror = { version = "2" }
 rusqlite = { version = "0.32", features = ["bundled"] }
 flume = { version = "0.11" }
 blake3 = { version = "1" }
+half = { version = "2" }
+lz4_flex = { version = "0.11", default-features = false, features = ["std"] }
 sysinfo = { version = "0.36" }
 edit-core = { path = "crates/edit-core" }
 edit-catalog = { path = "crates/edit-catalog" }
