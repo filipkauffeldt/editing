@@ -991,13 +991,7 @@ impl Browser {
             let rgba = cx
                 .background_executor()
                 .spawn(async move {
-                    let bytes = BrowsePreviewProvider::thumbnail_bytes(Path::new(&path))?;
-                    let decoded = image::load_from_memory(&bytes).ok()?;
-                    Some(
-                        decoded
-                            .thumbnail(THUMB_LONG_EDGE, THUMB_LONG_EDGE)
-                            .to_rgba8(),
-                    )
+                    BrowsePreviewProvider::decode_preview(Path::new(&path), Some(THUMB_LONG_EDGE))
                 })
                 .await;
             if let Some(rgba) = rgba {
