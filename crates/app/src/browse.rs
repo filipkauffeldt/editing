@@ -814,6 +814,18 @@ pub fn template_apply_payloads_with(
     captured_at: i64,
     replacements: Option<edit_metadata::CodeReplacements>,
 ) -> Vec<String> {
+    template_apply_payloads_opts(plan, fields_json, captured_at, replacements, false)
+}
+
+/// [`template_apply_payloads_with`]; `clear_empty` makes a field that
+/// expands empty clear its tags (form writes) instead of being skipped.
+pub fn template_apply_payloads_opts(
+    plan: &[TemplateApplyPlan],
+    fields_json: &str,
+    captured_at: i64,
+    replacements: Option<edit_metadata::CodeReplacements>,
+    clear_empty: bool,
+) -> Vec<String> {
     plan.iter()
         .map(|step| {
             serde_json::to_string(&edit_metadata::MetadataWritePayload {
@@ -824,6 +836,7 @@ pub fn template_apply_payloads_with(
                 session: None,
                 fields_json: fields_json.to_owned(),
                 replacements: replacements.clone(),
+                clear_empty,
             })
             .unwrap_or_else(|_| "{}".to_string())
         })

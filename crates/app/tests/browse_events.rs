@@ -165,10 +165,7 @@ fn apply_template_queues_the_selection_off_the_ui_thread(cx: &mut gpui_kit::Test
         });
     });
 
-    let fields = TemplateFields {
-        credit: Some("SHL".into()),
-        ..Default::default()
-    };
+    let fields = TemplateFields::default().with("credit", "SHL");
     cx.update(|cx| {
         browser.update(cx, |b, cx| {
             b.apply_template(fields.clone(), "press", cx);

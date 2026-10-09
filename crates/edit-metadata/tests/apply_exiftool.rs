@@ -129,6 +129,7 @@ fn template_apply_recipe_writes_the_selection() {
             session: None,
             fields_json: catalog.get_iptc_template(template_id).unwrap().fields_json,
             replacements: None,
+            clear_empty: false,
         })
         .unwrap();
         catalog
@@ -225,6 +226,7 @@ fn code_replacements_expand_into_the_written_caption() {
         session: None,
         fields_json: fields,
         replacements: Some(replacements),
+        clear_empty: false,
     })
     .unwrap();
     catalog

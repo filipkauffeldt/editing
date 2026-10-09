@@ -20,30 +20,71 @@
 //! codes (see `code_replacements`) on top of the variables, so a field can
 //! mix `{…}`, `=code=` and `\hot\` / `[hot]` invocations.
 
+use std::collections::BTreeMap;
+
 use serde::{Deserialize, Serialize};
 
 use crate::code_replacements::CodeReplacements;
+use crate::fields::FIELDS;
 
-/// Phase-1 IPTC field set (plan section 2.7): caption, keywords, headline,
-/// byline and title, credit, source, copyright, instructions, edit status,
-/// rights. `None` means the field is not part of the template.
-#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(default)]
-pub struct TemplateFields {
-    pub caption: Option<String>,
-    /// `;`-separated keywords, expanded as one string, split on write.
-    pub keywords: Option<String>,
-    pub headline: Option<String>,
-    pub byline: Option<String>,
-    pub byline_title: Option<String>,
-    pub credit: Option<String>,
-    pub source: Option<String>,
-    pub copyright: Option<String>,
-    pub instructions: Option<String>,
-    /// IIM-only field (no XMP counterpart), e.g. `New`, `Normal`.
-    pub edit_status: Option<String>,
-    /// XMP-xmpRights only (IIM has no usage-terms slot).
-    pub rights: Option<String>,
+/// Field values of a template or a form write, keyed by the ids of the
+/// field table (`crate::fields::FIELDS`). A missing key means the field is
+/// not part of the set. The keys of the first template version (`caption`,
+/// `keywords`, `byline`, `copyright`, `rights`, ...) are ids in the table,
+/// so stored templates keep loading; null and unknown keys are dropped.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct TemplateFields(BTreeMap<String, String>);
+
+impl TemplateFields {
+    /// Builder: set one field.
+    pub fn with(mut self, id: &str, value: impl Into<String>) -> Self {
+        self.set(id, Some(value.into()));
+        self
+    }
+
+    pub fn get(&self, id: &str) -> Option<&str> {
+        self.0.get(id).map(String::as_str)
+    }
+
+    /// Set or remove a field. Unknown ids are ignored.
+    pub fn set(&mut self, id: &str, value: Option<String>) {
+        if crate::fields::field(id).is_none() {
+            return;
+        }
+        match value {
+            Some(v) => self.0.insert(id.to_owned(), v),
+            None => self.0.remove(id),
+        };
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.0.is_empty()
+    }
+
+    pub fn len(&self) -> usize {
+        self.0.len()
+    }
+
+    pub fn contains(&self, id: &str) -> bool {
+        self.0.contains_key(id)
+    }
+}
+
+impl Serialize for TemplateFields {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        self.0.serialize(serializer)
+    }
+}
+
+impl<'de> Deserialize<'de> for TemplateFields {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        let raw = BTreeMap::<String, Option<String>>::deserialize(deserializer)?;
+        let mut fields = TemplateFields::default();
+        for (id, value) in raw {
+            fields.set(&id, value);
+        }
+        Ok(fields)
+    }
 }
 
 /// Per-photo values the field variables expand from.
@@ -252,10 +293,9 @@ fn substring(value: &str, spec: &str) -> String {
 
 impl TemplateFields {
     /// `TAG=value` pairs for the resident exiftool writer, dual XMP + IIM
-    /// per field (tag names verified against exiftool 13.x `-listx` and a
-    /// JPEG round-trip). List fields emit one repeat per value. A field
-    /// that expands empty is skipped, so an unavailable variable cannot
-    /// wipe existing metadata.
+    /// per field (tag names from the field table). List fields emit one
+    /// repeat per value. A field that expands empty is skipped, so an
+    /// unavailable variable cannot wipe existing metadata.
     pub fn to_tags(&self, vars: &TemplateVars) -> Vec<(String, String)> {
         self.to_tags_with(vars, None)
     }
@@ -266,48 +306,42 @@ impl TemplateFields {
         vars: &TemplateVars,
         codes: Option<&CodeReplacements>,
     ) -> Vec<(String, String)> {
+        self.to_tags_opts(vars, codes, false)
+    }
+
+    /// [`Self::to_tags_with`]; with `clear_empty` a field that expands
+    /// empty clears its tags (a form write that blanked the field) instead
+    /// of being skipped.
+    pub fn to_tags_opts(
+        &self,
+        vars: &TemplateVars,
+        codes: Option<&CodeReplacements>,
+        clear_empty: bool,
+    ) -> Vec<(String, String)> {
         let mut tags: Vec<(String, String)> = Vec::new();
-        let pairs: [(&Option<String>, &[&str]); 10] = [
-            (
-                &self.caption,
-                &["XMP-dc:Description", "IPTC:Caption-Abstract"],
-            ),
-            (&self.headline, &["XMP-photoshop:Headline", "IPTC:Headline"]),
-            (&self.byline, &["XMP-dc:Creator", "IPTC:By-line"]),
-            (
-                &self.byline_title,
-                &["XMP-photoshop:AuthorsPosition", "IPTC:By-lineTitle"],
-            ),
-            (&self.credit, &["XMP-photoshop:Credit", "IPTC:Credit"]),
-            (&self.source, &["XMP-photoshop:Source", "IPTC:Source"]),
-            (&self.copyright, &["XMP-dc:Rights", "IPTC:CopyrightNotice"]),
-            (
-                &self.instructions,
-                &["XMP-photoshop:Instructions", "IPTC:SpecialInstructions"],
-            ),
-            (&self.edit_status, &["IPTC:EditStatus"]),
-            (&self.rights, &["XMP-xmpRights:UsageTerms"]),
-        ];
-        for (raw, names) in pairs {
-            let Some(text) = raw else { continue };
-            let value = expand_with_codes(text, vars, codes).trim().to_owned();
-            if value.is_empty() {
+        for spec in FIELDS {
+            let Some(raw) = self.get(spec.id) else {
+                continue;
+            };
+            let values = field_values(spec.is_list(), raw, vars, codes);
+            if values.is_empty() {
+                if clear_empty {
+                    tags.extend(spec.tags().map(|name| (name.to_owned(), String::new())));
+                }
                 continue;
             }
-            for name in names {
-                tags.push(((*name).to_owned(), value.clone()));
+            for value in values {
+                for name in spec.tags() {
+                    tags.push((name.to_owned(), value.clone()));
+                }
             }
-        }
-        for keyword in self.keywords_list_with(vars, codes) {
-            tags.push(("XMP-dc:Subject".into(), keyword.clone()));
-            tags.push(("IPTC:Keywords".into(), keyword));
         }
         tags
     }
 
-    /// Every field in the template with its expansion for one photo, in
-    /// form order, for the editor's preview. An empty value is a field
-    /// the write would skip.
+    /// Every field in the set with its expansion for one photo, in table
+    /// order, for the editor's preview. An empty value is a field the
+    /// write would skip.
     pub fn preview(&self, vars: &TemplateVars) -> Vec<(&'static str, String)> {
         self.preview_with(vars, None)
     }
@@ -318,39 +352,20 @@ impl TemplateFields {
         vars: &TemplateVars,
         codes: Option<&CodeReplacements>,
     ) -> Vec<(&'static str, String)> {
-        let single = [
-            ("Caption", &self.caption),
-            ("Headline", &self.headline),
-            ("Byline", &self.byline),
-            ("Byline title", &self.byline_title),
-            ("Credit", &self.credit),
-            ("Source", &self.source),
-            ("Copyright", &self.copyright),
-            ("Instructions", &self.instructions),
-            ("Edit status", &self.edit_status),
-            ("Rights", &self.rights),
-        ];
-        let mut lines = Vec::new();
-        if self.keywords.is_some() {
-            lines.push(("Keywords", self.keywords_list_with(vars, codes).join(" | ")));
-        }
-        for (label, raw) in single {
-            if let Some(text) = raw {
-                lines.push((
-                    label,
-                    expand_with_codes(text, vars, codes).trim().to_owned(),
-                ));
-            }
-        }
-        lines
+        FIELDS
+            .iter()
+            .filter_map(|spec| {
+                let raw = self.get(spec.id)?;
+                let values = field_values(spec.is_list(), raw, vars, codes);
+                Some((spec.label, values.join(" | ")))
+            })
+            .collect()
     }
 
     /// XMP-only half of [`Self::to_tags`], for `.xmp` sidecar targets
     /// (raw files are stamped in a sidecar per the metadata-storage
     /// decision: XMP sidecar always for raws). IIM tags have no meaning
-    /// in an XMP packet and are dropped; the IIM-only `EditStatus` and
-    /// the IIM-only dialect pairs lose their IIM copy and keep the XMP
-    /// side (or nothing, for `edit_status`).
+    /// in an XMP packet and are dropped, so IIM-only fields write nothing.
     pub fn to_xmp_tags(&self, vars: &TemplateVars) -> Vec<(String, String)> {
         self.to_xmp_tags_with(vars, None)
     }
@@ -361,29 +376,40 @@ impl TemplateFields {
         vars: &TemplateVars,
         codes: Option<&CodeReplacements>,
     ) -> Vec<(String, String)> {
-        self.to_tags_with(vars, codes)
-            .into_iter()
-            .filter(|(name, _)| name.starts_with("XMP-"))
-            .collect()
+        xmp_only(self.to_tags_with(vars, codes))
     }
+}
 
-    fn keywords_list_with(
-        &self,
-        vars: &TemplateVars,
-        codes: Option<&CodeReplacements>,
-    ) -> Vec<String> {
-        let Some(raw) = &self.keywords else {
-            return vec![];
-        };
-        let expanded = expand_with_codes(raw, vars, codes);
-        // Semicolons only: a comma is ordinary text (`Smith, John`), so
-        // splitting on it would chop names apart.
+/// Keep the XMP tags of a tag list.
+pub fn xmp_only(tags: Vec<(String, String)>) -> Vec<(String, String)> {
+    tags.into_iter()
+        .filter(|(name, _)| name.starts_with("XMP-"))
+        .collect()
+}
+
+/// Expanded values of one field: one for a plain field, one per `;` part
+/// for a list. Semicolons only: a comma is ordinary text (`Smith, John`).
+fn field_values(
+    list: bool,
+    raw: &str,
+    vars: &TemplateVars,
+    codes: Option<&CodeReplacements>,
+) -> Vec<String> {
+    let expanded = expand_with_codes(raw, vars, codes);
+    if list {
         expanded
             .split(';')
             .map(str::trim)
-            .filter(|kw| !kw.is_empty())
+            .filter(|v| !v.is_empty())
             .map(str::to_owned)
             .collect()
+    } else {
+        let value = expanded.trim();
+        if value.is_empty() {
+            vec![]
+        } else {
+            vec![value.to_owned()]
+        }
     }
 }
 
@@ -479,11 +505,9 @@ mod tests {
         use crate::code_replacements::CodeReplacements;
 
         let codes = CodeReplacements::parse("h1\tSHL\n");
-        let f = TemplateFields {
-            caption: Some("\\h1\\ {date}".into()),
-            credit: Some("=h1=".into()),
-            ..Default::default()
-        };
+        let f = TemplateFields::default()
+            .with("caption", "\\h1\\ {date}")
+            .with("credit", "=h1=");
         assert_eq!(
             f.to_tags_with(&vars(), Some(&codes)),
             vec![
@@ -496,87 +520,74 @@ mod tests {
         assert_eq!(
             f.preview_with(&vars(), Some(&codes)),
             vec![
-                ("Caption", "SHL 2026-10-07".to_owned()),
-                ("Credit", "SHL".to_owned()),
+                ("Description", "SHL 2026-10-07".to_owned()),
+                ("Credit line", "SHL".to_owned()),
             ]
         );
     }
 
     #[test]
     fn to_tags_dual_writes_each_field() {
-        let f = TemplateFields {
-            caption: Some("{date} run".into()),
-            keywords: Some("ice; {session}, water".into()),
-            byline: Some("Anna Foto".into()),
-            byline_title: Some("staff photographer".into()),
-            credit: Some("SHL".into()),
-            source: Some("Agency".into()),
-            copyright: Some("(c) {yyyy} SHL".into()),
-            edit_status: Some("New".into()),
-            rights: Some("free use".into()),
-            ..Default::default()
-        };
+        let f = TemplateFields::default()
+            .with("caption", "{date} run")
+            .with("keywords", "ice; {session}, water")
+            .with("byline", "Anna Foto")
+            .with("edit_status", "New")
+            .with("rights", "free use")
+            .with("contact_email", "a@b.c");
         assert_eq!(
             f.to_tags(&vars()),
             vec![
                 ("XMP-dc:Description".into(), "2026-10-07 run".into()),
                 ("IPTC:Caption-Abstract".into(), "2026-10-07 run".into()),
-                ("XMP-dc:Creator".into(), "Anna Foto".into()),
-                ("IPTC:By-line".into(), "Anna Foto".into()),
-                (
-                    "XMP-photoshop:AuthorsPosition".into(),
-                    "staff photographer".into()
-                ),
-                ("IPTC:By-lineTitle".into(), "staff photographer".into()),
-                ("XMP-photoshop:Credit".into(), "SHL".into()),
-                ("IPTC:Credit".into(), "SHL".into()),
-                ("XMP-photoshop:Source".into(), "Agency".into()),
-                ("IPTC:Source".into(), "Agency".into()),
-                ("XMP-dc:Rights".into(), "(c) 2026 SHL".into()),
-                ("IPTC:CopyrightNotice".into(), "(c) 2026 SHL".into()),
-                ("IPTC:EditStatus".into(), "New".into()),
-                ("XMP-xmpRights:UsageTerms".into(), "free use".into()),
                 ("XMP-dc:Subject".into(), "ice".into()),
                 ("IPTC:Keywords".into(), "ice".into()),
                 ("XMP-dc:Subject".into(), "2026-10-07 run, water".into()),
                 ("IPTC:Keywords".into(), "2026-10-07 run, water".into()),
+                ("IPTC:EditStatus".into(), "New".into()),
+                ("XMP-dc:Creator".into(), "Anna Foto".into()),
+                ("IPTC:By-line".into(), "Anna Foto".into()),
+                ("XMP-xmpRights:UsageTerms".into(), "free use".into()),
+                ("XMP-iptcCore:CreatorWorkEmail".into(), "a@b.c".into()),
             ]
         );
     }
 
     #[test]
-    fn empty_expansions_are_skipped() {
-        let f = TemplateFields {
-            caption: Some("{camera}".into()),
-            byline: Some(" ".into()),
-            keywords: Some(" ; ".into()),
-            ..Default::default()
-        };
+    fn empty_expansions_are_skipped_or_cleared() {
+        let f = TemplateFields::default()
+            .with("caption", "{camera}")
+            .with("byline", " ")
+            .with("keywords", " ; ");
         let no_cam = TemplateVars {
             camera: None,
             ..vars()
         };
         assert!(f.to_tags(&no_cam).is_empty());
+        let cleared = f.to_tags_opts(&no_cam, None, true);
+        assert!(cleared.contains(&("XMP-dc:Description".into(), String::new())));
+        assert!(cleared.contains(&("IPTC:Keywords".into(), String::new())));
+        assert_eq!(cleared.len(), 6);
     }
 
     #[test]
     fn commas_are_ordinary_keyword_text() {
-        let f = TemplateFields {
-            keywords: Some("Smith, John; ice".into()),
-            ..Default::default()
-        };
-        let pairs: Vec<String> = f.keywords_list_with(&vars(), None).into_iter().collect();
-        assert_eq!(pairs, vec!["Smith, John", "ice"]);
+        let f = TemplateFields::default().with("keywords", "Smith, John; ice");
+        let tags = f.to_tags(&vars());
+        let subjects: Vec<&str> = tags
+            .iter()
+            .filter(|(n, _)| n == "XMP-dc:Subject")
+            .map(|(_, v)| v.as_str())
+            .collect();
+        assert_eq!(subjects, vec!["Smith, John", "ice"]);
     }
 
     #[test]
     fn preview_lists_every_set_field_expanded() {
-        let f = TemplateFields {
-            caption: Some("{base} #{seq}".into()),
-            keywords: Some("ice; Smith, John".into()),
-            credit: Some("{camera}".into()),
-            ..Default::default()
-        };
+        let f = TemplateFields::default()
+            .with("caption", "{base} #{seq}")
+            .with("keywords", "ice; Smith, John")
+            .with("credit", "{camera}");
         let no_cam = TemplateVars {
             camera: None,
             ..vars()
@@ -584,9 +595,9 @@ mod tests {
         assert_eq!(
             f.preview(&no_cam),
             vec![
+                ("Description", "AHQ_0701 #07".to_owned()),
                 ("Keywords", "ice | Smith, John".to_owned()),
-                ("Caption", "AHQ_0701 #07".to_owned()),
-                ("Credit", String::new()),
+                ("Credit line", String::new()),
             ]
         );
         assert!(TemplateFields::default().preview(&vars()).is_empty());
@@ -594,34 +605,43 @@ mod tests {
 
     #[test]
     fn xmp_only_tags_drop_the_iim_dialect() {
-        let f = TemplateFields {
-            caption: Some("cap".into()),
-            credit: Some("SHL".into()),
-            edit_status: Some("New".into()),
-            keywords: Some("ice".into()),
-            ..Default::default()
-        };
+        let f = TemplateFields::default()
+            .with("caption", "cap")
+            .with("credit", "SHL")
+            .with("edit_status", "New")
+            .with("keywords", "ice");
         assert_eq!(
             f.to_xmp_tags(&vars()),
             vec![
                 ("XMP-dc:Description".into(), "cap".into()),
-                ("XMP-photoshop:Credit".into(), "SHL".into()),
                 ("XMP-dc:Subject".into(), "ice".into()),
+                ("XMP-photoshop:Credit".into(), "SHL".into()),
             ]
         );
     }
 
     #[test]
     fn fields_json_round_trips() {
-        let f = TemplateFields {
-            credit: Some("SHL".into()),
-            ..Default::default()
-        };
+        let f = TemplateFields::default().with("credit", "SHL");
         let json = serde_json::to_string(&f).unwrap();
         assert_eq!(serde_json::from_str::<TemplateFields>(&json).unwrap(), f);
         assert_eq!(
             serde_json::from_str::<TemplateFields>("{}").unwrap(),
             TemplateFields::default()
         );
+    }
+
+    #[test]
+    fn stored_version_one_templates_still_load() {
+        let old = r#"{"caption":"c","keywords":null,"headline":null,"byline":"B",
+            "byline_title":null,"credit":"SHL","source":null,"copyright":"(c)",
+            "instructions":null,"edit_status":"New","rights":"free","gone":"x"}"#;
+        let f: TemplateFields = serde_json::from_str(old).unwrap();
+        assert_eq!(f.get("caption"), Some("c"));
+        assert_eq!(f.get("byline"), Some("B"));
+        assert_eq!(f.get("copyright"), Some("(c)"));
+        assert_eq!(f.get("rights"), Some("free"));
+        assert_eq!(f.get("keywords"), None);
+        assert_eq!(f.get("gone"), None);
     }
 }

@@ -19,7 +19,7 @@ use std::sync::Arc;
 
 use edit_catalog::Catalog;
 use edit_catalog::models::IptcTemplate;
-use edit_metadata::{CodeReplacements, TemplateFields};
+use edit_metadata::{CodeReplacements, FIELDS, FieldSpec, Group, Kind, TemplateFields};
 use gpui_kit::component::WindowExt as _;
 use gpui_kit::component::button::Button;
 use gpui_kit::component::form::{Field, Form};
@@ -27,7 +27,7 @@ use gpui_kit::component::input::{Input, InputState, Textarea, TextareaState};
 use gpui_kit::component::label::Label;
 use gpui_kit::component::searchable_list::SearchableVec;
 use gpui_kit::component::select::{Select, SelectState};
-use gpui_kit::component::{ActiveTheme as _, Disableable as _, h_flex, v_flex};
+use gpui_kit::component::{ActiveTheme as _, Disableable as _, StyledExt as _, h_flex, v_flex};
 use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::*;
 
@@ -48,17 +48,8 @@ pub struct TemplateEditor {
     templates: Vec<IptcTemplate>,
     names: Entity<SelectState<SearchableVec<String>>>,
     name: Entity<InputState>,
-    caption: Entity<TextareaState>,
-    keywords: Entity<InputState>,
-    headline: Entity<InputState>,
-    byline: Entity<InputState>,
-    byline_title: Entity<InputState>,
-    credit: Entity<InputState>,
-    source: Entity<InputState>,
-    copyright: Entity<InputState>,
-    instructions: Entity<InputState>,
-    edit_status: Entity<InputState>,
-    rights: Entity<InputState>,
+    /// One widget per row of the field table, in table order.
+    widgets: Vec<(&'static FieldSpec, FieldInput)>,
     /// Path input for the PM-format code replacement file.
     replacement_path: Entity<InputState>,
     /// Parsed codes used by Preview and baked into Apply payloads.
@@ -76,10 +67,49 @@ fn value_of(state: &Entity<InputState>, cx: &App) -> Option<String> {
     (!trimmed.is_empty()).then_some(trimmed)
 }
 
-fn textarea_value_of(state: &Entity<TextareaState>, cx: &App) -> Option<String> {
-    let text: String = state.read(cx).value().into();
-    let trimmed = text.trim().to_owned();
-    (!trimmed.is_empty()).then_some(trimmed)
+/// The widget behind one table row: a text box, or a textarea for the
+/// multi-line kinds. Template values are free text (selects included),
+/// so `{variables}` work everywhere.
+enum FieldInput {
+    Line(Entity<InputState>),
+    Area(Entity<TextareaState>),
+}
+
+impl FieldInput {
+    fn new(spec: &FieldSpec, window: &mut Window, cx: &mut Context<TemplateEditor>) -> Self {
+        match spec.kind {
+            Kind::Multi(_) => Self::Area(cx.new(|cx| TextareaState::new(window, cx))),
+            _ => Self::Line(cx.new(|cx| InputState::new(window, cx))),
+        }
+    }
+
+    /// Trimmed text; an empty box registers no field.
+    fn value(&self, cx: &App) -> Option<String> {
+        let text: String = match self {
+            Self::Line(state) => state.read(cx).value().into(),
+            Self::Area(state) => state.read(cx).value().into(),
+        };
+        let trimmed = text.trim().to_owned();
+        (!trimmed.is_empty()).then_some(trimmed)
+    }
+
+    fn set(&self, value: Option<&str>, window: &mut Window, cx: &mut Context<TemplateEditor>) {
+        let text = value.unwrap_or_default().to_owned();
+        match self {
+            Self::Line(state) => state.update(cx, |state, cx| state.set_value(text, window, cx)),
+            Self::Area(state) => state.update(cx, |state, cx| state.set_value(text, window, cx)),
+        }
+    }
+
+    fn render(&self, spec: &FieldSpec) -> AnyElement {
+        match (self, spec.kind) {
+            (Self::Line(state), _) => Input::new(state).id(spec.id).into_any_element(),
+            (Self::Area(state), Kind::Multi(rows)) => Textarea::new(state)
+                .h(px(rows as f32 * 18.0))
+                .into_any_element(),
+            (Self::Area(state), _) => Textarea::new(state).into_any_element(),
+        }
+    }
 }
 
 impl TemplateEditor {
@@ -92,22 +122,10 @@ impl TemplateEditor {
         let names = cx
             .new(|cx| SelectState::new(SearchableVec::new(Vec::<String>::new()), None, window, cx));
         let name = cx.new(|cx| InputState::new(window, cx).placeholder("Press pass"));
-        let caption = cx.new(|cx| {
-            TextareaState::new(window, cx).placeholder("{date} {seq:3} — caption with {camera}")
-        });
-        let keywords = cx.new(|cx| InputState::new(window, cx).placeholder("ice; {session}"));
-        let headline = cx.new(|cx| InputState::new(window, cx).placeholder("Season opener"));
-        let byline = cx.new(|cx| InputState::new(window, cx).placeholder("Anna Foto"));
-        let byline_title =
-            cx.new(|cx| InputState::new(window, cx).placeholder("staff photographer"));
-        let credit = cx.new(|cx| InputState::new(window, cx).placeholder("SHL"));
-        let source = cx.new(|cx| InputState::new(window, cx).placeholder("Agency"));
-        let copyright = cx.new(|cx| InputState::new(window, cx).placeholder("(c) {yyyy} SHL"));
-        let instructions =
-            cx.new(|cx| InputState::new(window, cx).placeholder("raw key; not for publication"));
-        let edit_status = cx.new(|cx| InputState::new(window, cx).placeholder("New"));
-        let rights =
-            cx.new(|cx| InputState::new(window, cx).placeholder("free use, credit required"));
+        let widgets = FIELDS
+            .iter()
+            .map(|spec| (spec, FieldInput::new(spec, window, cx)))
+            .collect();
         let replacement_path =
             cx.new(|cx| InputState::new(window, cx).placeholder("/path/to/code-replacements.tsv"));
         // Restore the last replacement file and parse it now, so Preview
@@ -132,17 +150,7 @@ impl TemplateEditor {
             templates: Vec::new(),
             names,
             name,
-            caption,
-            keywords,
-            headline,
-            byline,
-            byline_title,
-            credit,
-            source,
-            copyright,
-            instructions,
-            edit_status,
-            rights,
+            widgets,
             replacement_path,
             replacements,
             replacement_status,
@@ -175,19 +183,11 @@ impl TemplateEditor {
 
     /// Form values as the stored model. A blank box registers no field.
     fn fields(&self, cx: &App) -> TemplateFields {
-        TemplateFields {
-            caption: textarea_value_of(&self.caption, cx),
-            keywords: value_of(&self.keywords, cx),
-            headline: value_of(&self.headline, cx),
-            byline: value_of(&self.byline, cx),
-            byline_title: value_of(&self.byline_title, cx),
-            credit: value_of(&self.credit, cx),
-            source: value_of(&self.source, cx),
-            copyright: value_of(&self.copyright, cx),
-            instructions: value_of(&self.instructions, cx),
-            edit_status: value_of(&self.edit_status, cx),
-            rights: value_of(&self.rights, cx),
+        let mut fields = TemplateFields::default();
+        for (spec, input) in &self.widgets {
+            fields.set(spec.id, input.value(cx));
         }
+        fields
     }
 
     fn selected_template(&self, cx: &App) -> Option<IptcTemplate> {
@@ -206,44 +206,15 @@ impl TemplateEditor {
         state.update(cx, |state, cx| state.set_value(text, window, cx));
     }
 
-    fn set_textarea(
-        &self,
-        state: &Entity<TextareaState>,
-        value: Option<&str>,
-        window: &mut Window,
-        cx: &mut Context<Self>,
-    ) {
-        let text = value.unwrap_or_default().to_owned();
-        state.update(cx, |state, cx| state.set_value(text, window, cx));
-    }
-
     /// Fill the form from a template row and mark the editor as editing
     /// that row (Save updates; Delete removes it).
     fn fill_from(&mut self, row: &IptcTemplate, window: &mut Window, cx: &mut Context<Self>) {
         let fields: TemplateFields = serde_json::from_str(&row.fields_json).unwrap_or_default();
         self.editing_id = Some(row.id);
         self.set_input(&self.name, Some(&row.name), window, cx);
-        self.set_textarea(&self.caption, fields.caption.as_deref(), window, cx);
-        self.set_input(&self.keywords, fields.keywords.as_deref(), window, cx);
-        self.set_input(&self.headline, fields.headline.as_deref(), window, cx);
-        self.set_input(&self.byline, fields.byline.as_deref(), window, cx);
-        self.set_input(
-            &self.byline_title,
-            fields.byline_title.as_deref(),
-            window,
-            cx,
-        );
-        self.set_input(&self.credit, fields.credit.as_deref(), window, cx);
-        self.set_input(&self.source, fields.source.as_deref(), window, cx);
-        self.set_input(&self.copyright, fields.copyright.as_deref(), window, cx);
-        self.set_input(
-            &self.instructions,
-            fields.instructions.as_deref(),
-            window,
-            cx,
-        );
-        self.set_input(&self.edit_status, fields.edit_status.as_deref(), window, cx);
-        self.set_input(&self.rights, fields.rights.as_deref(), window, cx);
+        for (spec, input) in &self.widgets {
+            input.set(fields.get(spec.id), window, cx);
+        }
         self.preview.clear();
         self.status = format!("Editing template \"{}\".", row.name);
         cx.notify();
@@ -253,21 +224,9 @@ impl TemplateEditor {
     fn start_new(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         self.editing_id = None;
         self.set_input(&self.name, None, window, cx);
-        for state in [
-            &self.keywords,
-            &self.headline,
-            &self.byline,
-            &self.byline_title,
-            &self.credit,
-            &self.source,
-            &self.copyright,
-            &self.instructions,
-            &self.edit_status,
-            &self.rights,
-        ] {
-            self.set_input(state, None, window, cx);
+        for (_, input) in &self.widgets {
+            input.set(None, window, cx);
         }
-        self.set_textarea(&self.caption, None, window, cx);
         self.preview.clear();
         self.status = "Fill the fields, Save, then pick and Apply to selection.".to_string();
         cx.notify();
@@ -356,7 +315,7 @@ impl TemplateEditor {
     /// editor mirrors its status line.
     fn apply_selected(&mut self, cx: &mut Context<Self>) {
         let fields = self.fields(cx);
-        if fields == TemplateFields::default() {
+        if fields.is_empty() {
             self.status = "The form has no fields to write.".to_string();
             cx.notify();
             return;
@@ -504,68 +463,24 @@ impl TemplateEditor {
     }
 
     fn render_form(&self) -> impl IntoElement {
-        Form::new()
-            .columns(2)
-            .child(
-                Field::new()
-                    .label("Name")
-                    .child(Input::new(&self.name).id("template-name")),
-            )
-            .child(
-                Field::new()
-                    .label("Caption")
-                    .child(Textarea::new(&self.caption).h(px(72.0))),
-            )
-            .child(
-                Field::new()
-                    .label("Keywords (; separated)")
-                    .child(Input::new(&self.keywords).id("template-keywords")),
-            )
-            .child(
-                Field::new()
-                    .label("Headline")
-                    .child(Input::new(&self.headline).id("template-headline")),
-            )
-            .child(
-                Field::new()
-                    .label("Byline")
-                    .child(Input::new(&self.byline).id("template-byline")),
-            )
-            .child(
-                Field::new()
-                    .label("Byline title")
-                    .child(Input::new(&self.byline_title).id("template-byline-title")),
-            )
-            .child(
-                Field::new()
-                    .label("Credit")
-                    .child(Input::new(&self.credit).id("template-credit")),
-            )
-            .child(
-                Field::new()
-                    .label("Source")
-                    .child(Input::new(&self.source).id("template-source")),
-            )
-            .child(
-                Field::new()
-                    .label("Copyright")
-                    .child(Input::new(&self.copyright).id("template-copyright")),
-            )
-            .child(
-                Field::new()
-                    .label("Instructions")
-                    .child(Input::new(&self.instructions).id("template-instructions")),
-            )
-            .child(
-                Field::new()
-                    .label("Edit status")
-                    .child(Input::new(&self.edit_status).id("template-edit-status")),
-            )
-            .child(
-                Field::new()
-                    .label("Rights")
-                    .child(Input::new(&self.rights).id("template-rights")),
-            )
+        let name = Field::new()
+            .label("Name")
+            .child(Input::new(&self.name).id("template-name"));
+        let groups = Group::ALL.iter().map(|group| {
+            let rows = self
+                .widgets
+                .iter()
+                .filter(|(spec, _)| spec.group == *group)
+                .map(|(spec, input)| Field::new().label(spec.label).child(input.render(spec)));
+            v_flex()
+                .gap_2()
+                .child(div().font_semibold().child(group.label()))
+                .child(Form::new().columns(2).children(rows))
+        });
+        v_flex()
+            .gap_3()
+            .child(Form::new().columns(2).child(name))
+            .children(groups)
     }
 }
 
