@@ -214,13 +214,14 @@ fn row_ingest_file(row: &Row) -> rusqlite::Result<IngestFile> {
         state,
         error: row.get(11)?,
         created_at: row.get(12)?,
+        locked: row.get::<_, i64>(13)? != 0,
     })
 }
 
 /// The column list shared by every ingest-file SELECT, in [`row_ingest_file`]
 /// order.
 const INGEST_FILE_COLUMNS: &str = "id, batch_id, original_name, taken_at, bytes, source_path, \
-                                   dest_path, backup_path, blake3, photo_id, state, error, created_at";
+                                   dest_path, backup_path, blake3, photo_id, state, error, created_at, locked";
 
 /// The column list shared by every photo SELECT, in [`row_photo`] order.
 const PHOTO_COLUMNS: &str = "id, root_id, path, dir, base_name, ext, kind, bytes, mtime, width, \
@@ -867,12 +868,21 @@ impl Catalog {
         })
     }
 
+    /// Delete a template row. Ingest batches that used it keep their
+    /// history: the reference is cleared (the batch's job payload still
+    /// holds the frozen fields), so a used template can be deleted.
     pub fn delete_iptc_template(&self, id: i64) -> Result<()> {
         self.with_conn(|conn| {
-            let n = conn.execute("DELETE FROM iptc_templates WHERE id = ?1", [id])?;
+            let tx = conn.unchecked_transaction()?;
+            tx.execute(
+                "UPDATE ingest_batches SET template_id = NULL WHERE template_id = ?1",
+                [id],
+            )?;
+            let n = tx.execute("DELETE FROM iptc_templates WHERE id = ?1", [id])?;
             if n == 0 {
                 return Err(not_found("iptc_template", id));
             }
+            tx.commit()?;
             Ok(())
         })
     }
@@ -1079,8 +1089,8 @@ impl Catalog {
         self.with_conn(|conn| {
             conn.execute(
                 "INSERT INTO ingest_files
-                   (batch_id, original_name, taken_at, bytes, source_path, state, created_at)
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+                   (batch_id, original_name, taken_at, bytes, source_path, state, created_at, locked)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
                 params![
                     file.batch_id,
                     file.original_name,
@@ -1088,7 +1098,8 @@ impl Catalog {
                     file.bytes,
                     file.source_path,
                     file.state.as_str(),
-                    now_unix()
+                    now_unix(),
+                    file.locked
                 ],
             )?;
             Ok(conn.last_insert_rowid())
@@ -1151,8 +1162,26 @@ impl Catalog {
         blake3: &str,
         photo_id: Option<i64>,
     ) -> Result<()> {
+        self.complete_ingest_file_with_job(id, dest_path, backup_path, blake3, photo_id, None)
+    }
+
+    /// [`Catalog::complete_ingest_file`] plus one follow-up job, in a single
+    /// transaction. The file is `cataloged` exactly when its job is queued:
+    /// a crash before the commit leaves a recoverable `renaming` row with
+    /// no job, and a crash after leaves both, so the job is never lost and
+    /// never queued for a file that is not complete.
+    pub fn complete_ingest_file_with_job(
+        &self,
+        id: i64,
+        dest_path: &str,
+        backup_path: Option<&str>,
+        blake3: &str,
+        photo_id: Option<i64>,
+        job: Option<(crate::jobs::JobKind, &str)>,
+    ) -> Result<()> {
         self.with_conn(|conn| {
-            let n = conn.execute(
+            let tx = conn.unchecked_transaction()?;
+            let n = tx.execute(
                 "UPDATE ingest_files
                     SET state = 'cataloged', dest_path = ?1, backup_path = ?2,
                         blake3 = ?3, photo_id = ?4, error = NULL
@@ -1162,6 +1191,10 @@ impl Catalog {
             if n == 0 {
                 return Err(not_found("ingest_file", id));
             }
+            if let Some((kind, payload)) = job {
+                crate::jobs::enqueue(&tx, kind, payload)?;
+            }
+            tx.commit()?;
             Ok(())
         })
     }
@@ -1235,6 +1268,7 @@ impl Catalog {
 mod tests {
     use super::*;
     use crate::db::tests::scratch_db;
+    use crate::jobs::JobKind;
     use edit_core::IngestFileState;
 
     fn photo_fixture(root_id: i64, n: i64) -> NewPhoto {
@@ -1441,6 +1475,7 @@ mod tests {
                 bytes: 1024,
                 source_path: "/media/card/DCIM/DSC01234.NEF".into(),
                 state: IngestFileState::Queued,
+                locked: false,
             })
             .unwrap();
 
@@ -1528,6 +1563,7 @@ mod tests {
                 bytes: 5,
                 source_path: "/open".into(),
                 state: IngestFileState::Copying,
+                locked: false,
             })
             .unwrap();
         assert_eq!(
@@ -1565,6 +1601,91 @@ mod tests {
         assert_eq!(completed.jpeg_photo_id, Some(jpeg));
 
         assert!(db.set_item_side(999_999, jpeg, false).is_err());
+        std::fs::remove_file(path).ok();
+    }
+
+    fn batch_fixture(template_id: Option<i64>) -> NewIngestBatch {
+        NewIngestBatch {
+            volume_uuid: None,
+            volume_label: None,
+            session_name: Some("shoot".into()),
+            dest_dir: "/photos".into(),
+            backup_dir: None,
+            template_id,
+            state: "running".into(),
+        }
+    }
+
+    #[test]
+    fn deleting_a_used_template_keeps_the_batch_history() {
+        let path = scratch_db("template-delete");
+        let db = Catalog::open(&path).unwrap();
+        let template = db
+            .insert_iptc_template("press", r#"{"credit":"x"}"#, "global")
+            .unwrap();
+        let batch = db
+            .create_ingest_batch(&batch_fixture(Some(template)))
+            .unwrap();
+        assert_eq!(
+            db.get_ingest_batch(batch).unwrap().template_id,
+            Some(template)
+        );
+
+        db.delete_iptc_template(template).unwrap();
+        assert!(db.get_iptc_template(template).is_err());
+        assert_eq!(db.get_ingest_batch(batch).unwrap().template_id, None);
+        assert!(db.delete_iptc_template(template).is_err());
+        std::fs::remove_file(path).ok();
+    }
+
+    #[test]
+    fn completing_an_ingest_file_queues_its_job_in_the_same_commit() {
+        let path = scratch_db("complete-with-job");
+        let db = Catalog::open(&path).unwrap();
+        let batch = db.create_ingest_batch(&batch_fixture(None)).unwrap();
+        let file = db
+            .record_ingest_file(&NewIngestFile {
+                batch_id: batch,
+                original_name: "DSC01234.NEF".into(),
+                taken_at: Some(1_700_000_000),
+                bytes: 1024,
+                source_path: "/card/DSC01234.NEF".into(),
+                state: IngestFileState::Queued,
+                locked: false,
+            })
+            .unwrap();
+
+        // A failed completion (unknown row) must not leave a stray job.
+        assert!(
+            db.complete_ingest_file_with_job(
+                999_999,
+                "/photos/a.NEF",
+                None,
+                "ab12",
+                None,
+                Some((JobKind::MetadataWrite, "{}")),
+            )
+            .is_err()
+        );
+        assert!(db.list_jobs(10).unwrap().is_empty());
+
+        db.complete_ingest_file_with_job(
+            file,
+            "/photos/a.NEF",
+            None,
+            "ab12",
+            None,
+            Some((JobKind::MetadataWrite, r#"{"item_id":1}"#)),
+        )
+        .unwrap();
+        let jobs = db.list_jobs(10).unwrap();
+        assert_eq!(jobs.len(), 1);
+        assert_eq!(jobs[0].kind, JobKind::MetadataWrite);
+        assert_eq!(jobs[0].payload_json, r#"{"item_id":1}"#);
+        assert_eq!(
+            db.list_ingest_files(batch).unwrap()[0].state,
+            IngestFileState::Cataloged
+        );
         std::fs::remove_file(path).ok();
     }
 

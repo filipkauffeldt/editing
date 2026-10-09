@@ -821,6 +821,7 @@ pub fn template_apply_payloads_with(
                 paths: step.paths.clone(),
                 sequence: step.sequence,
                 captured_at,
+                session: None,
                 fields_json: fields_json.to_owned(),
                 replacements: replacements.clone(),
             })

@@ -20,28 +20,26 @@ use std::sync::Arc;
 use edit_catalog::Catalog;
 use edit_catalog::models::IptcTemplate;
 use edit_metadata::{CodeReplacements, TemplateFields};
+use gpui_kit::component::WindowExt as _;
 use gpui_kit::component::button::Button;
 use gpui_kit::component::form::{Field, Form};
 use gpui_kit::component::input::{Input, InputState, Textarea, TextareaState};
 use gpui_kit::component::label::Label;
 use gpui_kit::component::searchable_list::SearchableVec;
 use gpui_kit::component::select::{Select, SelectState};
-use gpui_kit::component::{ActiveTheme as _, Disableable as _, StyledExt as _, h_flex, v_flex};
+use gpui_kit::component::{ActiveTheme as _, Disableable as _, h_flex, v_flex};
 use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::*;
 
-use crate::ingest::AppState;
-use app::views::Browser;
+use crate::views::Browser;
 
 actions!(templates, [OpenTemplates]);
 
-/// Catalog setting holding the last loaded code replacement file path.
-const REPLACEMENTS_SETTING: &str = "code_replacements_path";
+use crate::ingest_job::REPLACEMENTS_SETTING;
 
 /// The overlay dialog. Owns the form and the catalog rows; the browser
 /// owns the job queue and badges, so apply is a thin read + enqueue.
 pub struct TemplateEditor {
-    state: Entity<AppState>,
     browser: Entity<Browser>,
     catalog: Arc<Catalog>,
     /// Template row being edited; `None` means the next Save inserts.
@@ -86,7 +84,6 @@ fn textarea_value_of(state: &Entity<TextareaState>, cx: &App) -> Option<String> 
 
 impl TemplateEditor {
     pub fn new(
-        state: Entity<AppState>,
         browser: Entity<Browser>,
         catalog: Arc<Catalog>,
         window: &mut Window,
@@ -129,7 +126,6 @@ impl TemplateEditor {
         }
 
         let mut editor = Self {
-            state,
             browser,
             catalog,
             editing_id: None,
@@ -155,12 +151,6 @@ impl TemplateEditor {
         };
         editor.reload(None, window, cx);
         editor
-    }
-
-    fn close(&mut self, cx: &mut Context<Self>) {
-        self.state.update(cx, |state, cx| {
-            state.set_templates_open(false, cx);
-        });
     }
 
     /// Reload template rows from the catalog and rebuild the picker,
@@ -579,86 +569,82 @@ impl TemplateEditor {
     }
 }
 
+/// Open the template editor as a modal over the window.
+pub fn open_template_dialog(editor: &Entity<TemplateEditor>, window: &mut Window, cx: &mut App) {
+    if window.has_active_dialog(cx) {
+        return;
+    }
+    let body = editor.clone();
+    window.open_dialog(cx, move |dialog, _, _| {
+        dialog
+            .title("IPTC templates")
+            .w(px(820.))
+            .margin_top(px(32.))
+            .child(body.clone())
+    });
+}
+
 impl Render for TemplateEditor {
     fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
-        let theme = cx.theme().clone();
         let status = self.status.clone();
         let can_delete = self.editing_id.is_some();
-        div()
-            .id("template-editor")
-            .w_full()
-            .rounded_lg()
-            .border_1()
-            .p_4()
-            .max_h(px(720.0))
-            .overflow_y_scroll()
-            .bg(theme.tokens.popover)
-            .child(
-                v_flex()
-                    .gap_3()
-                    .child(
-                        h_flex()
-                            .w_full()
-                            .justify_between()
-                            .child(
-                                div()
-                                    .font_semibold()
-                                    .child("IPTC template editor".to_string()),
-                            )
-                            .child(Button::new("template-close").label("Close").on_click(
-                                cx.listener(|this, _: &ClickEvent, _window, cx| {
-                                    this.close(cx);
-                                }),
-                            )),
-                    )
-                    .child(self.render_template_picker())
-                    .child(self.render_code_replacements(cx))
-                    .child(self.render_form())
-                    .child(self.render_preview())
-                    .child(div().text_sm().child(status))
-                    .child(
-                        h_flex()
-                            .w_full()
-                            .justify_end()
-                            .gap_2()
-                            .child(
-                                Button::new("template-new")
-                                    .label("New")
-                                    .on_click(cx.listener(|this, _: &ClickEvent, window, cx| {
-                                        this.start_new(window, cx);
-                                    })),
-                            )
-                            .child(Button::new("template-load").label("Load").on_click(
-                                cx.listener(|this, _: &ClickEvent, window, cx| {
+        // The body of a modal dialog (title, Escape and the backdrop come
+        // from the dialog layer), so no frame of its own.
+        v_flex().id("template-editor").w_full().child(
+            v_flex()
+                .gap_3()
+                .child(self.render_template_picker())
+                .child(self.render_code_replacements(cx))
+                .child(self.render_form())
+                .child(self.render_preview())
+                .child(div().text_sm().child(status))
+                .child(
+                    h_flex()
+                        .w_full()
+                        .justify_end()
+                        .gap_2()
+                        .child(
+                            Button::new("template-new")
+                                .label("New")
+                                .on_click(cx.listener(|this, _: &ClickEvent, window, cx| {
+                                    this.start_new(window, cx);
+                                })),
+                        )
+                        .child(
+                            Button::new("template-load")
+                                .label("Load")
+                                .on_click(cx.listener(|this, _: &ClickEvent, window, cx| {
                                     this.load_selected(window, cx);
-                                }),
-                            ))
-                            .child(
-                                Button::new("template-delete")
-                                    .label("Delete")
-                                    .disabled(!can_delete)
-                                    .on_click(cx.listener(|this, _: &ClickEvent, window, cx| {
-                                        this.delete(window, cx);
-                                    })),
-                            )
-                            .child(Button::new("template-save").label("Save").on_click(
-                                cx.listener(|this, _: &ClickEvent, window, cx| {
+                                })),
+                        )
+                        .child(
+                            Button::new("template-delete")
+                                .label("Delete")
+                                .disabled(!can_delete)
+                                .on_click(cx.listener(|this, _: &ClickEvent, window, cx| {
+                                    this.delete(window, cx);
+                                })),
+                        )
+                        .child(
+                            Button::new("template-save")
+                                .label("Save")
+                                .on_click(cx.listener(|this, _: &ClickEvent, window, cx| {
                                     this.save(window, cx);
-                                }),
-                            ))
-                            .child(Button::new("template-preview").label("Preview").on_click(
-                                cx.listener(|this, _: &ClickEvent, _window, cx| {
-                                    this.preview_fields(cx);
-                                }),
-                            ))
-                            .child(
-                                Button::new("template-apply")
-                                    .label("Apply to selection")
-                                    .on_click(cx.listener(|this, _: &ClickEvent, _window, cx| {
-                                        this.apply_selected(cx);
-                                    })),
-                            ),
-                    ),
-            )
+                                })),
+                        )
+                        .child(Button::new("template-preview").label("Preview").on_click(
+                            cx.listener(|this, _: &ClickEvent, _window, cx| {
+                                this.preview_fields(cx);
+                            }),
+                        ))
+                        .child(
+                            Button::new("template-apply")
+                                .label("Apply to selection")
+                                .on_click(cx.listener(|this, _: &ClickEvent, _window, cx| {
+                                    this.apply_selected(cx);
+                                })),
+                        ),
+                ),
+        )
     }
 }

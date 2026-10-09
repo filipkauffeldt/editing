@@ -126,6 +126,7 @@ fn template_apply_recipe_writes_the_selection() {
             paths: vec![catalog.get_photo(*photo_id).unwrap().path],
             sequence: *sequence,
             captured_at: now_unix(),
+            session: None,
             fields_json: catalog.get_iptc_template(template_id).unwrap().fields_json,
             replacements: None,
         })
@@ -221,6 +222,7 @@ fn code_replacements_expand_into_the_written_caption() {
         paths: vec![path.to_string_lossy().into_owned()],
         sequence: 1,
         captured_at: now_unix(),
+        session: None,
         fields_json: fields,
         replacements: Some(replacements),
     })
