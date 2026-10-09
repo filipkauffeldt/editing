@@ -206,6 +206,8 @@ pub struct Browser {
     /// (plan section 1.5). DisplaySrgb path — the canvas paints it.
     develop_image: Option<Arc<RenderImage>>,
     develop_image_item: Option<i64>,
+    /// Developed frames received so far (lets tests see a render land).
+    develop_frames: u64,
     /// Whether the develop buffer holds unsaved slider changes.
     develop_dirty: bool,
     /// Diagnostics for the develop panel status line.
@@ -342,6 +344,7 @@ impl Browser {
             unsaved: BTreeMap::new(),
             develop_image: None,
             develop_image_item: None,
+            develop_frames: 0,
             develop_dirty: false,
             develop_status: String::new(),
             crop: None,
@@ -1378,7 +1381,31 @@ impl Browser {
         if let Some(rgba) = image::RgbaImage::from_raw(frame.width, frame.height, frame.pixels) {
             self.develop_image = Some(Arc::new(RenderImage::new([image::Frame::new(rgba)])));
             self.develop_image_item = Some(item_id);
+            self.develop_frames += 1;
         }
+    }
+
+    /// The item whose edit the develop buffer holds, once loaded.
+    pub fn develop_owner(&self) -> Option<i64> {
+        self.develop.owner()
+    }
+
+    /// A develop slider's value in the edit buffer.
+    pub fn develop_value(&self, id: SliderId) -> f64 {
+        self.develop.slider_value(id)
+    }
+
+    /// Developed frames received so far.
+    pub fn develop_frames(&self) -> u64 {
+        self.develop_frames
+    }
+
+    /// The widget state behind one develop slider.
+    pub fn develop_slider(&self, id: SliderId) -> Option<Entity<SliderState>> {
+        self.develop_sliders
+            .iter()
+            .find(|(slider, _)| *slider == id)
+            .map(|(_, state)| state.clone())
     }
 
     /// Warm the drag-edge proxy decode for the current item's neighbors

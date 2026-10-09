@@ -187,6 +187,14 @@ impl DevelopSession {
     }
 }
 
+/// Pixel budget of a render size, for comparing requests.
+fn rank(size: RenderSize) -> u32 {
+    match size {
+        RenderSize::Proxy(edge) => u32::from(edge),
+        RenderSize::Full => u32::MAX,
+    }
+}
+
 /// Latest-request render scheduling for one worker (plan section 2.3):
 /// slider changes coalesce into the newest wanted size, a stale class of
 /// render is cancelled, and a failed item is terminal for the paint-time
@@ -214,7 +222,13 @@ impl RenderQueue {
     pub fn request(&mut self, size: RenderSize, then: Option<RenderSize>) -> bool {
         self.wanted = Some(size);
         self.followup = then;
-        if self.inflight.is_some_and(|running| running != size) {
+        // Only a smaller request supersedes a running render (the user is
+        // moving a slider again). A click or release asks for a bigger one:
+        // the running frame is the same edit, so let it land and show.
+        if self
+            .inflight
+            .is_some_and(|running| rank(size) < rank(running))
+        {
             self.token.cancel();
         }
         !std::mem::replace(&mut self.worker, true)
@@ -399,6 +413,30 @@ mod tests {
     const RELEASE: RenderSize = RenderSize::Proxy(edit_render::PROXY_RELEASE_LONG_EDGE);
 
     #[test]
+    fn a_click_does_not_cancel_the_drag_frame_already_rendering() {
+        // Mouse down renders the drag proxy; mouse up asks for the release
+        // proxy while it is still running. Cancelling the drag frame left
+        // the preview unchanged until the slow release render finished.
+        let mut queue = RenderQueue::default();
+        assert!(queue.request(DRAG, None));
+        let (_, token) = queue.take().unwrap();
+        assert!(!queue.request(RELEASE, None));
+        assert!(!token.is_cancelled(), "the drag frame must still land");
+        queue.complete(true);
+        let (size, _) = queue.take().expect("the release render follows");
+        assert_eq!(size, RELEASE);
+    }
+
+    #[test]
+    fn moving_again_cancels_a_running_release_render() {
+        let mut queue = RenderQueue::default();
+        assert!(queue.request(RELEASE, None));
+        let (_, token) = queue.take().unwrap();
+        assert!(!queue.request(DRAG, None));
+        assert!(token.is_cancelled());
+    }
+
+    #[test]
     fn slider_changes_coalesce_into_one_latest_request() {
         let mut queue = RenderQueue::default();
         // Only the first request spawns the worker.
@@ -414,17 +452,17 @@ mod tests {
     }
 
     #[test]
-    fn a_second_request_cancels_the_first_when_it_is_stale() {
+    fn a_smaller_request_cancels_a_running_render_and_a_bigger_one_waits() {
         let mut queue = RenderQueue::default();
         queue.request(DRAG, None);
         let (_, first) = queue.take().unwrap();
         // Same class while dragging: the running render finishes.
         queue.request(DRAG, None);
         assert!(!first.is_cancelled());
-        // Release supersedes the drag-edge render: cancelled.
+        // Release asks for more pixels of the same edit: it waits its turn.
         queue.request(RELEASE, None);
-        assert!(first.is_cancelled());
-        queue.complete(false);
+        assert!(!first.is_cancelled());
+        queue.complete(true);
         let (size, second) = queue.take().unwrap();
         assert_eq!(size, RELEASE);
         assert!(!second.is_cancelled());
