@@ -33,6 +33,7 @@ use edit_core::render::{Frame, OutputColor, RenderRequest, RenderSize};
 use edit_core::traits::{DevelopEngine, RetouchStage};
 use edit_core::{Crop, DevelopSettings, ItemId, MaskPlane, RetouchRecipe};
 use lightcraft_pipeline::Quality;
+use smart_preview::{SMART_PREVIEW_LONG_EDGE, SmartPreviewKey, SmartPreviewStore, is_raw_path};
 
 /// Long edge of the downscaled proxy rendered during a slider drag. The
 /// proxy decode bins raws in milliseconds and keeps every slider frame in the
@@ -76,6 +77,53 @@ impl DecodeSource {
             .len()
             .saturating_mul(std::mem::size_of::<[f32; 3]>())
             .saturating_add(self.stages.bytes())
+    }
+}
+
+/// Which image edits run against for a photo.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum EditingSource {
+    /// The persisted (or cached) smart preview of a raw.
+    SmartPreview,
+    /// A raw with no smart preview yet; renders decode the raw proxy.
+    Raw,
+    /// A plain file (or no store): decoded straight from the file.
+    File,
+}
+
+/// The decode-cache key of a photo's smart preview source.
+fn smart_key(path: &Path, key: &SmartPreviewKey) -> DecodeKey {
+    (
+        path.to_path_buf(),
+        key.mtime_nanos,
+        key.size,
+        SMART_PREVIEW_LONG_EDGE,
+    )
+}
+
+/// Persist a freshly decoded smart preview; failure only costs a rebuild.
+fn store_smart(store: &SmartPreviewStore, key: &SmartPreviewKey, source: &DecodeSource) {
+    if let Err(e) = store.store(key, &source.img, &source.info) {
+        eprintln!("smart preview not saved for {}: {e}", key.path.display());
+    }
+}
+
+/// A decode source at `edge` from a larger working copy.
+fn shrink(
+    img: &lightcraft_raster::Rgb32f,
+    info: lightcraft_pipeline::SourceInfo,
+    edge: u16,
+) -> DecodeSource {
+    let edge = edge as usize;
+    let img = if img.width.max(img.height) > edge {
+        lightcraft_raster::resample::fit(img, edge, edge, lightcraft_raster::resample::Filter::Box)
+    } else {
+        img.clone()
+    };
+    DecodeSource {
+        img: Arc::new(img),
+        info,
+        stages: lightcraft_pipeline::StageCache::default(),
     }
 }
 
@@ -169,6 +217,11 @@ impl DecodeCache {
     /// after insertion are counted too.
     fn bytes_held(&self) -> usize {
         self.sources.values().map(|s| s.held_bytes()).sum()
+    }
+
+    /// The banked source for `key`, without touching recency.
+    fn peek(&self, key: &DecodeKey) -> Option<Arc<DecodeSource>> {
+        self.sources.get(key).map(Arc::clone)
     }
 
     /// Hit, wait on an in-flight decode, or become the owner of a new one.
@@ -268,6 +321,8 @@ pub struct RenderService {
     paths: Option<Arc<dyn ItemPhotoPaths>>,
     /// Decodes actually run, for the cache-sharing tests.
     decodes: AtomicUsize,
+    /// Persistent smart previews of raws; `None` decodes raws every time.
+    smart: Option<SmartPreviewStore>,
 }
 
 impl Default for RenderService {
@@ -295,7 +350,83 @@ impl RenderService {
             decoded: Mutex::new(DecodeCache::new(max_entries, budget_bytes)),
             paths: None,
             decodes: AtomicUsize::new(0),
+            smart: None,
         }
+    }
+
+    /// Use `store` as the editing source of raws: renders load the saved
+    /// working copy instead of decoding the raw, and [`Self::ensure_smart_preview`]
+    /// builds it.
+    pub fn with_smart_previews(mut self, store: SmartPreviewStore) -> Self {
+        self.smart = Some(store);
+        self
+    }
+
+    /// Raw file decodes run so far (smart preview loads do not count).
+    pub fn raw_decodes(&self) -> usize {
+        self.decodes.load(Ordering::Relaxed)
+    }
+
+    /// The best editing image available for the file right now. Renders use
+    /// it automatically; the app asks to know whether to say "Preparing".
+    pub fn editing_source(&self, path: &Path) -> EditingSource {
+        let Some(store) = self.smart.as_ref().filter(|_| is_raw_path(path)) else {
+            return EditingSource::File;
+        };
+        let key = SmartPreviewKey::for_file(path);
+        let banked = lock(&self.decoded).peek(&smart_key(path, &key)).is_some();
+        if banked || store.contains(&key) {
+            EditingSource::SmartPreview
+        } else {
+            EditingSource::Raw
+        }
+    }
+
+    /// Build the smart preview of a raw if it is missing. With `bank`, the
+    /// working copy also lands in the in-memory cache (the photo is about to
+    /// be edited); without it the sweep leaves the cache alone. Idempotent.
+    pub fn ensure_smart_preview(
+        &self,
+        path: &Path,
+        bank: bool,
+        cancel: &CancelToken,
+    ) -> Result<EditingSource> {
+        cancel.check()?;
+        let Some(store) = self.smart.as_ref().filter(|_| is_raw_path(path)) else {
+            return Ok(EditingSource::File);
+        };
+        let key = SmartPreviewKey::for_file(path);
+        if bank {
+            self.proxy_source(path, SMART_PREVIEW_LONG_EDGE, cancel)?;
+        } else if !store.contains(&key) {
+            let source = self.decode_source(path, SMART_PREVIEW_LONG_EDGE as usize, cancel)?;
+            store_smart(store, &key, &source);
+        }
+        Ok(EditingSource::SmartPreview)
+    }
+
+    /// Decode one proxy source, preferring the persisted smart preview: a
+    /// raw is only decoded when no smart preview exists, and a decode at the
+    /// smart preview's own edge saves one.
+    fn editing_decode(&self, path: &Path, edge: u16, cancel: &CancelToken) -> Result<DecodeSource> {
+        let Some(store) = self.smart.as_ref().filter(|_| is_raw_path(path)) else {
+            return self.decode_source(path, edge as usize, cancel);
+        };
+        let key = SmartPreviewKey::for_file(path);
+        if edge <= SMART_PREVIEW_LONG_EDGE {
+            let banked = lock(&self.decoded).peek(&smart_key(path, &key));
+            if let Some(src) = banked {
+                return Ok(shrink(src.img.as_ref(), src.info, edge));
+            }
+            if let Some(sp) = store.load(&key) {
+                return Ok(shrink(&sp.image, sp.info, edge));
+            }
+        }
+        let source = self.decode_source(path, edge as usize, cancel)?;
+        if edge == SMART_PREVIEW_LONG_EDGE {
+            store_smart(store, &key, &source);
+        }
+        Ok(source)
     }
 
     /// One render, from source file to BGRA frame. Proxy renders reuse decoded
@@ -378,7 +509,7 @@ impl RenderService {
                         slot,
                         settled: false,
                     };
-                    return match self.decode_source(path, edge as usize, cancel) {
+                    return match self.editing_decode(path, edge, cancel) {
                         Ok(source) => {
                             let source = Arc::new(source);
                             guard.bank(Arc::clone(&source));
@@ -1518,5 +1649,211 @@ mod tests {
         let mask = MaskPlane::new(2, 2, vec![255; 4]).unwrap();
         NoopRetouch.apply(&mut frame, &recipe, &mask).unwrap();
         assert_eq!(frame, before);
+    }
+
+    fn smart_service(tag: &str) -> (RenderService, PathBuf, PathBuf) {
+        let dir = std::env::temp_dir().join(format!("edit-render-{tag}-{}", std::process::id()));
+        std::fs::remove_dir_all(&dir).ok();
+        std::fs::create_dir_all(&dir).unwrap();
+        let store = SmartPreviewStore::new(dir.join("smart"), 1 << 30);
+        (
+            RenderService::new().with_smart_previews(store),
+            dir.join("a.nef"),
+            dir,
+        )
+    }
+
+    /// A smooth, colourful synthetic working copy.
+    fn synthetic(w: usize, h: usize) -> lightcraft_raster::Rgb32f {
+        lightcraft_raster::Rgb32f {
+            width: w,
+            height: h,
+            data: (0..w * h)
+                .map(|i| {
+                    let (x, y) = ((i % w) as f32 / w as f32, (i / w) as f32 / h as f32);
+                    [0.05 + 0.8 * x, 0.05 + 0.8 * y, 0.05 + 0.4 * x * y]
+                })
+                .collect(),
+        }
+    }
+
+    /// Plant a smart preview for a stand-in raw file whose bytes are not a
+    /// decodable raw: any decode of it fails, so a render that succeeds
+    /// provably never touched it.
+    fn plant(service: &RenderService, path: &Path, w: usize, h: usize) {
+        std::fs::write(path, b"not a real raw").unwrap();
+        let store = service.smart.as_ref().unwrap();
+        store
+            .store(
+                &SmartPreviewKey::for_file(path),
+                &synthetic(w, h),
+                &lightcraft_pipeline::SourceInfo::default(),
+            )
+            .unwrap();
+    }
+
+    #[test]
+    fn a_stored_smart_preview_serves_drag_and_release_without_decoding_the_raw() {
+        let (service, raw, dir) = smart_service("sp-hit");
+        plant(&service, &raw, 640, 400);
+        assert_eq!(service.editing_source(&raw), EditingSource::SmartPreview);
+        let cancel = CancelToken::new();
+        let develop = DevelopSettings::default();
+        let drag = service
+            .render_path(&raw, RenderSize::Proxy(320), &develop, None, &cancel)
+            .unwrap();
+        let release = service
+            .render_path(&raw, RenderSize::Proxy(2560), &develop, None, &cancel)
+            .unwrap();
+        assert_eq!((drag.width, drag.height), (320, 200));
+        assert_eq!((release.width, release.height), (640, 400));
+        assert_eq!(service.raw_decodes(), 0, "the raw must stay untouched");
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn without_a_smart_preview_a_raw_reports_raw_and_a_plain_file_reports_file() {
+        let (service, raw, dir) = smart_service("sp-state");
+        std::fs::write(&raw, b"x").unwrap();
+        assert_eq!(service.editing_source(&raw), EditingSource::Raw);
+        let jpg = dir.join("p.jpg");
+        tiny_jpeg(&jpg, 8, 8, [1, 2, 3]);
+        assert_eq!(service.editing_source(&jpg), EditingSource::File);
+        assert_eq!(
+            RenderService::new().editing_source(&raw),
+            EditingSource::File
+        );
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn a_changed_raw_invalidates_its_smart_preview() {
+        let (service, raw, dir) = smart_service("sp-stale");
+        plant(&service, &raw, 64, 40);
+        assert_eq!(service.editing_source(&raw), EditingSource::SmartPreview);
+        std::fs::write(&raw, b"edited raw, different size").unwrap();
+        assert_eq!(service.editing_source(&raw), EditingSource::Raw);
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn ensure_is_idempotent_and_builds_through_the_decoder_once() {
+        let (service, path, dir) = smart_service("sp-ensure");
+        // A plain file is not a raw: nothing to build.
+        let jpg = dir.join("p.jpg");
+        tiny_jpeg(&jpg, 8, 8, [1, 2, 3]);
+        let cancel = CancelToken::new();
+        assert_eq!(
+            service.ensure_smart_preview(&jpg, false, &cancel).unwrap(),
+            EditingSource::File
+        );
+        // A planted smart preview is already built: no decode, any number of times.
+        plant(&service, &path, 64, 40);
+        for bank in [false, true, false, true] {
+            assert_eq!(
+                service.ensure_smart_preview(&path, bank, &cancel).unwrap(),
+                EditingSource::SmartPreview
+            );
+        }
+        assert_eq!(service.raw_decodes(), 0);
+        // A raw that cannot be decoded fails the job instead of storing junk.
+        let broken = dir.join("broken.nef");
+        std::fs::write(&broken, b"junk").unwrap();
+        assert!(
+            service
+                .ensure_smart_preview(&broken, false, &cancel)
+                .is_err()
+        );
+        assert_eq!(service.editing_source(&broken), EditingSource::Raw);
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn a_smart_preview_matches_the_direct_proxy_decode_within_tolerance() {
+        // Stand-in for a raw: a smooth 3000x2000 PNG decoded through the same
+        // bridge at the smart edge, saved, loaded and shrunk to the drag edge,
+        // against the direct decode at the drag edge.
+        let dir = std::env::temp_dir().join(format!("edit-render-fid-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let png = dir.join("g.png");
+        let img = image::RgbImage::from_fn(3000, 2000, |x, y| {
+            image::Rgb([
+                (x * 255 / 3000) as u8,
+                (y * 255 / 2000) as u8,
+                ((x + y) * 255 / 5000) as u8,
+            ])
+        });
+        write_png(&png, &img);
+        let service = RenderService::new();
+        let cancel = CancelToken::new();
+        let big = service.decode_source(&png, 2560, &cancel).unwrap();
+        let store = SmartPreviewStore::new(dir.join("smart"), 1 << 30);
+        let key = SmartPreviewKey::for_file(&png);
+        store.store(&key, &big.img, &big.info).unwrap();
+        let loaded = store.load(&key).unwrap();
+        let max_err = |a: &lightcraft_raster::Rgb32f, b: &lightcraft_raster::Rgb32f| {
+            assert_eq!((a.width, a.height), (b.width, b.height));
+            a.data
+                .iter()
+                .flatten()
+                .zip(b.data.iter().flatten())
+                .map(|(x, y)| (x - y).abs())
+                .fold(0.0f32, f32::max)
+        };
+        let storage = max_err(&big.img, &loaded.image);
+        let shrunk = shrink(&loaded.image, loaded.info, 1600);
+        let direct = service.decode_source(&png, 1600, &cancel).unwrap();
+        let derived = max_err(&shrunk.img, &direct.img);
+        eprintln!(
+            "smart preview max channel error: storage {storage:.6}, 1600 derived {derived:.6}"
+        );
+        // Tolerance: half-float storage is within 0.05% of each sample (<= 5e-4
+        // for samples <= 1); the derived drag proxy adds one Box resample step.
+        assert!(storage <= 5e-4, "storage error {storage}");
+        assert!(derived <= 0.01, "derived proxy error {derived}");
+        assert_eq!(shrunk.info, direct.info);
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// Timing of the smart preview path. Run optimised for the real figures:
+    /// `cargo test --release -p edit-render smart_preview_timing -- --nocapture`.
+    #[test]
+    fn smart_preview_timing() {
+        let (service, raw, dir) = smart_service("sp-time");
+        plant(&service, &raw, 2560, 1707);
+        let cancel = CancelToken::new();
+        let develop = DevelopSettings::default();
+        let store = service.smart.as_ref().unwrap();
+        let key = SmartPreviewKey::for_file(&raw);
+        let t = std::time::Instant::now();
+        let loaded = store.load(&key).unwrap();
+        let load = t.elapsed();
+        drop(loaded);
+        let t = std::time::Instant::now();
+        service
+            .render_path(&raw, RenderSize::Proxy(1600), &develop, None, &cancel)
+            .unwrap();
+        let first = t.elapsed();
+        let mut warm = Vec::new();
+        for i in 0..5 {
+            let mut d = develop.clone();
+            d.light.exposure = (i as f64) * 0.1;
+            let t = std::time::Instant::now();
+            service
+                .render_path(&raw, RenderSize::Proxy(1600), &d, None, &cancel)
+                .unwrap();
+            warm.push(t.elapsed());
+        }
+        let size = store.total_bytes();
+        eprintln!(
+            "smart preview: file {:.1} MB, load {load:?}, first 1600 drag frame {first:?}, warm drag frames {warm:?}",
+            size as f64 / 1e6
+        );
+        if !cfg!(debug_assertions) {
+            assert!(load.as_millis() < 100, "load took {load:?}");
+            assert!(warm.iter().all(|w| w.as_millis() < 60), "{warm:?}");
+        }
+        assert_eq!(service.raw_decodes(), 0);
+        std::fs::remove_dir_all(&dir).ok();
     }
 }
