@@ -12,6 +12,7 @@ pub mod browse;
 pub mod crop;
 pub mod develop;
 pub mod develop_panel;
+pub mod fields_form;
 pub mod ingest;
 pub mod ingest_job;
 pub mod panel;

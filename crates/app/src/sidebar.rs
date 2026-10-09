@@ -7,30 +7,25 @@
 //! photos selected a field shows its value when they agree and "Mixed"
 //! when they differ.
 
-use std::collections::{BTreeMap, BTreeSet, HashMap};
+use std::collections::{BTreeMap, HashMap};
 use std::path::PathBuf;
 use std::sync::Arc;
 
 use edit_catalog::Catalog;
 use edit_catalog::models::IptcTemplate;
-use edit_metadata::{
-    FIELDS, FieldSpec, FieldValues, Group, Kind, Merged, TemplateFields, Writer, changed_fields,
-    merge_values, read_fields,
-};
-use gpui_kit::component::accordion::Accordion;
+use edit_metadata::{FieldValues, Merged, TemplateFields, Writer, merge_values, read_fields};
 use gpui_kit::component::button::{Button, ButtonVariants as _};
-use gpui_kit::component::input::{Input, InputEvent, InputState, Textarea, TextareaState};
 use gpui_kit::component::label::Label;
 use gpui_kit::component::scroll::ScrollableElement as _;
 use gpui_kit::component::searchable_list::SearchableVec;
 use gpui_kit::component::select::{Select, SelectEvent, SelectState};
 use gpui_kit::component::{
-    ActiveTheme as _, Disableable as _, IconName, Sizable as _, StyledExt as _, h_flex, v_flex,
+    ActiveTheme as _, Disableable as _, Sizable as _, StyledExt as _, h_flex, v_flex,
 };
-use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::*;
 
 use crate::browse::{BrowseItem, item_photo_paths};
+use crate::fields_form::FieldsForm;
 
 gpui_kit::actions!(metadata_sidebar, [SaveMetadata]);
 
@@ -50,17 +45,6 @@ pub enum SidebarEvent {
 
 impl EventEmitter<SidebarEvent> for MetadataSidebar {}
 
-enum Control {
-    Line(Entity<InputState>),
-    Area(Entity<TextareaState>),
-    Pick(Entity<SelectState<Choices>>),
-}
-
-struct FieldWidget {
-    spec: &'static FieldSpec,
-    control: Control,
-}
-
 enum Load {
     Empty,
     Loading,
@@ -71,8 +55,7 @@ enum Load {
 pub struct MetadataSidebar {
     catalog: Arc<Catalog>,
     browser_focus: FocusHandle,
-    widgets: Vec<FieldWidget>,
-    open_groups: BTreeSet<usize>,
+    form: Entity<FieldsForm>,
     items: Vec<BrowseItem>,
     key: Vec<String>,
     cache: HashMap<String, Arc<FieldValues>>,
@@ -81,44 +64,11 @@ pub struct MetadataSidebar {
     generation: u64,
     /// Widgets need to be reset from `loaded` (and a stashed draft).
     pending_sync: bool,
-    touched: BTreeSet<&'static str>,
     /// Unsaved edits of selections the user moved away from.
     drafts: HashMap<Vec<String>, TemplateFields>,
     templates: Entity<SelectState<Choices>>,
     template_rows: Vec<IptcTemplate>,
     badge: String,
-}
-
-/// Option labels of a select field, plus the current value when it is not
-/// one of the options.
-fn pick_labels(spec: &FieldSpec, extra: Option<&str>) -> Vec<String> {
-    let mut labels: Vec<String> = match spec.kind {
-        Kind::Select(options) => options.iter().map(|(l, _)| (*l).to_owned()).collect(),
-        _ => Vec::new(),
-    };
-    if let Some(extra) = extra.filter(|v| !v.is_empty())
-        && label_for(spec, extra).is_none()
-    {
-        labels.push(extra.to_owned());
-    }
-    labels
-}
-
-fn label_for(spec: &FieldSpec, value: &str) -> Option<&'static str> {
-    match spec.kind {
-        Kind::Select(options) => options.iter().find(|(_, v)| *v == value).map(|(l, _)| *l),
-        _ => None,
-    }
-}
-
-fn value_for(spec: &FieldSpec, label: &str) -> String {
-    match spec.kind {
-        Kind::Select(options) => options
-            .iter()
-            .find(|(l, _)| *l == label)
-            .map_or_else(|| label.to_owned(), |(_, v)| (*v).to_owned()),
-        _ => label.to_owned(),
-    }
 }
 
 fn read_items(
@@ -150,13 +100,8 @@ impl MetadataSidebar {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> Self {
-        let widgets = FIELDS
-            .iter()
-            .map(|spec| FieldWidget {
-                spec,
-                control: Self::make_control(spec, window, cx),
-            })
-            .collect();
+        let form = cx.new(|cx| FieldsForm::new("meta", window, cx));
+        cx.observe(&form, |_, _, cx| cx.notify()).detach();
         let templates = cx
             .new(|cx| SelectState::new(SearchableVec::new(Vec::<String>::new()), None, window, cx));
         cx.subscribe_in(
@@ -172,13 +117,7 @@ impl MetadataSidebar {
         let mut sidebar = Self {
             catalog,
             browser_focus,
-            widgets,
-            open_groups: Group::ALL
-                .iter()
-                .enumerate()
-                .filter(|(_, g)| g.open_by_default())
-                .map(|(i, _)| i)
-                .collect(),
+            form,
             items: Vec::new(),
             key: Vec::new(),
             cache: HashMap::new(),
@@ -186,7 +125,6 @@ impl MetadataSidebar {
             loaded: BTreeMap::new(),
             generation: 0,
             pending_sync: false,
-            touched: BTreeSet::new(),
             drafts: HashMap::new(),
             templates,
             template_rows: Vec::new(),
@@ -194,55 +132,6 @@ impl MetadataSidebar {
         };
         sidebar.refresh_templates(window, cx);
         sidebar
-    }
-
-    fn make_control(
-        spec: &'static FieldSpec,
-        window: &mut Window,
-        cx: &mut Context<Self>,
-    ) -> Control {
-        let id = spec.id;
-        match spec.kind {
-            Kind::Multi(_) | Kind::List => {
-                let state = cx.new(|cx| TextareaState::new(window, cx));
-                cx.subscribe(&state, move |this, _, event: &InputEvent, cx| {
-                    this.edited(id, event, cx)
-                })
-                .detach();
-                Control::Area(state)
-            }
-            Kind::Select(_) => {
-                let state = cx.new(|cx| {
-                    SelectState::new(
-                        SearchableVec::new(pick_labels(spec, None)),
-                        None,
-                        window,
-                        cx,
-                    )
-                });
-                cx.subscribe(&state, move |this, _, _: &SelectEvent<Choices>, cx| {
-                    this.touched.insert(id);
-                    cx.notify();
-                })
-                .detach();
-                Control::Pick(state)
-            }
-            _ => {
-                let state = cx.new(|cx| InputState::new(window, cx));
-                cx.subscribe(&state, move |this, _, event: &InputEvent, cx| {
-                    this.edited(id, event, cx)
-                })
-                .detach();
-                Control::Line(state)
-            }
-        }
-    }
-
-    fn edited(&mut self, id: &'static str, event: &InputEvent, cx: &mut Context<Self>) {
-        if matches!(event, InputEvent::Change) {
-            self.touched.insert(id);
-            cx.notify();
-        }
     }
 
     // ---- selection and loading ----
@@ -263,7 +152,6 @@ impl MetadataSidebar {
         }
         self.key = key;
         self.items = items;
-        self.touched.clear();
         self.loaded.clear();
         self.start_load(cx);
         cx.notify();
@@ -277,7 +165,6 @@ impl MetadataSidebar {
             hit |= self.key.contains(path);
         }
         if hit {
-            self.touched.clear();
             self.drafts.remove(&self.key);
             self.start_load(cx);
             cx.notify();
@@ -362,87 +249,22 @@ impl MetadataSidebar {
 
     // ---- widgets <-> values ----
 
-    fn text_of(&self, widget: &FieldWidget, cx: &App) -> String {
-        match &widget.control {
-            Control::Line(state) => state.read(cx).value().to_string(),
-            Control::Area(state) => state.read(cx).value().to_string(),
-            Control::Pick(state) => match state.read(cx).selected_value() {
-                Some(label) => value_for(widget.spec, label),
-                None => String::new(),
-            },
-        }
-    }
-
-    fn set_text(
-        &self,
-        widget: &FieldWidget,
-        text: &str,
-        mixed: bool,
-        window: &mut Window,
-        cx: &mut Context<Self>,
-    ) {
-        match &widget.control {
-            Control::Line(state) => state.update(cx, |state, cx| {
-                state.set_placeholder(if mixed { "Mixed" } else { "" }, window, cx);
-                state.set_value(text.to_owned(), window, cx);
-            }),
-            Control::Area(state) => state.update(cx, |state, cx| {
-                state.set_placeholder(if mixed { "Mixed" } else { "" }, window, cx);
-                state.set_value(text.to_owned(), window, cx);
-            }),
-            Control::Pick(state) => {
-                let spec = widget.spec;
-                state.update(cx, |state, cx| {
-                    state.set_items(
-                        SearchableVec::new(pick_labels(spec, Some(text))),
-                        window,
-                        cx,
-                    );
-                    if mixed {
-                        state.set_selected_index(None, window, cx);
-                    } else {
-                        let label =
-                            label_for(spec, text).map_or_else(|| text.to_owned(), str::to_owned);
-                        state.set_selected_value(&label, window, cx);
-                    }
-                });
-            }
-        }
-    }
-
-    /// Reset every widget to the loaded values, then lay a stashed draft
-    /// for this selection on top.
+    /// Reset the form to the loaded values, then lay a stashed draft for
+    /// this selection on top.
     fn sync_widgets(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         self.pending_sync = false;
-        self.touched.clear();
         let draft = self.drafts.remove(&self.key);
-        for widget in &self.widgets {
-            let (text, mixed) = match self.loaded.get(widget.spec.id) {
-                Some(Merged::Same(value)) => (value.clone(), false),
-                _ => (String::new(), true),
-            };
-            self.set_text(widget, &text, mixed, window, cx);
-        }
-        if let Some(draft) = draft {
-            for widget in &self.widgets {
-                if let Some(text) = draft.get(widget.spec.id) {
-                    self.set_text(widget, text, false, window, cx);
-                    self.touched.insert(widget.spec.id);
-                }
-            }
-        }
+        let loaded = self.loaded.clone();
+        self.form.update(cx, |form, cx| {
+            form.reset(loaded, draft.as_ref(), window, cx)
+        });
     }
 
     fn changed(&self, cx: &App) -> TemplateFields {
         if !matches!(self.load, Load::Ready) || self.pending_sync {
             return TemplateFields::default();
         }
-        let current: BTreeMap<&'static str, String> = self
-            .widgets
-            .iter()
-            .map(|w| (w.spec.id, self.text_of(w, cx)))
-            .collect();
-        changed_fields(&self.loaded, &current, &self.touched)
+        self.form.read(cx).changed(cx)
     }
 
     // ---- commands ----
@@ -483,18 +305,8 @@ impl MetadataSidebar {
         };
         let fields: TemplateFields = serde_json::from_str(&row.fields_json).unwrap_or_default();
         if matches!(self.load, Load::Ready) && !self.pending_sync {
-            for widget in &self.widgets {
-                let Some(text) = fields.get(widget.spec.id) else {
-                    continue;
-                };
-                if matches!(widget.control, Control::Pick(_))
-                    && label_for(widget.spec, text).is_none()
-                {
-                    continue;
-                }
-                self.set_text(widget, text, false, window, cx);
-                self.touched.insert(widget.spec.id);
-            }
+            self.form
+                .update(cx, |form, cx| form.fill(&fields, window, cx));
         }
         self.templates
             .update(cx, |select, cx| select.set_selected_index(None, window, cx));
@@ -509,140 +321,6 @@ impl MetadataSidebar {
             [one] => one.base_name.clone(),
             many => format!("{} photos", many.len()),
         }
-    }
-
-    fn render_control(&self, widget: &FieldWidget) -> AnyElement {
-        let spec = widget.spec;
-        let id = SharedString::from(format!("meta-{}", spec.id));
-        match &widget.control {
-            Control::Line(state) => Input::new(state).small().id(id).into_any_element(),
-            Control::Area(state) => {
-                let rows = match spec.kind {
-                    Kind::Multi(rows) => rows,
-                    Kind::List if spec.id == "keywords" => 3,
-                    Kind::List => 2,
-                    _ => 3,
-                };
-                Textarea::new(state)
-                    .h(px(rows as f32 * 18.0 + 8.0))
-                    .into_any_element()
-            }
-            Control::Pick(state) => Select::new(state)
-                .small()
-                .placeholder("Mixed")
-                .id(id)
-                .into_any_element(),
-        }
-    }
-
-    fn render_row(&self, widget: &FieldWidget, edited: bool, cx: &App) -> impl IntoElement {
-        let theme = cx.theme();
-        let color = if edited {
-            theme.primary
-        } else {
-            theme.muted_foreground
-        };
-        v_flex()
-            .w_full()
-            .gap(cx.theme().spacing_tokens().xs)
-            .child(
-                div()
-                    .w_full()
-                    .flex_none()
-                    .truncate()
-                    .child(Label::new(widget.spec.label).text_xs().text_color(color)),
-            )
-            .child(self.render_control(widget))
-    }
-
-    fn render_form(&self, edited: &TemplateFields, cx: &mut Context<Self>) -> impl IntoElement {
-        let spacing = cx.theme().spacing_tokens();
-        let this = cx.entity();
-        let mut accordion = Accordion::new("metadata-groups")
-            .multiple(true)
-            .bordered(false)
-            .small()
-            .h_auto();
-        for (index, group) in Group::ALL.iter().enumerate() {
-            let rows: Vec<_> = self
-                .widgets
-                .iter()
-                .filter(|w| w.spec.group == *group)
-                .collect();
-            let edits = rows.iter().filter(|w| edited.contains(w.spec.id)).count();
-            let open = self.open_groups.contains(&index);
-            let rows = if open { rows } else { Vec::new() };
-            let content = v_flex()
-                .w_full()
-                .gap(spacing.md)
-                .when(open, |col| col.pb(spacing.md))
-                .children(
-                    rows.into_iter()
-                        .map(|w| self.render_row(w, edited.contains(w.spec.id), cx)),
-                );
-            let primary = cx.theme().primary;
-            let owner = this.clone();
-            accordion = accordion.item(move |item| {
-                item.open(open)
-                    .title(
-                        h_flex()
-                            .w_full()
-                            .items_center()
-                            .justify_between()
-                            .child(
-                                h_flex()
-                                    .gap(spacing.sm)
-                                    .child(Label::new(group.label()).text_sm().font_semibold())
-                                    .when(edits > 0, |row| {
-                                        row.child(
-                                            Label::new(edits.to_string())
-                                                .text_xs()
-                                                .text_color(primary),
-                                        )
-                                    }),
-                            )
-                            .child(
-                                Button::new(SharedString::from(format!(
-                                    "meta-group-revert-{index}"
-                                )))
-                                .ghost()
-                                .xsmall()
-                                .icon(IconName::Undo2)
-                                .tooltip("Revert section")
-                                .disabled(edits == 0)
-                                .on_click(
-                                    move |_, window, cx| {
-                                        cx.stop_propagation();
-                                        owner.update(cx, |sidebar, cx| {
-                                            sidebar.revert_group(*group, window, cx);
-                                        });
-                                    },
-                                ),
-                            ),
-                    )
-                    .when(open, |item| item.child(content))
-            });
-        }
-        accordion.on_toggle_click(move |open, _, cx| {
-            let open: BTreeSet<usize> = open.iter().copied().collect();
-            this.update(cx, |this, cx| {
-                this.open_groups = open;
-                cx.notify();
-            });
-        })
-    }
-
-    /// Put one section's fields back to the loaded values.
-    fn revert_group(&mut self, group: Group, window: &mut Window, cx: &mut Context<Self>) {
-        for widget in self.widgets.iter().filter(|w| w.spec.group == group) {
-            let (text, mixed) = match self.loaded.get(widget.spec.id) {
-                Some(Merged::Same(value)) => (value.clone(), false),
-                _ => (String::new(), true),
-            };
-            self.set_text(widget, &text, mixed, window, cx);
-            self.touched.remove(widget.spec.id);
-        }
-        cx.notify();
     }
 }
 
@@ -743,7 +421,7 @@ impl Render for MetadataSidebar {
                     .w_full()
                     .px(spacing.md)
                     .overflow_y_scrollbar()
-                    .child(self.render_form(&edited, cx))
+                    .child(self.form.clone())
                     .into_any_element()
             } else {
                 div()
