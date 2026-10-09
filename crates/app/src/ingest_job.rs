@@ -148,6 +148,7 @@ pub fn iptc_stamp_job(
         session: Some(payload.session.clone()),
         fields_json: fields_json.clone(),
         replacements: replacements.clone(),
+        clear_empty: false,
     };
     Some((JobKind::MetadataWrite, serde_json::to_string(&job).ok()?))
 }

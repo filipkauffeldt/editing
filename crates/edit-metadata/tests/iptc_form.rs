@@ -38,6 +38,7 @@ fn try_write(
         paths: vec![path.to_string_lossy().into_owned()],
         sequence: 1,
         captured_at: 1_791_374_400,
+        session: None,
         fields_json: serde_json::to_string(fields).unwrap(),
         replacements: None,
         clear_empty,

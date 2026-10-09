@@ -323,7 +323,7 @@ fn the_sheet_counts_every_stamped_photo_after_a_live_ingest(cx: &mut gpui_kit::T
             .count();
         assert_eq!(browser.row_count(), 4);
         assert_eq!(stamped, 4);
-        assert_eq!(browser.template_status(), "Template applied: 4 photos.");
+        assert_eq!(browser.template_status(), "Metadata written: 4 photos.");
     });
     std::fs::remove_dir_all(&base).ok();
 }

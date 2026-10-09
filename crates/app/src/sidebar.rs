@@ -21,9 +21,12 @@ use gpui_kit::component::accordion::Accordion;
 use gpui_kit::component::button::{Button, ButtonVariants as _};
 use gpui_kit::component::input::{Input, InputEvent, InputState, Textarea, TextareaState};
 use gpui_kit::component::label::Label;
+use gpui_kit::component::scroll::ScrollableElement as _;
 use gpui_kit::component::searchable_list::SearchableVec;
 use gpui_kit::component::select::{Select, SelectEvent, SelectState};
-use gpui_kit::component::{ActiveTheme as _, Disableable as _, Sizable as _, h_flex, v_flex};
+use gpui_kit::component::{
+    ActiveTheme as _, Disableable as _, IconName, Sizable as _, StyledExt as _, h_flex, v_flex,
+};
 use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::*;
 
@@ -33,7 +36,7 @@ gpui_kit::actions!(metadata_sidebar, [SaveMetadata]);
 
 /// Photos whose values stay cached; past this the cache starts over.
 const CACHE_CAP: usize = 4096;
-const LABEL_WIDTH: f32 = 108.0;
+const LABEL_WIDTH: f32 = 96.0;
 
 type Choices = SearchableVec<String>;
 
@@ -540,7 +543,7 @@ impl MetadataSidebar {
         };
         h_flex()
             .w_full()
-            .gap_2()
+            .gap(cx.theme().spacing_tokens().sm)
             .items_start()
             .child(
                 div()
@@ -553,19 +556,12 @@ impl MetadataSidebar {
     }
 
     fn render_form(&self, edited: &TemplateFields, cx: &mut Context<Self>) -> impl IntoElement {
-        let this = cx.entity().downgrade();
+        let spacing = cx.theme().spacing_tokens();
+        let this = cx.entity();
         let mut accordion = Accordion::new("metadata-groups")
             .multiple(true)
-            .small()
-            .h_auto()
-            .on_toggle_click(move |open, _, cx| {
-                let open: BTreeSet<usize> = open.iter().copied().collect();
-                this.update(cx, |this, cx| {
-                    this.open_groups = open;
-                    cx.notify();
-                })
-                .ok();
-            });
+            .bordered(false)
+            .small();
         for (index, group) in Group::ALL.iter().enumerate() {
             let rows: Vec<_> = self
                 .widgets
@@ -573,28 +569,74 @@ impl MetadataSidebar {
                 .filter(|w| w.spec.group == *group)
                 .collect();
             let edits = rows.iter().filter(|w| edited.contains(w.spec.id)).count();
-            let content = v_flex().gap_1p5().pb_2().children(
+            let open = self.open_groups.contains(&index);
+            let content = v_flex().w_full().gap(spacing.md).pb(spacing.md).children(
                 rows.into_iter()
                     .map(|w| self.render_row(w, edited.contains(w.spec.id), cx)),
             );
             let primary = cx.theme().primary;
-            let open = self.open_groups.contains(&index);
+            let owner = this.clone();
             accordion = accordion.item(move |item| {
                 item.open(open)
                     .title(
                         h_flex()
-                            .gap_2()
-                            .child(Label::new(group.label()).text_sm())
-                            .when(edits > 0, |row| {
-                                row.child(
-                                    Label::new(edits.to_string()).text_xs().text_color(primary),
-                                )
-                            }),
+                            .w_full()
+                            .items_center()
+                            .justify_between()
+                            .child(
+                                h_flex()
+                                    .gap(spacing.sm)
+                                    .child(Label::new(group.label()).text_sm().font_semibold())
+                                    .when(edits > 0, |row| {
+                                        row.child(
+                                            Label::new(edits.to_string())
+                                                .text_xs()
+                                                .text_color(primary),
+                                        )
+                                    }),
+                            )
+                            .child(
+                                Button::new(SharedString::from(format!(
+                                    "meta-group-revert-{index}"
+                                )))
+                                .ghost()
+                                .xsmall()
+                                .icon(IconName::Undo2)
+                                .tooltip("Revert section")
+                                .disabled(edits == 0)
+                                .on_click(
+                                    move |_, window, cx| {
+                                        cx.stop_propagation();
+                                        owner.update(cx, |sidebar, cx| {
+                                            sidebar.revert_group(*group, window, cx);
+                                        });
+                                    },
+                                ),
+                            ),
                     )
                     .child(content)
             });
         }
-        accordion
+        accordion.on_toggle_click(move |open, _, cx| {
+            let open: BTreeSet<usize> = open.iter().copied().collect();
+            this.update(cx, |this, cx| {
+                this.open_groups = open;
+                cx.notify();
+            });
+        })
+    }
+
+    /// Put one section's fields back to the loaded values.
+    fn revert_group(&mut self, group: Group, window: &mut Window, cx: &mut Context<Self>) {
+        for widget in self.widgets.iter().filter(|w| w.spec.group == group) {
+            let (text, mixed) = match self.loaded.get(widget.spec.id) {
+                Some(Merged::Same(value)) => (value.clone(), false),
+                _ => (String::new(), true),
+            };
+            self.set_text(widget, &text, mixed, window, cx);
+            self.touched.remove(widget.spec.id);
+        }
+        cx.notify();
     }
 }
 
@@ -626,9 +668,10 @@ impl Render for MetadataSidebar {
             self.badge.clone()
         };
 
+        let spacing = theme.spacing_tokens();
         v_flex()
             .id("metadata-sidebar")
-            .w(px(330.0))
+            .w_72()
             .h_full()
             .flex_none()
             .bg(bg)
@@ -642,19 +685,19 @@ impl Render for MetadataSidebar {
                 }
             }))
             .child(
-                h_flex()
-                    .px_3()
-                    .pt_2()
-                    .pb_1()
-                    .justify_between()
-                    .child(Label::new(self.title()).text_sm())
-                    .child(Label::new(status).text_xs().text_color(warning)),
-            )
-            .child(
                 v_flex()
-                    .px_3()
-                    .pb_2()
-                    .gap_1p5()
+                    .w_full()
+                    .flex_none()
+                    .p(spacing.md)
+                    .gap(spacing.sm)
+                    .border_b_1()
+                    .border_color(border)
+                    .child(
+                        h_flex()
+                            .justify_between()
+                            .child(Label::new(self.title()).text_sm().font_semibold())
+                            .child(Label::new(status).text_xs().text_color(warning)),
+                    )
                     .child(
                         Select::new(&self.templates)
                             .small()
@@ -663,7 +706,7 @@ impl Render for MetadataSidebar {
                     )
                     .child(
                         h_flex()
-                            .gap_2()
+                            .gap(spacing.sm)
                             .child(
                                 Button::new("meta-save")
                                     .primary()
@@ -677,6 +720,7 @@ impl Render for MetadataSidebar {
                             .child(
                                 Button::new("meta-revert")
                                     .small()
+                                    .outline()
                                     .label("Revert")
                                     .disabled(!dirty)
                                     .on_click(
@@ -685,21 +729,19 @@ impl Render for MetadataSidebar {
                             ),
                     ),
             )
-            .child(div().h(px(1.0)).w_full().bg(border))
             .child(if ready {
                 div()
                     .id("metadata-scroll")
                     .flex_1()
                     .min_h_0()
                     .w_full()
-                    .overflow_y_scroll()
-                    .px_3()
+                    .px(spacing.md)
+                    .overflow_y_scrollbar()
                     .child(self.render_form(&edited, cx))
                     .into_any_element()
             } else {
                 div()
-                    .px_3()
-                    .py_2()
+                    .p(spacing.md)
                     .child(Label::new(note).text_xs().text_color(muted))
                     .into_any_element()
             })
