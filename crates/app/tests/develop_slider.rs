@@ -107,6 +107,8 @@ fn clicking_the_slider_track_renders_a_new_preview(cx: &mut TestAppContext) {
     // The photo's edit loads in the background; wait for the panel to be live.
     settle(cx, &rig, |b| b.develop_owner().is_some());
     let before = cx.update(|cx| rig.browser.read(cx).develop_frames());
+    // Opening an unedited photo shows the camera preview; nothing is developed.
+    assert_eq!(before, 0, "opening an unedited photo must not render");
 
     let bounds = cx.update(|cx| slider.read(cx).bounds());
     assert!(
