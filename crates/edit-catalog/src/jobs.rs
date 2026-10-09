@@ -37,6 +37,8 @@ pub enum JobKind {
     IngestVerify,
     BackupCopy,
     Upload,
+    /// The persistent downscaled editing copy of a raw.
+    SmartPreview,
 }
 
 impl JobKind {
@@ -54,6 +56,7 @@ impl JobKind {
             Self::IngestVerify => "ingest_verify",
             Self::BackupCopy => "backup_copy",
             Self::Upload => "upload",
+            Self::SmartPreview => "smart_preview",
         }
     }
 }
@@ -75,6 +78,7 @@ impl FromStr for JobKind {
             "ingest_verify" => Ok(Self::IngestVerify),
             "backup_copy" => Ok(Self::BackupCopy),
             "upload" => Ok(Self::Upload),
+            "smart_preview" => Ok(Self::SmartPreview),
             unknown => Err(Error::InvalidValue(format!("unknown job kind: {unknown}"))),
         }
     }
@@ -95,6 +99,7 @@ impl JobKind {
             Self::IngestVerify,
             Self::BackupCopy,
             Self::Upload,
+            Self::SmartPreview,
         ]
     }
 }
@@ -251,6 +256,43 @@ impl Catalog {
     /// Durably enqueue a job. Returns its id.
     pub fn enqueue_job(&self, kind: JobKind, payload_json: &str) -> Result<JobId> {
         self.with_conn(|conn| enqueue(conn, kind, payload_json))
+    }
+
+    /// Enqueue unless an identical job (same kind and payload) is already
+    /// queued or running, so repeated requests for the same work collapse
+    /// into one. `None` when one was already pending.
+    pub fn enqueue_job_if_absent(
+        &self,
+        kind: JobKind,
+        payload_json: &str,
+    ) -> Result<Option<JobId>> {
+        self.with_conn(|conn| {
+            let pending: bool = conn.query_row(
+                "SELECT EXISTS(SELECT 1 FROM jobs WHERE kind = ?1 AND payload_json = ?2
+                               AND state IN ('queued', 'running'))",
+                params![kind.as_str(), payload_json],
+                |row| row.get(0),
+            )?;
+            if pending {
+                return Ok(None);
+            }
+            enqueue(conn, kind, payload_json).map(Some)
+        })
+    }
+
+    /// Queued jobs of the given kinds.
+    pub fn count_queued_jobs(&self, kinds: &[JobKind]) -> Result<i64> {
+        self.with_conn(|conn| {
+            let mut total = 0;
+            for kind in kinds {
+                total += conn.query_row(
+                    "SELECT COUNT(*) FROM jobs WHERE state = 'queued' AND kind = ?1",
+                    [kind.as_str()],
+                    |row| row.get::<_, i64>(0),
+                )?;
+            }
+            Ok(total)
+        })
     }
 
     /// Claim the oldest queued job (see [`claim`]).
@@ -507,12 +549,53 @@ mod tests {
 
     #[test]
     fn job_kinds_round_trip() {
-        assert_eq!(JobKind::all().len(), 12);
+        assert_eq!(JobKind::all().len(), 13);
         for kind in JobKind::all() {
             assert_eq!(kind.as_str().parse::<JobKind>().unwrap(), *kind);
         }
         assert!("nope".parse::<JobKind>().is_err());
         assert!("nope".parse::<JobState>().is_err());
+    }
+
+    #[test]
+    fn identical_pending_smart_preview_jobs_collapse_and_resume_after_a_crash() {
+        let path = scratch_db("smart-idem");
+        let db = Catalog::open(&path).unwrap();
+        let payload = r#"{"path":"/p/a.nef"}"#;
+        let first = db
+            .enqueue_job_if_absent(JobKind::SmartPreview, payload)
+            .unwrap();
+        assert!(first.is_some());
+        assert!(
+            db.enqueue_job_if_absent(JobKind::SmartPreview, payload)
+                .unwrap()
+                .is_none()
+        );
+        // Different work is not collapsed.
+        assert!(
+            db.enqueue_job_if_absent(JobKind::SmartPreview, r#"{"path":"/p/b.nef"}"#)
+                .unwrap()
+                .is_some()
+        );
+        assert_eq!(db.count_queued_jobs(&[JobKind::SmartPreview]).unwrap(), 2);
+        assert_eq!(db.count_queued_jobs(&[JobKind::Thumb]).unwrap(), 0);
+        // A claimed job still counts as pending; a crash puts it back in the queue.
+        let claimed = db.claim_job().unwrap().unwrap();
+        assert_eq!(Some(claimed.id), first);
+        assert!(
+            db.enqueue_job_if_absent(JobKind::SmartPreview, payload)
+                .unwrap()
+                .is_none()
+        );
+        assert_eq!(db.recover_running().unwrap(), 1);
+        assert_eq!(db.claim_job().unwrap().unwrap().id, claimed.id);
+        // Once done, the same work may be requested again.
+        db.complete_job(claimed.id).unwrap();
+        assert!(
+            db.enqueue_job_if_absent(JobKind::SmartPreview, payload)
+                .unwrap()
+                .is_some()
+        );
     }
 
     #[test]
