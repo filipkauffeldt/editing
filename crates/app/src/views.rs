@@ -68,6 +68,8 @@ pub const THUMB_LONG_EDGE: u32 = 320;
 /// Bounded decoded-thumbnail cache: the grid and strip share it, so a
 /// 10k-photo folder cannot grow the UI process without limit.
 pub const THUMB_CACHE_CAP: usize = 256;
+/// Full-size previews kept for the single view.
+const PREVIEW_CACHE_CAP: usize = 6;
 /// New background decodes kicked off per frame at most.
 const THUMB_REQUEST_BUDGET: usize = 24;
 
@@ -88,6 +90,14 @@ fn paint_origin(
     let ox = (vw - dw) / 2.0 + dw * zoom.pan_x;
     let oy = (vh - dh) / 2.0 + dh * zoom.pan_y;
     (ox, oy)
+}
+
+/// GPUI paints BGRA, so swap the decoder's RGBA once at the boundary.
+fn bgra_image(mut rgba: image::RgbaImage) -> Arc<RenderImage> {
+    for px in rgba.as_chunks_mut::<4>().0 {
+        px.swap(0, 2);
+    }
+    Arc::new(RenderImage::new([image::Frame::new(rgba)]))
 }
 
 gpui_kit::actions!(
@@ -208,6 +218,14 @@ pub struct Browser {
     develop_image_item: Option<i64>,
     /// Developed frames received so far (lets tests see a render land).
     develop_frames: u64,
+    /// The item whose saved edit was read into the develop buffer. Reading
+    /// never renders: the developed image only replaces the camera preview
+    /// once the photo has edits or the user changes a control.
+    develop_loaded: Option<i64>,
+    /// Full-size camera previews for the single view, newest last.
+    previews: HashMap<i64, Arc<RenderImage>>,
+    preview_order: VecDeque<i64>,
+    preview_pending: HashSet<i64>,
     /// Whether the develop buffer holds unsaved slider changes.
     develop_dirty: bool,
     /// Diagnostics for the develop panel status line.
@@ -345,6 +363,10 @@ impl Browser {
             develop_image: None,
             develop_image_item: None,
             develop_frames: 0,
+            develop_loaded: None,
+            previews: HashMap::new(),
+            preview_order: VecDeque::new(),
+            preview_pending: HashSet::new(),
             develop_dirty: false,
             develop_status: String::new(),
             crop: None,
@@ -975,6 +997,9 @@ impl Browser {
             {
                 if let Some(item) = rows.get(neighbor) {
                     self.request_thumb(cx, item.item_id, item.display_path.clone());
+                    if self.mode == Mode::Single && offset == 1 {
+                        self.request_preview(cx, item.item_id, item.display_path.clone());
+                    }
                 }
             }
         }
@@ -1013,10 +1038,8 @@ impl Browser {
 
     /// Insert a decoded frame, evicting the oldest entries past the cap.
     /// Stored BGRA, matching what `paint_image` expects.
-    fn insert_thumb(&mut self, item_id: i64, mut rgba: image::RgbaImage) {
-        for px in rgba.as_chunks_mut::<4>().0 {
-            px.swap(0, 2);
-        }
+    fn insert_thumb(&mut self, item_id: i64, rgba: image::RgbaImage) {
+        let image = bgra_image(rgba);
         if !self.thumbs.contains_key(&item_id)
             && self.thumbs.len() >= THUMB_CACHE_CAP
             && let Some(old) = self.thumb_order.pop_front()
@@ -1027,11 +1050,42 @@ impl Browser {
             self.thumb_order.remove(pos);
         }
         self.thumb_order.push_back(item_id);
-        self.thumbs.insert(
-            item_id,
-            Arc::new(RenderImage::new([image::Frame::new(rgba)])),
-        );
+        self.thumbs.insert(item_id, image);
         self.thumb_pending.remove(&item_id);
+    }
+
+    /// Decode the camera preview at single-view size off-thread, unless
+    /// cached or already queued.
+    fn request_preview(&mut self, cx: &mut Context<Self>, item_id: i64, path: String) {
+        if self.previews.contains_key(&item_id) || !self.preview_pending.insert(item_id) {
+            return;
+        }
+        cx.spawn(async move |this, cx| {
+            let rgba = cx
+                .background_executor()
+                .spawn(async move {
+                    BrowsePreviewProvider::decode_preview(
+                        Path::new(&path),
+                        Some(PROXY_RELEASE_LONG_EDGE as u32),
+                    )
+                })
+                .await;
+            this.update(cx, |this, cx| {
+                this.preview_pending.remove(&item_id);
+                if let Some(rgba) = rgba {
+                    if this.previews.len() >= PREVIEW_CACHE_CAP
+                        && let Some(old) = this.preview_order.pop_front()
+                    {
+                        this.previews.remove(&old);
+                    }
+                    this.preview_order.push_back(item_id);
+                    this.previews.insert(item_id, bgra_image(rgba));
+                }
+                cx.notify();
+            })
+            .ok();
+        })
+        .detach();
     }
 
     /// Read the current item's edit row into the develop session on the
@@ -1096,11 +1150,18 @@ impl Browser {
                     self.develop_dirty = false;
                 }
                 self.develop_status.clear();
-                self.request_render(
-                    RenderSize::Proxy(PROXY_DRAG_LONG_EDGE),
-                    Some(RenderSize::Proxy(PROXY_RELEASE_LONG_EDGE)),
-                    cx,
-                );
+                self.develop_loaded = Some(item_id);
+                // An unedited photo keeps showing the camera preview; the
+                // developed render starts with the first edit.
+                if !self.develop.buffer().is_unedited() || self.develop_dirty {
+                    self.request_render(
+                        RenderSize::Proxy(PROXY_DRAG_LONG_EDGE),
+                        Some(RenderSize::Proxy(PROXY_RELEASE_LONG_EDGE)),
+                        cx,
+                    );
+                } else {
+                    self.queue.finish(item_id);
+                }
             }
             Err(diagnostic) => {
                 self.develop.disown();
@@ -1818,11 +1879,13 @@ impl Browser {
         };
         if let Some(row) = item.as_ref() {
             self.request_thumb(cx, row.item_id, row.display_path.clone());
-            // Kick the develop load and render for a photo with no resolved
-            // art yet, unless it already failed (failures are terminal here).
-            if self.queue.should_kick(row.item_id, self.develop_image_item) {
+            self.request_preview(cx, row.item_id, row.display_path.clone());
+            // Read the saved edit once per photo (reads never render), unless
+            // it already failed (failures are terminal here).
+            if self.queue.should_kick(row.item_id, self.develop_loaded) {
                 self.develop_image = None;
                 self.develop_image_item = None;
+                self.develop_loaded = None;
                 self.queue.begin(row.item_id);
                 self.schedule_current_edit_load(cx);
             }
@@ -1832,6 +1895,7 @@ impl Browser {
                 .as_ref()
                 .filter(|_| self.develop_image_item == Some(row.item_id))
                 .map(Arc::clone)
+                .or_else(|| self.previews.get(&row.item_id).map(Arc::clone))
                 .or_else(|| self.thumbs.get(&row.item_id).map(Arc::clone))
         });
         let zoom = self.zoom;
