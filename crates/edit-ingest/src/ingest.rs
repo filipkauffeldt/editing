@@ -90,6 +90,9 @@ pub struct CardFile {
     pub original_name: String,
     pub bytes: u64,
     pub mtime: i64,
+    /// Protected in the camera. A locked photo is stored read-only on the
+    /// card (no owner-write bit); see [`is_locked`].
+    pub locked: bool,
 }
 
 /// Counts a finished card.
@@ -285,7 +288,24 @@ fn card_file(path: &Path) -> Option<CardFile> {
         original_name,
         bytes: meta.len(),
         mtime,
+        locked: is_locked(&meta),
     })
+}
+
+/// Whether a card file is locked in the camera. Cameras mark a protected
+/// image with the FAT/exFAT read-only attribute, which Linux shows as a
+/// missing owner-write bit. Trust it only when the volume itself is
+/// writable: on a read-only mount every file looks read-only.
+pub fn is_locked(meta: &fs::Metadata) -> bool {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        meta.permissions().mode() & 0o200 == 0
+    }
+    #[cfg(not(unix))]
+    {
+        meta.permissions().readonly()
+    }
 }
 
 /// Assign sequence numbers: RAW and JPEG files that share a base name get
@@ -456,6 +476,7 @@ where
                     bytes: file.bytes as i64,
                     source_path: file.path.to_string_lossy().into_owned(),
                     state: IngestFileState::Duplicate,
+                    locked: file.locked,
                 })?;
                 summary.duplicates += 1;
                 on_progress(index + 1, total);
@@ -484,6 +505,7 @@ where
                 bytes: file.bytes as i64,
                 source_path: file.path.to_string_lossy().into_owned(),
                 state: IngestFileState::Queued,
+                locked: file.locked,
             })?,
         };
 
@@ -887,6 +909,76 @@ mod tests {
         fs::remove_dir_all(&card).ok();
     }
 
+    fn lock(path: &Path) {
+        use std::os::unix::fs::PermissionsExt;
+        fs::set_permissions(path, fs::Permissions::from_mode(0o444)).unwrap();
+    }
+
+    #[test]
+    fn the_scan_reports_files_the_camera_locked() {
+        let card = card_with(&[
+            ("DSC0001.NEF", b"locked one"),
+            ("DSC0002.NEF", b"open"),
+            ("DSC0003.JPG", b"locked jpg"),
+        ]);
+        let dcim = card.join("DCIM/100CANON");
+        lock(&dcim.join("DSC0001.NEF"));
+        lock(&dcim.join("DSC0003.JPG"));
+        let files = enumerate_card(&card).unwrap();
+        let locked: Vec<(&str, bool)> = files
+            .iter()
+            .map(|f| (f.original_name.as_str(), f.locked))
+            .collect();
+        assert_eq!(
+            locked,
+            [
+                ("DSC0001.NEF", true),
+                ("DSC0002.NEF", false),
+                ("DSC0003.JPG", true)
+            ]
+        );
+        fs::remove_dir_all(&card).ok();
+    }
+
+    #[test]
+    fn locked_cards_land_writable_and_the_lock_stays_in_the_history() {
+        use std::os::unix::fs::PermissionsExt;
+        let card = card_with(&[("DSC0001.NEF", b"locked raw"), ("DSC0002.NEF", b"open raw")]);
+        lock(&card.join("DCIM/100CANON/DSC0001.NEF"));
+        let base = scratch("locked-copy");
+        let dest = base.join("Photos");
+        let backup = base.join("Backup");
+        let catalog = Catalog::open(&base.join("catalog.sqlite")).unwrap();
+        let batch = new_batch(&catalog, &dest, Some(&backup));
+        run_ingest_copy(
+            &catalog,
+            &payload(batch, &card, &dest, Some(&backup)),
+            fixed_metadata,
+            &|_, _| {},
+        )
+        .unwrap();
+        // The read-only attribute must not follow the file, or later
+        // IPTC/XMP writes on the copy would fail.
+        for root in [&dest, &backup] {
+            for name in ["shoot_0001.NEF", "shoot_0002.NEF"] {
+                let mode = fs::metadata(root.join("2026-10-07").join(name))
+                    .unwrap()
+                    .permissions()
+                    .mode();
+                assert!(
+                    mode & 0o200 != 0,
+                    "{name} is writable in {root:?}: {mode:o}"
+                );
+            }
+        }
+        let rows = catalog.list_ingest_files(batch).unwrap();
+        let by_name = |name: &str| rows.iter().find(|r| r.original_name == name).unwrap();
+        assert!(by_name("DSC0001.NEF").locked);
+        assert!(!by_name("DSC0002.NEF").locked);
+        fs::remove_dir_all(&base).ok();
+        fs::remove_dir_all(&card).ok();
+    }
+
     #[test]
     fn enumerate_fails_on_an_unreadable_card_root() {
         let missing = scratch("gone").join("not-mounted");
@@ -1039,6 +1131,7 @@ mod tests {
                 bytes: 10,
                 source_path: "/card/DCIM/DSC0001.JPG".into(),
                 state: IngestFileState::Queued,
+                locked: false,
             })
             .unwrap();
         catalog
@@ -1163,6 +1256,7 @@ mod tests {
                 bytes: 10,
                 source_path: "/card/DCIM/DSC0001.JPG".into(),
                 state: IngestFileState::Queued,
+                locked: false,
             })
             .unwrap();
         catalog
