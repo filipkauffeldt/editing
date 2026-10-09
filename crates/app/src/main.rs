@@ -1,4 +1,5 @@
 use edit_render::RenderService;
+use edit_render::smart_preview::{SMART_PREVIEW_BUDGET_BYTES, SmartPreviewStore};
 
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -204,6 +205,21 @@ fn main() {
     let catalog = Arc::new(Catalog::open(&catalog_path()).expect("open catalog"));
     catalog.recover_running().expect("recover running jobs");
 
+    // Smart previews live next to the catalog file.
+    let smart_dir = catalog_path()
+        .parent()
+        .map(|dir| dir.join("smart-previews"))
+        .unwrap_or_else(|| PathBuf::from("smart-previews"));
+    let renderer = Arc::new(
+        RenderService::with_paths(Arc::new(CatalogPhotoPaths {
+            catalog: Arc::clone(&catalog),
+        }))
+        .with_smart_previews(SmartPreviewStore::new(
+            smart_dir,
+            SMART_PREVIEW_BUDGET_BYTES,
+        )),
+    );
+    let worker_renderer = Arc::clone(&renderer);
     let worker_catalog = Arc::clone(&catalog);
     // The resident exiftool writer lives once for the process; job grain
     // serializes through the transport mutex. Missing binary: template
@@ -214,15 +230,13 @@ fn main() {
             Some(writer) => edit_metadata::run_metadata_write(job, writer, tx),
             None => Err("exiftool unavailable (install libimage-exiftool-perl)".into()),
         },
+        JobKind::SmartPreview => app::smart::run_job(&worker_renderer, &job.payload_json),
         _ => handle_job(worker_catalog.clone(), job, tx),
     });
     let pool =
         edit_catalog::spawn_workers(&catalog, WORKER_THREADS, handler).expect("spawn workers");
     let events = pool.events().clone();
     let browser_events = events.clone();
-    let renderer = Arc::new(RenderService::with_paths(Arc::new(CatalogPhotoPaths {
-        catalog: Arc::clone(&catalog),
-    })));
     // The pool owns the worker threads; leak it so background jobs keep
     // draining for the life of the window.
     std::mem::forget(pool);

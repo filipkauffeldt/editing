@@ -367,6 +367,19 @@ impl RenderService {
         self.decodes.load(Ordering::Relaxed)
     }
 
+    /// Smart preview bytes on disk and the store's budget; `None` without a store.
+    pub fn smart_preview_usage(&self) -> Option<(u64, u64)> {
+        self.smart
+            .as_ref()
+            .map(|s| (s.total_bytes(), s.budget_bytes()))
+    }
+
+    /// Drop the smart previews of photos that are no longer in `live` (their
+    /// rows were removed). Returns how many were deleted.
+    pub fn retain_smart_previews<'a>(&self, live: impl IntoIterator<Item = &'a Path>) -> usize {
+        self.smart.as_ref().map_or(0, |s| s.retain_paths(live))
+    }
+
     /// The best editing image available for the file right now. Renders use
     /// it automatically; the app asks to know whether to say "Preparing".
     pub fn editing_source(&self, path: &Path) -> EditingSource {

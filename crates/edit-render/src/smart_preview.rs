@@ -139,6 +139,10 @@ impl SmartPreviewStore {
         }
     }
 
+    pub fn budget_bytes(&self) -> u64 {
+        self.budget_bytes
+    }
+
     pub fn dir(&self) -> &Path {
         &self.dir
     }
