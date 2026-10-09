@@ -66,6 +66,7 @@ use crate::smart;
 const PREPARING_STATUS: &str = "Preparing…";
 
 mod crop_ui;
+mod preset_ops;
 
 /// Cells per contact-sheet row over `uniform_list`.
 pub const GRID_COLS: usize = 4;
@@ -206,8 +207,10 @@ pub struct Browser {
     develop: DevelopSession,
     /// The develop sidebar; reports user actions as [`PanelEvent`]s.
     panel: Entity<DevelopPanel>,
-    /// Saved user presets: `(name, file path)`.
-    user_presets: Vec<(String, String)>,
+    /// The indexed preset files.
+    user_presets: Vec<crate::preset_store::PresetRow>,
+    /// The preset last picked in the panel (its list key).
+    picked_preset: Option<SharedString>,
     /// Develop render scheduling: the latest wanted size for the one worker,
     /// cancellation of stale renders, and per-item terminal failures that
     /// stop the paint-time kick.
@@ -323,7 +326,7 @@ impl Browser {
             KeyBinding::new("x", FlipCrop, Some("!Input")),
             KeyBinding::new("ctrl-s", SaveMetadata, None),
         ]);
-        let browser = Self {
+        let mut browser = Self {
             catalog,
             events,
             focus,
@@ -349,6 +352,7 @@ impl Browser {
             develop: DevelopSession::new(DevelopSettings::default()),
             panel,
             user_presets,
+            picked_preset: None,
             queue: RenderQueue::default(),
             prewarm_token: CancelToken::new(),
             prewarmed: HashSet::new(),
@@ -388,6 +392,7 @@ impl Browser {
             sidebar_stale: Vec::new(),
         };
         cx.on_app_quit(|this, cx| this.flush_for_quit(cx)).detach();
+        browser.rescan_presets(cx);
         browser
     }
 
@@ -1235,16 +1240,26 @@ impl Browser {
         self.panel.clone()
     }
 
-    /// The preset list: None, the starters, then the user's saved presets.
+    /// The preset list: None and the starters, then the indexed presets
+    /// under their folder.
     fn preset_entries(&self) -> Vec<PresetEntry> {
         let mut entries = vec![none_entry()];
         entries.extend(BUILTIN_PRESETS.iter().map(|preset| PresetEntry {
             key: format!("builtin:{}", preset.name).into(),
             title: preset.name.into(),
+            group: "Built in".into(),
         }));
-        entries.extend(self.user_presets.iter().map(|(name, _)| PresetEntry {
-            key: format!("user:{name}").into(),
-            title: name.clone().into(),
+        entries.extend(self.user_presets.iter().map(|preset| {
+            PresetEntry {
+                key: format!("user:{}", preset.path).into(),
+                title: preset.name.clone().into(),
+                group: preset
+                    .group
+                    .clone()
+                    .unwrap_or_else(|| "User presets".into())
+                    .replace('/', " / ")
+                    .into(),
+            }
         }));
         entries
     }
@@ -1266,6 +1281,10 @@ impl Browser {
             }
             PanelEvent::ApplyPreset(key) => self.apply_preset(&key, cx),
             PanelEvent::SavePreset(name) => self.save_preset(&name, cx),
+            PanelEvent::ImportPresets => self.prompt_import_presets(cx),
+            PanelEvent::ExportSettings => self.prompt_export_settings(cx),
+            PanelEvent::ExportPreset => self.prompt_export_preset(cx),
+            PanelEvent::ChoosePresetFolder => self.prompt_preset_folder(cx),
         }
     }
 
@@ -1292,8 +1311,7 @@ impl Browser {
                 .find(|preset| preset.name == name)
                 .map(|preset| preset.to_values());
         }
-        let name = key.strip_prefix("user:")?;
-        let (_, path) = self.user_presets.iter().find(|(n, _)| n == name)?;
+        let path = key.strip_prefix("user:")?;
         crate::preset_store::load(Path::new(path)).ok()
     }
 
@@ -1302,6 +1320,7 @@ impl Browser {
         let Some(values) = self.resolve_preset(key) else {
             return;
         };
+        self.picked_preset = Some(key.to_owned().into());
         let current = self.develop_item_id();
         let targets: Vec<i64> = self
             .selection
@@ -1359,19 +1378,6 @@ impl Browser {
                 self.unsaved.insert(item, json);
             }
         }
-    }
-
-    /// Save the current edit's changed controls as a named preset.
-    pub fn save_preset(&mut self, name: &str, cx: &mut Context<Self>) {
-        let values = PresetValues::from_settings(self.develop.buffer());
-        match crate::preset_store::save(&self.catalog, name, &values) {
-            Ok(()) => {
-                self.user_presets = crate::preset_store::list(&self.catalog);
-                self.develop_status = format!("Saved preset {}", name.trim());
-            }
-            Err(e) => self.develop_status = format!("Preset not saved: {e}"),
-        }
-        cx.notify();
     }
 
     /// Subscribe-backed live slider change (`SliderEvent::Change`): write the
