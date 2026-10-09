@@ -57,7 +57,13 @@ use crate::sidebar::{MetadataSidebar, SaveMetadata, SidebarEvent};
 use edit_core::{CancelToken, Crop, DevelopSettings, RenderSize};
 use edit_ingest::{IngestCopyPayload, dest_root_path};
 use edit_metadata::{CodeReplacements, MetadataWritePayload, TemplateFields};
-use edit_render::{PROXY_DRAG_LONG_EDGE, PROXY_RELEASE_LONG_EDGE, RenderService};
+use edit_render::smart_preview::is_raw_path;
+use edit_render::{EditingSource, PROXY_DRAG_LONG_EDGE, PROXY_RELEASE_LONG_EDGE, RenderService};
+
+use crate::smart;
+
+/// Develop panel status while a raw's smart preview is being built.
+const PREPARING_STATUS: &str = "Preparing…";
 
 mod crop_ui;
 
@@ -210,6 +216,12 @@ pub struct Browser {
     prewarm_token: CancelToken,
     /// Items whose neighbor prewarm already ran (bounded).
     prewarmed: HashSet<i64>,
+    /// Raws whose smart preview job is queued or running, by path.
+    smart_pending: HashSet<String>,
+    /// Raws whose smart preview failed; not retried until a folder reopens.
+    smart_failed: HashSet<String>,
+    /// A smart preview that just finished, to swap into the open photo.
+    smart_ready: Option<String>,
     /// Sidecar writes, serialized per item.
     sidecars: SidecarQueue,
     /// Edits whose catalog write failed, retried at every commit point and
@@ -340,6 +352,9 @@ impl Browser {
             queue: RenderQueue::default(),
             prewarm_token: CancelToken::new(),
             prewarmed: HashSet::new(),
+            smart_pending: HashSet::new(),
+            smart_failed: HashSet::new(),
+            smart_ready: None,
             sidecars: SidecarQueue::default(),
             unsaved: BTreeMap::new(),
             develop_image: None,
@@ -428,6 +443,7 @@ impl Browser {
                 let applied = this
                     .update(cx, |browser, cx| {
                         browser.on_job_event(&event);
+                        browser.apply_smart_preview(cx);
                         cx.notify();
                     })
                     .ok();
@@ -474,6 +490,8 @@ impl Browser {
     pub fn open_folder(&mut self, path: PathBuf, cx: &mut Context<Self>) {
         // Reopening is an explicit reload: failed renders get another try.
         self.queue.navigate();
+        smart::cancel_sweep();
+        self.smart_failed.clear();
         // A folder opens on its contact sheet with the first photo selected.
         self.mode = Mode::Grid;
         self.current = 0;
@@ -880,6 +898,7 @@ impl Browser {
                     self.resolve_scan_root(event.id);
                     self.scan_status.clear();
                     self.refresh_items();
+                    self.start_smart_sweep();
                 } else if let Some(path) = self.thumb_jobs.remove(&event.id) {
                     self.mark_thumb(&path, ThumbState::Ready);
                     self.rebuild_rows();
@@ -907,7 +926,7 @@ impl Browser {
                     } else {
                         format!("Metadata written: {done_count} done, {in_flight} in flight…")
                     };
-                } else {
+                } else if !self.on_smart_event(event.id, true) {
                     self.on_ingest_event(event.id, &event.kind);
                 }
             }
@@ -921,7 +940,7 @@ impl Browser {
                     self.meta_jobs.remove(&event.id);
                     self.set_meta(item_id, MetaBadge::Failed);
                     self.template_status = format!("Metadata write failed: {error}");
-                } else {
+                } else if !self.on_smart_event(event.id, false) {
                     self.on_ingest_event(event.id, &event.kind);
                 }
             }
@@ -1026,6 +1045,9 @@ impl Browser {
                     }
                 }
             }
+        }
+        if self.mode == Mode::Single {
+            self.prewarm_neighbors(cx);
         }
     }
 
@@ -1256,6 +1278,7 @@ impl Browser {
         }
         if self.develop.edit(change) {
             self.develop_dirty = true;
+            self.want_smart_preview();
             self.queue.clear_failed(item);
             self.request_render(RenderSize::Proxy(PROXY_RELEASE_LONG_EDGE), None, cx);
             self.persist_current_edit(cx);
@@ -1361,6 +1384,7 @@ impl Browser {
         }
         self.develop.set_slider(id, value);
         self.develop_dirty = true;
+        self.want_smart_preview();
         self.queue.clear_failed(item);
         self.request_render(RenderSize::Proxy(PROXY_DRAG_LONG_EDGE), None, cx);
     }
@@ -1374,6 +1398,7 @@ impl Browser {
         }
         self.develop.end_drag(id, value);
         self.develop_dirty = true;
+        self.want_smart_preview();
         self.queue.clear_failed(item);
         self.request_render(RenderSize::Proxy(PROXY_RELEASE_LONG_EDGE), None, cx);
         self.persist_current_edit(cx);
@@ -1382,6 +1407,87 @@ impl Browser {
     /// The catalog row id of the item the develop panel is editing.
     fn develop_item_id(&self) -> i64 {
         self.current_item().map(|row| row.item_id).unwrap_or(-1)
+    }
+
+    /// The open photo is being edited: build its smart preview in the
+    /// background if it is a raw without one. The embedded preview stays on
+    /// screen and renders keep running from the raw proxy until it is ready,
+    /// then the render swaps to the saved copy.
+    fn want_smart_preview(&mut self) {
+        let Some(path) = self.current_item().map(|item| item.display_path) else {
+            return;
+        };
+        if self.smart_pending.contains(&path) {
+            self.develop_status = PREPARING_STATUS.to_string();
+            return;
+        }
+        if self.smart_failed.contains(&path) {
+            return;
+        }
+        if self.renderer.editing_source(Path::new(&path)) != EditingSource::Raw {
+            return;
+        }
+        smart::enqueue(&self.catalog, &path, true);
+        self.smart_pending.insert(path);
+        self.develop_status = PREPARING_STATUS.to_string();
+    }
+
+    /// A `smart_preview` job ended. `false` when the event is another kind.
+    fn on_smart_event(&mut self, id: JobId, ok: bool) -> bool {
+        let Ok(job) = self.catalog.job(id) else {
+            return false;
+        };
+        if job.kind != JobKind::SmartPreview {
+            return false;
+        }
+        if let Ok(payload) = serde_json::from_str::<smart::SmartPreviewPayload>(&job.payload_json) {
+            let was_pending = self.smart_pending.remove(&payload.path);
+            if self.develop_status == PREPARING_STATUS {
+                self.develop_status.clear();
+            }
+            if ok {
+                if was_pending {
+                    self.smart_ready = Some(payload.path);
+                }
+            } else {
+                self.smart_failed.insert(payload.path);
+            }
+        }
+        true
+    }
+
+    /// After a drained job event: swap a finished smart preview into the
+    /// open photo's render (same size and framing, so nothing jumps).
+    pub fn apply_smart_preview(&mut self, cx: &mut Context<Self>) {
+        let Some(path) = self.smart_ready.take() else {
+            return;
+        };
+        let open = self
+            .current_item()
+            .is_some_and(|item| item.display_path == path);
+        if open
+            && self.develop.owner() == Some(self.develop_item_id())
+            && (!self.develop.buffer().is_unedited() || self.develop_dirty)
+        {
+            self.request_render(RenderSize::Proxy(PROXY_RELEASE_LONG_EDGE), None, cx);
+        }
+    }
+
+    /// Start the folder sweep: raw-only photos from the open one outward.
+    fn start_smart_sweep(&mut self) {
+        let mut paths: Vec<String> = self
+            .items
+            .iter()
+            .filter(|item| {
+                item.has_raw && !item.has_jpeg && is_raw_path(Path::new(&item.display_path))
+            })
+            .map(|item| item.display_path.clone())
+            .collect();
+        let open = self.current_item().map(|item| item.display_path);
+        if let Some(pos) = open.and_then(|open| paths.iter().position(|p| *p == open)) {
+            paths.rotate_left(pos);
+        }
+        smart::start_sweep(Arc::clone(&self.catalog), Arc::clone(&self.renderer), paths);
     }
 
     /// Request a render; the worker takes the latest request only, so a
@@ -1568,9 +1674,17 @@ impl Browser {
                 if !self.prewarmed.insert(item.item_id) {
                     continue;
                 }
+                let path = item.display_path.clone();
+                if self.renderer.editing_source(Path::new(&path)) == EditingSource::Raw {
+                    // A raw: build its smart preview rather than decode the raw proxy.
+                    if !self.smart_pending.contains(&path) && !self.smart_failed.contains(&path) {
+                        smart::enqueue(&self.catalog, &path, true);
+                        self.smart_pending.insert(path);
+                    }
+                    continue;
+                }
                 let renderer = Arc::clone(&self.renderer);
                 let token = self.prewarm_token.clone();
-                let path = item.display_path.clone();
                 let item_id = item.item_id;
                 cx.spawn(async move |this, cx| {
                     let warmed = cx

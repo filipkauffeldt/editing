@@ -184,6 +184,7 @@ impl Browser {
             cx.notify();
             return;
         }
+        self.want_smart_preview();
         self.crop = Some(CropSession::enter(self.develop.crop()));
         self.straightened_image = false;
         self.crop_base = None;
