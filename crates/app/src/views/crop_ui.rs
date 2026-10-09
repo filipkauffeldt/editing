@@ -376,13 +376,14 @@ impl Browser {
             .chain(Aspect::ALL.into_iter().map(Some))
             .collect();
         let mut preset_rows = Vec::new();
-        for (row, chunk) in presets.chunks(4).enumerate() {
+        // Free, Original and 1:1 on the first line; the ratios on the second.
+        for (row, chunk) in [&presets[..3], &presets[3..]].into_iter().enumerate() {
             let mut line = h_flex().w_full().gap_1();
             for (col, preset) in chunk.iter().enumerate() {
                 let preset = *preset;
                 line = line.child(
-                    div().flex_1().child(
-                        Button::new(("crop-aspect", row * 4 + col))
+                    div().flex_1().min_w_0().child(
+                        Button::new(("crop-aspect", row * 3 + col))
                             .label(preset.map(Aspect::label).unwrap_or("Free"))
                             .xsmall()
                             .w_full()
