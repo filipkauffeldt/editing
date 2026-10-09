@@ -570,10 +570,15 @@ impl MetadataSidebar {
                 .collect();
             let edits = rows.iter().filter(|w| edited.contains(w.spec.id)).count();
             let open = self.open_groups.contains(&index);
-            let content = v_flex().w_full().gap(spacing.md).pb(spacing.md).children(
-                rows.into_iter()
-                    .map(|w| self.render_row(w, edited.contains(w.spec.id), cx)),
-            );
+            let rows = if open { rows } else { Vec::new() };
+            let content = v_flex()
+                .w_full()
+                .gap(spacing.md)
+                .when(open, |col| col.pb(spacing.md))
+                .children(
+                    rows.into_iter()
+                        .map(|w| self.render_row(w, edited.contains(w.spec.id), cx)),
+                );
             let primary = cx.theme().primary;
             let owner = this.clone();
             accordion = accordion.item(move |item| {

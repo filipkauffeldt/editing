@@ -2350,8 +2350,13 @@ impl Render for Browser {
                         };
                         match unsaved {
                             0 => status,
-                            n if status.is_empty() => format!("{n} unsaved metadata edits"),
-                            n => format!("{status}; {n} unsaved metadata edits"),
+                            n => {
+                                let unsaved = format!(
+                                    "{n} unsaved metadata edit{}",
+                                    if n == 1 { "" } else { "s" }
+                                );
+                                if status.is_empty() { unsaved } else { format!("{status}; {unsaved}") }
+                            }
                         }
                     })
                     .right("O open folder, I ingest, G grid or single, C crop, Z fit, Shift Z 100%, T templates"),
