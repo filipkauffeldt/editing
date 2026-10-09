@@ -9,6 +9,10 @@ concurrency:
 
 env:
   CARGO_TERM_COLOR: always
+  # Debug info and incremental caches made the debug target dir big enough to
+  # fill the runner disk (the linker died with a bus error).
+  CARGO_INCREMENTAL: 0
+  CARGO_PROFILE_DEV_DEBUG: 0
 
 jobs:
   check:
@@ -16,6 +20,11 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
+
+      - name: Free disk space
+        run: |
+          sudo rm -rf /usr/local/lib/android /usr/share/dotnet /opt/ghc /usr/local/.ghcup
+          df -h /
 
       - name: Install system dependencies
         run: |
