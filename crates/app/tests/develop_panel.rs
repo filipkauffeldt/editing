@@ -177,10 +177,6 @@ fn reset_buttons_put_a_row_a_section_and_everything_back(cx: &mut TestAppContext
 #[gpui_kit::test]
 fn a_typed_number_commits_clamped_and_is_saved(cx: &mut TestAppContext) {
     let rig = open_single(cx);
-    let panel = cx.update(|cx| rig.browser.read(cx).develop_panel());
-    let input = cx
-        .update(|cx| panel.read(cx).number_input("light.exposure"))
-        .unwrap();
     click(cx, &rig, "develop-value-light.exposure");
     cx.update_window(rig.handle, |_, window, cx| {
         window.press("secondary-a", cx);

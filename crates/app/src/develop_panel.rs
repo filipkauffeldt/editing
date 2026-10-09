@@ -132,6 +132,12 @@ pub struct DevelopPanel {
 
 impl EventEmitter<PanelEvent> for DevelopPanel {}
 
+impl Default for DevelopPanel {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl DevelopPanel {
     pub fn new() -> Self {
         Self {
