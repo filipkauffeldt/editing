@@ -33,7 +33,7 @@ gpui_kit::actions!(metadata_sidebar, [SaveMetadata]);
 
 /// Photos whose values stay cached; past this the cache starts over.
 const CACHE_CAP: usize = 4096;
-const LABEL_WIDTH: f32 = 92.0;
+const LABEL_WIDTH: f32 = 108.0;
 
 type Choices = SearchableVec<String>;
 
@@ -628,7 +628,7 @@ impl Render for MetadataSidebar {
 
         v_flex()
             .id("metadata-sidebar")
-            .w(px(300.0))
+            .w(px(330.0))
             .h_full()
             .flex_none()
             .bg(bg)
