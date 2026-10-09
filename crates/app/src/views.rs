@@ -376,6 +376,11 @@ impl Browser {
         browser
     }
 
+    /// The metadata form once the first frame has built it.
+    pub fn sidebar(&self) -> Option<Entity<MetadataSidebar>> {
+        self.sidebar.clone()
+    }
+
     /// Name of the open folder (its last path component), empty before one
     /// is opened.
     pub fn folder_name(&self) -> String {
@@ -2242,6 +2247,7 @@ impl Render for Browser {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         self.sync_straighten(window, cx);
         let metadata = self.render_metadata(window, cx);
+        let unsaved = metadata.read(cx).unsaved_count(cx);
         let center: AnyElement = match self.mode {
             Mode::Grid => self.render_grid(cx).into_any_element(),
             Mode::Single => self.render_single(cx).into_any_element(),
@@ -2336,10 +2342,17 @@ impl Render for Browser {
             )
             .child(
                 StatusBar::new()
-                    .left(match (self.template_status.is_empty(), self.scan_status.is_empty()) {
-                        (true, _) => self.scan_status.clone(),
-                        (false, true) => self.template_status.clone(),
-                        (false, false) => format!("{}; {}", self.template_status, self.scan_status),
+                    .left({
+                        let status = match (self.template_status.is_empty(), self.scan_status.is_empty()) {
+                            (true, _) => self.scan_status.clone(),
+                            (false, true) => self.template_status.clone(),
+                            (false, false) => format!("{}; {}", self.template_status, self.scan_status),
+                        };
+                        match unsaved {
+                            0 => status,
+                            n if status.is_empty() => format!("{n} unsaved metadata edits"),
+                            n => format!("{status}; {n} unsaved metadata edits"),
+                        }
                     })
                     .right("O open folder, I ingest, G grid or single, C crop, Z fit, Shift Z 100%, T templates"),
             )

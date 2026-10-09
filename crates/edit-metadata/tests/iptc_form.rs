@@ -114,7 +114,7 @@ fn select_options_survive_a_round_trip() {
             let fields = TemplateFields::default().with(spec.id, *value);
             try_write(&writer, &file, &fields, true)
                 .unwrap_or_else(|e| panic!("{} option {label}: {e}", spec.id));
-            let read = read_fields(&bin, &[file.clone()]).unwrap();
+            let read = read_fields(&bin, std::slice::from_ref(&file)).unwrap();
             let got = read[0].get(spec.id).map(String::as_str);
             assert_eq!(got, Some(*value), "{} option {label}", spec.id);
         }
@@ -139,7 +139,9 @@ fn jpeg_round_trip_keeps_twins_unicode_and_lines() {
         .with("person_shown", "Ann; Bo");
     write(&writer, &file, &fields, true);
 
-    let read = read_fields(&bin, &[file.clone()]).unwrap().remove(0);
+    let read = read_fields(&bin, std::slice::from_ref(&file))
+        .unwrap()
+        .remove(0);
     assert_eq!(read["caption"], caption);
     assert_eq!(read["headline"], "Överraskning");
     assert_eq!(read["keywords"], "ice; Smith, John; 水");
