@@ -214,13 +214,14 @@ fn row_ingest_file(row: &Row) -> rusqlite::Result<IngestFile> {
         state,
         error: row.get(11)?,
         created_at: row.get(12)?,
+        locked: row.get::<_, i64>(13)? != 0,
     })
 }
 
 /// The column list shared by every ingest-file SELECT, in [`row_ingest_file`]
 /// order.
 const INGEST_FILE_COLUMNS: &str = "id, batch_id, original_name, taken_at, bytes, source_path, \
-                                   dest_path, backup_path, blake3, photo_id, state, error, created_at";
+                                   dest_path, backup_path, blake3, photo_id, state, error, created_at, locked";
 
 /// The column list shared by every photo SELECT, in [`row_photo`] order.
 const PHOTO_COLUMNS: &str = "id, root_id, path, dir, base_name, ext, kind, bytes, mtime, width, \
@@ -1088,8 +1089,8 @@ impl Catalog {
         self.with_conn(|conn| {
             conn.execute(
                 "INSERT INTO ingest_files
-                   (batch_id, original_name, taken_at, bytes, source_path, state, created_at)
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+                   (batch_id, original_name, taken_at, bytes, source_path, state, created_at, locked)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
                 params![
                     file.batch_id,
                     file.original_name,
@@ -1097,7 +1098,8 @@ impl Catalog {
                     file.bytes,
                     file.source_path,
                     file.state.as_str(),
-                    now_unix()
+                    now_unix(),
+                    file.locked
                 ],
             )?;
             Ok(conn.last_insert_rowid())
@@ -1473,6 +1475,7 @@ mod tests {
                 bytes: 1024,
                 source_path: "/media/card/DCIM/DSC01234.NEF".into(),
                 state: IngestFileState::Queued,
+                locked: false,
             })
             .unwrap();
 
@@ -1560,6 +1563,7 @@ mod tests {
                 bytes: 5,
                 source_path: "/open".into(),
                 state: IngestFileState::Copying,
+                locked: false,
             })
             .unwrap();
         assert_eq!(
@@ -1647,6 +1651,7 @@ mod tests {
                 bytes: 1024,
                 source_path: "/card/DSC01234.NEF".into(),
                 state: IngestFileState::Queued,
+                locked: false,
             })
             .unwrap();
 

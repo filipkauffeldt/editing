@@ -239,6 +239,8 @@ pub struct IngestFile {
     pub state: edit_core::IngestFileState,
     pub error: Option<String>,
     pub created_at: i64,
+    /// Protected in the camera (read-only on the card).
+    pub locked: bool,
 }
 
 /// Parameters for recording a file as it enters the ingest pipeline. The
@@ -252,4 +254,6 @@ pub struct NewIngestFile {
     pub bytes: i64,
     pub source_path: String,
     pub state: edit_core::IngestFileState,
+    /// Protected in the camera (read-only on the card).
+    pub locked: bool,
 }
