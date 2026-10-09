@@ -258,3 +258,90 @@ fn escape_cancels_and_enter_applies_and_saves(cx: &mut TestAppContext) {
     settle(cx, &rig, |b| b.crop_ready());
     assert_eq!(draft(cx, &rig).rotation_degrees, 3.0);
 }
+
+#[gpui_kit::test]
+fn drawing_on_an_uncropped_photo_makes_a_frame_in_the_selected_aspect(cx: &mut TestAppContext) {
+    let rig = rig(cx);
+    enter_crop(cx, &rig, true);
+    let source = (600.0, 400.0);
+
+    // Free: the frame is the box between the press and the release.
+    drag(cx, &rig, (0.2, 0.2), (0.6, 0.5));
+    let free = draft(cx, &rig).rect;
+    assert!(
+        (free.x - 0.2).abs() < 0.01 && (free.y - 0.2).abs() < 0.01,
+        "{free:?}"
+    );
+    assert!(
+        (free.w - 0.4).abs() < 0.01 && (free.h - 0.3).abs() < 0.01,
+        "{free:?}"
+    );
+
+    // Back to the whole photo, then draw with a lock: the ratio holds.
+    cx.update(|cx| rig.browser.update(cx, |b, cx| b.reset_crop(cx)));
+    cx.update(|cx| {
+        rig.browser
+            .update(cx, |b, cx| b.set_crop_aspect(Some(Aspect::ThreeTwo), cx))
+    });
+    drag(cx, &rig, (0.1, 0.1), (0.5, 0.9));
+    let locked = draft(cx, &rig).rect;
+    assert!(
+        (rect_ratio(locked, source) - 1.5).abs() < 0.01,
+        "{locked:?}"
+    );
+    assert!(
+        (locked.x - 0.1).abs() < 0.01 && (locked.y - 0.1).abs() < 0.01,
+        "{locked:?}"
+    );
+
+    // The frame drawn is editable: a locked handle drag keeps the ratio.
+    drag(
+        cx,
+        &rig,
+        (locked.x + locked.w - 0.002, locked.y + locked.h - 0.002),
+        (0.3, 0.3),
+    );
+    assert!((rect_ratio(draft(cx, &rig).rect, source) - 1.5).abs() < 0.02);
+}
+
+#[gpui_kit::test]
+fn dragging_outside_the_frame_turns_the_photo_and_x_flips_the_frame(cx: &mut TestAppContext) {
+    let rig = rig(cx);
+    enter_crop(cx, &rig, true);
+    let source = (600.0, 400.0);
+    drag(cx, &rig, (0.3, 0.3), (0.7, 0.7));
+    let frame = draft(cx, &rig).rect;
+
+    // A press east of the frame, pulled downward, turns the photo clockwise.
+    drag(cx, &rig, (0.9, 0.5), (0.9, 0.7));
+    let turned = draft(cx, &rig);
+    assert!(turned.rotation_degrees > 2.0, "{turned:?}");
+    assert!(
+        rect_fits(turned.rect, turned.rotation_degrees, source),
+        "{turned:?}"
+    );
+    assert!(
+        turned.rect.w <= frame.w + 1e-4,
+        "the frame never grows when turning"
+    );
+
+    // Pulled the other way past the limit it clamps at 45 degrees.
+    drag(cx, &rig, (0.95, 0.5), (0.2, 1.6));
+    assert!(draft(cx, &rig).rotation_degrees.abs() <= 45.0);
+
+    // X turns a locked frame between landscape and portrait.
+    cx.update(|cx| rig.browser.update(cx, |b, cx| b.straighten_to(0.0, cx)));
+    cx.update(|cx| {
+        rig.browser
+            .update(cx, |b, cx| b.set_crop_aspect(Some(Aspect::ThreeTwo), cx))
+    });
+    let before = draft(cx, &rig);
+    assert!(rect_ratio(before.rect, source) > 1.0);
+    cx.simulate_keystrokes(rig.handle, "x");
+    let after = draft(cx, &rig);
+    assert!(after.aspect_flipped);
+    assert!(
+        (rect_ratio(after.rect, source) - 2.0 / 3.0).abs() < 0.02,
+        "{after:?}"
+    );
+}

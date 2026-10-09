@@ -4,9 +4,16 @@
 //! The drag, aspect and fit rules live in [`crate::crop`] and are covered by
 //! `cargo test`. This module only turns pointer positions into the
 //! straightened canvas's normalized coordinates and paints what the session
-//! holds. Renders go through the same coalescing worker as the sliders: while
-//! the mode is active they show the whole straightened canvas, so the frame
-//! sits over the image and the image turns under it.
+//! holds.
+//!
+//! Nothing in crop mode runs the develop pipeline per pointer event. Entering
+//! renders the whole photo once; the canvas paints that image and the frame,
+//! handles and grid over it, so frame drags cost one repaint. A straighten
+//! angle turns a small copy of that image on a background thread (newest
+//! request only) and the full-size copy when the pointer is let go. The
+//! pipeline renders the committed crop when the mode ends.
+
+use std::sync::Arc;
 
 use edit_core::{Aspect, Rect, RenderSize};
 use gpui_kit::component::button::{Button, ButtonVariants as _};
@@ -18,9 +25,10 @@ use gpui_kit::component::{
     ActiveTheme as _, Disableable as _, IconName, Selectable as _, Sizable as _, h_flex, v_flex,
 };
 use gpui_kit::*;
+use image::RgbaImage;
 
 use super::{Browser, Mode, PROXY_DRAG_LONG_EDGE, PROXY_RELEASE_LONG_EDGE};
-use crate::crop::{CropSession, Handle};
+use crate::crop::{CropSession, Grab, Handle};
 
 /// Where the canvas last painted the image, in window pixels. The pointer
 /// maps into the straightened canvas through it.
@@ -141,9 +149,9 @@ impl Browser {
         self.crop.as_ref().map(|session| session.draft().clone())
     }
 
-    /// Whether the crop canvas has painted, so the frame can be edited.
+    /// Whether the crop canvas has its image, so the frame can be edited.
     pub fn crop_ready(&self) -> bool {
-        self.straightened_image && self.crop.as_ref().is_some_and(CropSession::has_source)
+        self.crop_base.is_some() && self.crop.as_ref().is_some_and(CropSession::has_source)
     }
 
     /// Where the canvas last painted the image, as `(x, y, w, h)` in window
@@ -178,8 +186,13 @@ impl Browser {
         }
         self.crop = Some(CropSession::enter(self.develop.crop()));
         self.straightened_image = false;
+        self.crop_base = None;
+        self.crop_base_image = None;
+        self.crop_small = None;
+        self.crop_hover = None;
         self.zoom.reset();
         self.queue.clear_failed(item.item_id);
+        // The one pipeline render of crop mode: the whole photo, uncropped.
         self.request_render(
             RenderSize::Proxy(PROXY_DRAG_LONG_EDGE),
             Some(RenderSize::Proxy(PROXY_RELEASE_LONG_EDGE)),
@@ -195,6 +208,11 @@ impl Browser {
             return;
         };
         self.straighten_dragging = false;
+        self.crop_base = None;
+        self.crop_base_image = None;
+        self.crop_small = None;
+        self.crop_hover = None;
+        self.crop_turn.clear();
         if apply {
             let crop = session.result();
             if crop.as_ref() != self.develop.crop() {
@@ -213,25 +231,138 @@ impl Browser {
         cx.notify();
     }
 
-    /// The crop and framing the next render uses: the whole straightened
-    /// canvas in crop mode, the committed crop otherwise.
+    /// `X`: the frame and its lock turn between landscape and portrait.
+    pub(super) fn flip_crop_orientation(&mut self, cx: &mut Context<Self>) {
+        if let Some(session) = self.crop.as_mut() {
+            session.flip_orientation();
+            cx.notify();
+        }
+    }
+
+    /// The crop and framing the next render uses: the whole uncropped photo
+    /// in crop mode, the committed crop otherwise.
     pub(super) fn render_crop(&self) -> (Option<edit_core::Crop>, bool) {
         match &self.crop {
-            Some(session) => (Some(session.draft().straightened_canvas()), true),
+            Some(_) => (None, true),
             None => (self.develop.crop().cloned(), false),
         }
     }
 
-    /// A rendered frame landed: remember what framing it shows, and tell the
-    /// session the source's size once it is the straightened canvas.
-    pub(super) fn note_frame_framing(&mut self, straightened: bool, width: u32, height: u32) {
-        self.straightened_image = straightened;
-        if straightened && let Some(session) = self.crop.as_mut() {
+    /// Whether a finished render belongs on the canvas. Crop mode takes only
+    /// its own uncropped render, and the normal view takes the others, so a
+    /// render that raced a mode change is dropped.
+    pub(super) fn takes_frame(&self, uncropped: bool) -> bool {
+        self.crop.is_some() == uncropped
+    }
+
+    /// The uncropped render landed: it becomes the crop canvas. A small copy
+    /// for live straightening is made off the UI thread.
+    pub(super) fn set_crop_base(&mut self, frame: edit_core::Frame, cx: &mut Context<Self>) {
+        let (width, height) = (frame.width, frame.height);
+        let Some(base) = RgbaImage::from_raw(width, height, frame.pixels) else {
+            return;
+        };
+        let base = Arc::new(base);
+        if let Some(session) = self.crop.as_mut() {
             session.set_source(width, height);
+        }
+        self.crop_base_image = Some(Arc::new(RenderImage::new([image::Frame::new(
+            (*base).clone(),
+        )])));
+        self.crop_base = Some(Arc::clone(&base));
+        self.crop_small = None;
+        let angle = self
+            .crop
+            .as_ref()
+            .map_or(0.0, |s| s.draft().rotation_degrees);
+        self.show_turned(angle, false, cx);
+        let item = self.develop_item_id();
+        cx.spawn(async move |this, cx| {
+            let small = cx
+                .background_executor()
+                .spawn(async move { shrink(&base, LIVE_LONG_EDGE) })
+                .await;
+            this.update(cx, |this, cx| {
+                if this.crop.is_some() && this.develop_item_id() == item {
+                    this.crop_small = Some(Arc::new(small));
+                }
+                cx.notify();
+            })
+            .ok();
+        })
+        .detach();
+    }
+
+    /// Put the photo turned to `degrees` on the canvas. At zero it is the
+    /// render itself; otherwise the turn runs on a background thread, on the
+    /// small copy while the angle is moving and on the full one when it
+    /// settles, and only the newest request ever runs.
+    fn show_turned(&mut self, degrees: f32, live: bool, cx: &mut Context<Self>) {
+        let Some(item) = self.current_item().map(|row| row.item_id) else {
+            return;
+        };
+        if degrees == 0.0 {
+            self.crop_turn.clear();
+            if let Some(image) = self.crop_base_image.clone() {
+                self.show_canvas(item, image);
+                cx.notify();
+            }
+            return;
+        }
+        if self.crop_turn.request((degrees, !live)) {
+            self.spawn_turn_worker(cx);
         }
     }
 
-    /// The frame overlay, once the canvas shows the straightened image.
+    fn show_canvas(&mut self, item: i64, image: Arc<RenderImage>) {
+        self.develop_image = Some(image);
+        self.develop_image_item = Some(item);
+        self.straightened_image = true;
+    }
+
+    fn spawn_turn_worker(&mut self, cx: &mut Context<Self>) {
+        cx.spawn(async move |this, cx| {
+            loop {
+                let job = this
+                    .update(cx, |this, _| {
+                        let (degrees, full) = this.crop_turn.take()?;
+                        let source = if full {
+                            this.crop_base.clone()
+                        } else {
+                            this.crop_small.clone().or_else(|| this.crop_base.clone())
+                        }?;
+                        Some((degrees, source))
+                    })
+                    .ok()
+                    .flatten();
+                let Some((degrees, source)) = job else {
+                    break;
+                };
+                let turned =
+                    cx.background_executor()
+                        .spawn(async move {
+                            edit_render::straighten::straighten_preview(&source, degrees)
+                        })
+                        .await;
+                let applied = this
+                    .update(cx, |this, cx| {
+                        let item = this.develop_item_id();
+                        if this.crop.is_some() {
+                            let image = Arc::new(RenderImage::new([image::Frame::new(turned)]));
+                            this.show_canvas(item, image);
+                        }
+                        cx.notify();
+                    })
+                    .is_ok();
+                if !applied {
+                    break;
+                }
+            }
+        })
+        .detach();
+    }
+
+    /// The frame overlay, once the canvas shows the crop image.
     pub(super) fn crop_overlay(&self, cx: &App) -> Option<Overlay> {
         let session = self.crop.as_ref().filter(|_| self.straightened_image)?;
         let theme = cx.theme();
@@ -244,6 +375,29 @@ impl Browser {
                 handle: theme.foreground,
                 handle_border: theme.background,
             },
+        })
+    }
+
+    /// The pointer shape for what is under it (or held).
+    pub(super) fn crop_cursor(&self) -> Option<CursorStyle> {
+        let session = self.crop.as_ref()?;
+        let grab = if session.is_rotating() {
+            return Some(CursorStyle::ClosedHand);
+        } else {
+            self.crop_hover?
+        };
+        Some(match grab {
+            Grab::Move => CursorStyle::OpenHand,
+            Grab::Rotate => CursorStyle::PointingHand,
+            Grab::Draw => CursorStyle::Crosshair,
+            Grab::Handle(Handle::Top | Handle::Bottom) => CursorStyle::ResizeUpDown,
+            Grab::Handle(Handle::Left | Handle::Right) => CursorStyle::ResizeLeftRight,
+            Grab::Handle(Handle::TopLeft | Handle::BottomRight) => {
+                CursorStyle::ResizeUpLeftDownRight
+            }
+            Grab::Handle(Handle::TopRight | Handle::BottomLeft) => {
+                CursorStyle::ResizeUpRightDownLeft
+            }
         })
     }
 
@@ -286,12 +440,26 @@ impl Browser {
         let Some(session) = self.crop.as_ref() else {
             return false;
         };
-        if session.is_dragging()
-            && let Some((at, _)) = self.pointer_in_canvas(position)
-            && let Some(session) = self.crop.as_mut()
-        {
+        let Some((at, view)) = self.pointer_in_canvas(position) else {
+            return true;
+        };
+        if session.is_dragging() {
+            let before = session.draft().rotation_degrees;
+            let Some(session) = self.crop.as_mut() else {
+                return true;
+            };
             session.drag_to(at);
+            let after = session.draft().rotation_degrees;
+            if after != before {
+                self.show_turned(after, true, cx);
+            }
             cx.notify();
+        } else {
+            let hover = session.hit(at, view);
+            if hover != self.crop_hover {
+                self.crop_hover = hover;
+                cx.notify();
+            }
         }
         true
     }
@@ -300,25 +468,27 @@ impl Browser {
         let Some(session) = self.crop.as_mut() else {
             return false;
         };
+        let turned = session.is_rotating();
+        let angle = session.draft().rotation_degrees;
         session.end_drag();
+        if turned {
+            // Settled: swap the small preview for the full-size turn.
+            self.show_turned(angle, false, cx);
+        }
         cx.notify();
         true
     }
 
-    /// Slider moved: turn the image under the frame and re-render, at the
-    /// drag edge while held and the release edge when let go.
+    /// Slider moved: turn the image under the frame. The small copy follows
+    /// the drag; the full one is made when the slider is let go.
     fn on_straighten(&mut self, degrees: f32, release: bool, cx: &mut Context<Self>) {
         let Some(session) = self.crop.as_mut() else {
             return;
         };
         session.set_angle(degrees);
+        let angle = session.draft().rotation_degrees;
         self.straighten_dragging = !release;
-        let size = if release {
-            PROXY_RELEASE_LONG_EDGE
-        } else {
-            PROXY_DRAG_LONG_EDGE
-        };
-        self.request_render(RenderSize::Proxy(size), None, cx);
+        self.show_turned(angle, !release, cx);
     }
 
     pub fn set_crop_aspect(&mut self, aspect: Option<Aspect>, cx: &mut Context<Self>) {
@@ -328,13 +498,14 @@ impl Browser {
         }
     }
 
-    fn reset_crop(&mut self, cx: &mut Context<Self>) {
+    /// The panel's Reset: the whole photo, level and free.
+    pub fn reset_crop(&mut self, cx: &mut Context<Self>) {
         let Some(session) = self.crop.as_mut() else {
             return;
         };
         session.reset();
         self.straighten_dragging = false;
-        self.request_render(RenderSize::Proxy(PROXY_RELEASE_LONG_EDGE), None, cx);
+        self.show_turned(0.0, false, cx);
         cx.notify();
     }
 
@@ -407,15 +578,33 @@ impl Browser {
             .border_color(border)
             .child(
                 v_flex().gap_1().child(Label::new("Crop").text_lg()).child(
-                    Label::new("Drag the frame to move it, or a handle to resize.")
-                        .text_xs()
-                        .text_color(muted),
+                    Label::new(
+                        "Drag on the photo to draw a frame, or outside the frame to straighten.",
+                    )
+                    .text_xs()
+                    .text_color(muted),
                 ),
             )
             .child(
                 v_flex()
                     .gap_1()
-                    .child(Label::new("Aspect ratio").text_xs().text_color(muted))
+                    .child(
+                        h_flex()
+                            .w_full()
+                            .items_center()
+                            .justify_between()
+                            .child(Label::new("Aspect ratio").text_xs().text_color(muted))
+                            .child(
+                                Button::new("crop-flip")
+                                    .ghost()
+                                    .xsmall()
+                                    .label("Flip")
+                                    .tooltip("Landscape or portrait (X)")
+                                    .on_click(cx.listener(|this, _: &ClickEvent, _, cx| {
+                                        this.flip_crop_orientation(cx);
+                                    })),
+                            ),
+                    )
                     .children(preset_rows),
             )
             .child(
@@ -496,4 +685,20 @@ impl Browser {
                     ),
             )
     }
+}
+
+/// Long edge of the copy turned while an angle is moving. Small enough to
+/// turn well inside a frame, large enough to look like the photo.
+const LIVE_LONG_EDGE: u32 = 900;
+
+/// `image` shrunk so its long edge is at most `edge`.
+fn shrink(image: &RgbaImage, edge: u32) -> RgbaImage {
+    let long = image.width().max(image.height());
+    if long <= edge {
+        return image.clone();
+    }
+    let scale = edge as f32 / long as f32;
+    let w = ((image.width() as f32 * scale).round() as u32).max(1);
+    let h = ((image.height() as f32 * scale).round() as u32).max(1);
+    image::imageops::resize(image, w, h, image::imageops::FilterType::Triangle)
 }

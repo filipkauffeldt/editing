@@ -252,17 +252,6 @@ impl Crop {
         self.rect == Rect::full() && self.rotation_degrees == 0.0
     }
 
-    /// The straightened full frame: the whole canvas, turned by this crop's
-    /// angle. This is what the crop canvas paints while the frame is edited.
-    pub fn straightened_canvas(&self) -> Crop {
-        Crop {
-            rect: Rect::full(),
-            rotation_degrees: self.rotation_degrees,
-            aspect: None,
-            aspect_flipped: false,
-        }
-    }
-
     /// The crop with its frame pulled inside the rotated `source` image.
     pub fn constrained(&self, source: (f64, f64)) -> Crop {
         Crop {
@@ -438,8 +427,6 @@ mod tests {
         assert_eq!(serde_json::from_str::<Crop>(&json).unwrap(), crop);
         assert!(!crop.is_identity());
         assert!(Crop::default().is_identity());
-        assert_eq!(crop.straightened_canvas().rect, Rect::full());
-        assert_eq!(crop.straightened_canvas().rotation_degrees, -3.25);
     }
 
     #[test]

@@ -46,7 +46,7 @@ use crate::browse::{
     list_browse_items, pair_key, plan_template_apply, run_catalog_scan,
     template_apply_payloads_with,
 };
-use crate::crop::CropSession;
+use crate::crop::{CropSession, Grab, Latest};
 use crate::develop::{
     DevelopSession, EditJson, LoadedEdit, RenderQueue, SidecarQueue, SliderId, edit_json,
 };
@@ -113,7 +113,8 @@ gpui_kit::actions!(
         Rate5,
         ToggleCrop,
         ApplyCrop,
-        CancelCrop
+        CancelCrop,
+        FlipCrop
     ]
 );
 
@@ -127,7 +128,7 @@ pub enum Mode {
 
 /// One develop render the worker takes: what to draw and how.
 struct RenderJob {
-    /// Whether it draws the whole straightened canvas for crop mode.
+    /// Whether it draws the whole uncropped photo for crop mode.
     straightened: bool,
     item_id: i64,
     path: String,
@@ -198,6 +199,15 @@ pub struct Browser {
     straightened_image: bool,
     /// Where the canvas last painted the image, for crop pointer mapping.
     crop_frame: Rc<Cell<Option<crop_ui::ImageFrame>>>,
+    /// The uncropped render crop mode paints, and the same image ready to
+    /// paint; a small copy of it is what a moving angle turns.
+    crop_base: Option<Arc<image::RgbaImage>>,
+    crop_base_image: Option<Arc<RenderImage>>,
+    crop_small: Option<Arc<image::RgbaImage>>,
+    /// Newest straighten request for the background worker.
+    crop_turn: Latest<(f32, bool)>,
+    /// What the pointer is over on the crop canvas, for the cursor.
+    crop_hover: Option<Grab>,
     /// The resolved rendered develop output through `render_path`.
     renderer: Arc<RenderService>,
     scan_jobs: Vec<JobId>,
@@ -278,6 +288,7 @@ impl Browser {
             KeyBinding::new("c", ToggleCrop, Some("!Input")),
             KeyBinding::new("enter", ApplyCrop, Some("!Input")),
             KeyBinding::new("escape", CancelCrop, Some("!Input")),
+            KeyBinding::new("x", FlipCrop, Some("!Input")),
         ]);
         let browser = Self {
             catalog,
@@ -315,6 +326,11 @@ impl Browser {
             straighten_dragging: false,
             straightened_image: false,
             crop_frame: Rc::new(Cell::new(None)),
+            crop_base: None,
+            crop_base_image: None,
+            crop_small: None,
+            crop_turn: Latest::default(),
+            crop_hover: None,
             renderer,
             scan_jobs: Vec::new(),
             template_status: String::new(),
@@ -1222,9 +1238,12 @@ impl Browser {
             Ok(frame) => {
                 self.queue.complete(true);
                 self.queue.finish(item_id);
-                if self.develop_item_id() == item_id {
-                    self.note_frame_framing(straightened, frame.width, frame.height);
-                    self.insert_develop_frame(item_id, frame);
+                if self.develop_item_id() == item_id && self.takes_frame(straightened) {
+                    if straightened {
+                        self.set_crop_base(frame, cx);
+                    } else {
+                        self.insert_develop_frame(item_id, frame);
+                    }
                     self.prewarm_neighbors(cx);
                 }
             }
@@ -1683,6 +1702,7 @@ impl Browser {
         let fit_cell = Rc::clone(&self.fit_scale);
         let crop_frame = Rc::clone(&self.crop_frame);
         let crop_overlay = self.crop_overlay(cx);
+        let crop_cursor = self.crop_cursor();
         let title = item
             .as_ref()
             .map(|row| row.base_name.clone())
@@ -1701,6 +1721,7 @@ impl Browser {
             .child(
                 div()
                     .id("single-canvas")
+                    .when_some(crop_cursor, |canvas, cursor| canvas.cursor(cursor))
                     .flex_1()
                     .size_full()
                     .overflow_hidden()
@@ -1992,6 +2013,9 @@ impl Render for Browser {
                     }))
                     .on_action(cx.listener(|this, _: &CancelCrop, _, cx| {
                         this.finish_crop(false, cx);
+                    }))
+                    .on_action(cx.listener(|this, _: &FlipCrop, _, cx| {
+                        this.flip_crop_orientation(cx);
                     }))
                     .on_action(cx.listener(|this, _: &ToggleView, _, cx| {
                         this.finish_crop(true, cx);

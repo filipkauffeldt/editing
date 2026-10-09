@@ -140,6 +140,46 @@ pub fn hit_test(rect: Rect, at: (f32, f32), view: (f32, f32)) -> Option<Grab> {
     Some(Grab::Handle(handle))
 }
 
+/// Hand-off to one background worker where only the newest request matters:
+/// a request replaces an unstarted older one, so a fast pointer never builds
+/// a queue of stale work.
+#[derive(Debug)]
+pub struct Latest<T> {
+    wanted: Option<T>,
+    worker: bool,
+}
+
+impl<T> Default for Latest<T> {
+    fn default() -> Self {
+        Self {
+            wanted: None,
+            worker: false,
+        }
+    }
+}
+
+impl<T> Latest<T> {
+    /// Ask for `value`. `true` when the caller must start the worker.
+    pub fn request(&mut self, value: T) -> bool {
+        self.wanted = Some(value);
+        !std::mem::replace(&mut self.worker, true)
+    }
+
+    /// The worker's next job. `None` stops the worker.
+    pub fn take(&mut self) -> Option<T> {
+        let next = self.wanted.take();
+        if next.is_none() {
+            self.worker = false;
+        }
+        next
+    }
+
+    /// Drop what has not started.
+    pub fn clear(&mut self) {
+        self.wanted = None;
+    }
+}
+
 /// A grab in progress, with what it started from.
 enum Drag {
     /// A handle or the body: the frame and pointer it started from.
@@ -315,6 +355,12 @@ impl CropSession {
 
     pub fn end_drag(&mut self) {
         self.drag = None;
+    }
+
+    /// What a press at `at` would pick up, for hover feedback.
+    pub fn hit(&self, at: (f32, f32), view: (f32, f32)) -> Option<Grab> {
+        self.source?;
+        hit_test(self.draft.rect, at, view)
     }
 
     /// Whether the grab held is turning the photo.
@@ -937,5 +983,30 @@ mod tests {
             "{r:?}"
         );
         assert!(rect_fits(r, 0.0, SOURCE));
+    }
+
+    #[test]
+    fn only_the_newest_request_reaches_the_worker() {
+        let mut latest = Latest::default();
+        assert!(latest.request(1), "the first request starts the worker");
+        assert!(!latest.request(2));
+        assert!(!latest.request(3));
+        assert_eq!(latest.take(), Some(3), "the stale ones are gone");
+        // A request while the worker runs is picked up by its next take.
+        assert!(!latest.request(4));
+        assert_eq!(latest.take(), Some(4));
+        assert_eq!(latest.take(), None, "an empty take stops the worker");
+        assert!(latest.request(5), "so the next request starts a new one");
+        latest.clear();
+        assert_eq!(latest.take(), None);
+    }
+
+    #[test]
+    fn hover_asks_the_same_question_as_a_press() {
+        let s = session(Rect::new(0.2, 0.2, 0.6, 0.6));
+        assert_eq!(s.hit((0.5, 0.5), VIEW), Some(Grab::Move));
+        assert_eq!(s.hit((0.05, 0.5), VIEW), Some(Grab::Rotate));
+        let before_paint = CropSession::enter(None);
+        assert_eq!(before_paint.hit((0.5, 0.5), VIEW), None);
     }
 }
