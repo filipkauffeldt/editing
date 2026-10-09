@@ -266,6 +266,16 @@ pub fn section(key: &str) -> Option<&'static PanelSection> {
     PANEL.iter().find(|section| section.key == key)
 }
 
+/// Every on/off row in panel order.
+pub fn toggle_ids() -> impl Iterator<Item = &'static str> {
+    PANEL.iter().flat_map(|section| {
+        section.items.iter().filter_map(|item| match item {
+            Toggle(id, _) => Some(*id),
+            _ => None,
+        })
+    })
+}
+
 /// Read an on/off setting.
 pub fn toggle_get(settings: &DevelopSettings, id: &str) -> bool {
     match id {
@@ -333,6 +343,8 @@ pub fn section_is_edited(settings: &DevelopSettings, key: &str) -> bool {
 pub struct PresetValues {
     pub values: Vec<(String, f64)>,
     pub white_balance: Option<WbMode>,
+    /// On/off settings the preset turns on.
+    pub toggles: Vec<String>,
 }
 
 impl PresetValues {
@@ -346,14 +358,19 @@ impl PresetValues {
             })
             .collect();
         let white_balance = (settings.wb.mode != WbMode::AsShot).then_some(settings.wb.mode);
+        let toggles = toggle_ids()
+            .filter(|id| toggle_get(settings, id))
+            .map(str::to_owned)
+            .collect();
         Self {
             values,
             white_balance,
+            toggles,
         }
     }
 
     pub fn is_empty(&self) -> bool {
-        self.values.is_empty() && self.white_balance.is_none()
+        self.values.is_empty() && self.white_balance.is_none() && self.toggles.is_empty()
     }
 
     /// Set the preset's controls on `settings`; everything else is kept.
@@ -363,6 +380,9 @@ impl PresetValues {
         }
         if let Some(mode) = self.white_balance {
             settings.wb.mode = mode;
+        }
+        for id in &self.toggles {
+            toggle_set(settings, id, true);
         }
     }
 }
@@ -382,6 +402,7 @@ impl BuiltinPreset {
                 .map(|(id, v)| ((*id).to_owned(), *v))
                 .collect(),
             white_balance: None,
+            toggles: Vec::new(),
         }
     }
 }
@@ -520,6 +541,7 @@ mod tests {
         let values = PresetValues {
             values: vec![("light.contrast".into(), 900.0), ("wb.temp".into(), 7000.0)],
             white_balance: None,
+            toggles: Vec::new(),
         };
         let mut settings = DevelopSettings::default();
         values.apply(&mut settings);
