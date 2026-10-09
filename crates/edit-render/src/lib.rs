@@ -17,6 +17,7 @@
 
 pub mod lightcraft;
 pub mod plain;
+pub mod smart_preview;
 pub mod straighten;
 
 use std::borrow::Cow;
