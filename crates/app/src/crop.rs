@@ -205,9 +205,12 @@ pub struct CropSession {
 }
 
 impl CropSession {
+    /// Start from the committed crop. A photo with none starts locked to its
+    /// own aspect, so a frame drawn on it keeps the photo's shape; Free is
+    /// one click away.
     pub fn enter(committed: Option<&Crop>) -> Self {
         Self {
-            draft: committed.cloned().unwrap_or_default(),
+            draft: committed.cloned().unwrap_or_else(Self::fresh),
             source: None,
             drag: None,
         }
@@ -277,9 +280,17 @@ impl CropSession {
         self.draft.rect = constrain_rect(turned, self.draft.rotation_degrees, source);
     }
 
-    /// Back to the full, level, free frame.
+    /// The whole photo, level, locked to its own aspect.
+    fn fresh() -> Crop {
+        Crop {
+            aspect: Some(Aspect::Original),
+            ..Crop::default()
+        }
+    }
+
+    /// Back to the whole photo, level, locked to its own aspect.
     pub fn reset(&mut self) {
-        self.draft = Crop::default();
+        self.draft = Self::fresh();
         self.drag = None;
     }
 
@@ -767,7 +778,7 @@ mod tests {
         assert!(s.result().is_some());
         s.reset();
         assert_eq!(s.result(), None);
-        assert_eq!(*s.draft(), Crop::default());
+        assert_eq!(*s.draft(), CropSession::fresh());
 
         let s = session(Rect::new(0.1, 0.1, 0.5, 0.5));
         let crop = s.result().unwrap();
@@ -1008,5 +1019,29 @@ mod tests {
         assert_eq!(s.hit((0.05, 0.5), VIEW), Some(Grab::Rotate));
         let before_paint = CropSession::enter(None);
         assert_eq!(before_paint.hit((0.5, 0.5), VIEW), None);
+    }
+
+    #[test]
+    fn a_photo_without_a_crop_starts_locked_to_its_own_aspect() {
+        let mut s = CropSession::enter(None);
+        assert_eq!(s.draft().aspect, Some(Aspect::Original));
+        s.set_source(6000, 4000);
+        assert_eq!(s.result(), None, "the whole photo is still no crop");
+        // Drawing keeps the photo's shape, and Free drops the lock.
+        grab(&mut s, (0.2, 0.2));
+        s.drag_to((0.5, 0.9));
+        assert!(near(rect_ratio(s.draft().rect, SOURCE), 1.5, 1e-3));
+        s.end_drag();
+        s.reset();
+        s.set_aspect(None);
+        grab(&mut s, (0.2, 0.2));
+        s.drag_to((0.5, 0.9));
+        assert!(near(s.draft().rect.h as f64, 0.7, 1e-5));
+        // A saved free crop reopens free.
+        let saved = Crop {
+            rect: Rect::new(0.1, 0.1, 0.5, 0.5),
+            ..Crop::default()
+        };
+        assert_eq!(CropSession::enter(Some(&saved)).draft().aspect, None);
     }
 }

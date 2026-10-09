@@ -166,7 +166,9 @@ fn enter_crop(cx: &mut TestAppContext, rig: &Rig, first: bool) {
 fn dragging_a_handle_and_the_frame_edits_the_draft(cx: &mut TestAppContext) {
     let rig = rig(cx);
     enter_crop(cx, &rig, true);
-    assert_eq!(draft(cx, &rig), Crop::default());
+    // A photo with no crop opens locked to its own aspect; these edits are free.
+    assert_eq!(draft(cx, &rig).aspect, Some(Aspect::Original));
+    cx.update(|cx| rig.browser.update(cx, |b, cx| b.set_crop_aspect(None, cx)));
 
     // Pull the bottom-right handle in: the frame shrinks from that corner.
     drag(cx, &rig, (0.995, 0.995), (0.7, 0.6));
@@ -265,7 +267,13 @@ fn drawing_on_an_uncropped_photo_makes_a_frame_in_the_selected_aspect(cx: &mut T
     enter_crop(cx, &rig, true);
     let source = (600.0, 400.0);
 
+    // The default lock is the photo's own ratio: a draw keeps its shape.
+    drag(cx, &rig, (0.2, 0.2), (0.6, 0.5));
+    assert!((rect_ratio(draft(cx, &rig).rect, source) - 1.5).abs() < 0.01);
+    cx.update(|cx| rig.browser.update(cx, |b, cx| b.reset_crop(cx)));
+
     // Free: the frame is the box between the press and the release.
+    cx.update(|cx| rig.browser.update(cx, |b, cx| b.set_crop_aspect(None, cx)));
     drag(cx, &rig, (0.2, 0.2), (0.6, 0.5));
     let free = draft(cx, &rig).rect;
     assert!(
