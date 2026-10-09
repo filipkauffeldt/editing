@@ -2414,6 +2414,9 @@ impl Render for Browser {
                             Mode::Grid => Mode::Single,
                             Mode::Single => Mode::Grid,
                         };
+                        if this.mode == Mode::Single {
+                            this.preload_neighbors(cx);
+                        }
                         cx.notify();
                     }))
                     .on_action(cx.listener(|this, _: &FitView, _, cx| {
