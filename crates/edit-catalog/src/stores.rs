@@ -119,6 +119,8 @@ fn row_preset(row: &Row) -> rusqlite::Result<Preset> {
         path: row.get(3)?,
         source: row.get(4)?,
         updated_at: row.get(5)?,
+        mtime: row.get(6)?,
+        size: row.get(7)?,
     })
 }
 
@@ -668,10 +670,41 @@ impl Catalog {
         })
     }
 
+    /// Insert or update the preset indexed for `path`.
+    pub fn upsert_preset(
+        &self,
+        name: &str,
+        group: Option<&str>,
+        path: &str,
+        source: &str,
+        mtime: i64,
+        size: i64,
+    ) -> Result<()> {
+        self.with_conn(|conn| {
+            conn.execute(
+                "INSERT INTO presets (name, group_name, path, source, updated_at, mtime, size)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)
+                 ON CONFLICT(path) DO UPDATE SET
+                   name = excluded.name, group_name = excluded.group_name,
+                   source = excluded.source, updated_at = excluded.updated_at,
+                   mtime = excluded.mtime, size = excluded.size",
+                params![name, group, path, source, now_unix(), mtime, size],
+            )?;
+            Ok(())
+        })
+    }
+
+    pub fn delete_preset(&self, id: i64) -> Result<()> {
+        self.with_conn(|conn| {
+            conn.execute("DELETE FROM presets WHERE id = ?1", [id])?;
+            Ok(())
+        })
+    }
+
     pub fn list_presets(&self) -> Result<Vec<Preset>> {
         self.with_conn(|conn| {
             let mut stmt = conn.prepare(
-                "SELECT id, name, group_name, path, source, updated_at FROM presets ORDER BY id",
+                "SELECT id, name, group_name, path, source, updated_at, mtime, size FROM presets ORDER BY id",
             )?;
             Ok(stmt
                 .query_map([], row_preset)?
@@ -1387,6 +1420,32 @@ mod tests {
 
         db.insert_preset("warm", Some("user"), "/presets/warm.xmp", "user")
             .unwrap();
+        assert_eq!(db.list_presets().unwrap().len(), 1);
+        db.upsert_preset(
+            "cool",
+            Some("Film"),
+            "/presets/Film/cool.xmp",
+            "user",
+            7,
+            99,
+        )
+        .unwrap();
+        db.upsert_preset(
+            "cooler",
+            Some("Film"),
+            "/presets/Film/cool.xmp",
+            "user",
+            8,
+            100,
+        )
+        .unwrap();
+        let listed = db.list_presets().unwrap();
+        assert_eq!(listed.len(), 2);
+        assert_eq!(
+            (listed[1].name.as_str(), listed[1].mtime, listed[1].size),
+            ("cooler", 8, 100)
+        );
+        db.delete_preset(listed[1].id).unwrap();
         assert_eq!(db.list_presets().unwrap().len(), 1);
 
         db.insert_detection(item, r#"{"x":0}"#, r#"[]"#, "libfacedetection")
