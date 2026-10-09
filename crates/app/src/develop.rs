@@ -1,6 +1,6 @@
-//! Develop session for M2 (plan sections 1.5, 2.3): the edit buffer, the
-//! six LR-style tone sliders, drag tracking, and the pure scheduling rules
-//! behind proxy renders and edit persistence.
+//! Develop session for M2 (plan sections 1.5, 2.3): the edit buffer (tone
+//! settings plus the crop), the six LR-style tone sliders, drag tracking, and
+//! the pure scheduling rules behind proxy renders and edit persistence.
 //!
 //! Pure, UI-free state covered by `cargo test`; the GPUI wiring lives in
 //! [`crate::views`]. Sliders address `DevelopSettings` through LightCraft's
@@ -8,7 +8,7 @@
 
 use std::collections::{HashMap, HashSet};
 
-use edit_core::{CancelToken, DevelopSettings, RenderSize};
+use edit_core::{CancelToken, Crop, DevelopSettings, RenderSize};
 use lightcraft_develop::ControlSpec;
 
 /// The six LR-style tone sliders in develop-panel order.
@@ -63,9 +63,56 @@ impl SliderId {
     }
 }
 
+/// One item's edit as the two strings the `edits` row stores.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct EditJson {
+    pub develop: String,
+    /// `None` is an uncropped item: the row's `crop_json` stays NULL.
+    pub crop: Option<String>,
+}
+
+/// An item's stored edit, parsed.
+#[derive(Clone, Debug, PartialEq)]
+pub struct LoadedEdit {
+    pub develop: DevelopSettings,
+    pub crop: Option<Crop>,
+}
+
+impl LoadedEdit {
+    /// Parse the row's strings. A row with a crop it cannot read is an
+    /// unreadable edit, never an uncropped one: saving over it would drop the
+    /// user's crop.
+    pub fn parse(develop_json: &str, crop_json: Option<&str>) -> Result<Self, String> {
+        let develop = serde_json::from_str::<DevelopSettings>(develop_json)
+            .map_err(|e| format!("Edit is unreadable: {e}"))?;
+        let crop = match crop_json {
+            None => None,
+            Some(json) => Some(
+                serde_json::from_str::<Crop>(json)
+                    .map_err(|e| format!("Crop is unreadable: {e}"))?,
+            ),
+        };
+        Ok(Self { develop, crop })
+    }
+}
+
+/// Serialize an edit buffer for the `edits` row. An identity crop is stored
+/// as none, so a reset item reads back as uncropped.
+pub fn edit_json(develop: &DevelopSettings, crop: Option<&Crop>) -> Result<EditJson, String> {
+    let develop = serde_json::to_string(develop).map_err(|e| e.to_string())?;
+    let crop = match crop.filter(|crop| !crop.is_identity()) {
+        None => None,
+        Some(crop) => Some(serde_json::to_string(crop).map_err(|e| e.to_string())?),
+    };
+    Ok(EditJson { develop, crop })
+}
+
 /// Pure develop state: the edit buffer plus the drag the view reports.
 pub struct DevelopSession {
     buffer: DevelopSettings,
+    /// The committed crop; `None` is uncropped. Crop mode edits a draft and
+    /// commits here.
+    crop: Option<Crop>,
     /// Catalog item the buffer belongs to. `None` until a load lands, and
     /// again after a failed load: the buffer then holds another item's
     /// values, so edits and saves must not touch the new item.
@@ -78,6 +125,7 @@ impl DevelopSession {
     pub fn new(buffer: DevelopSettings) -> Self {
         Self {
             buffer,
+            crop: None,
             owner: None,
             dragging: None,
         }
@@ -86,6 +134,16 @@ impl DevelopSession {
     /// The edit buffer (never mutated in place by callers).
     pub fn buffer(&self) -> &DevelopSettings {
         &self.buffer
+    }
+
+    /// The committed crop, if the item is cropped.
+    pub fn crop(&self) -> Option<&Crop> {
+        self.crop.as_ref()
+    }
+
+    /// Commit a crop. An identity crop clears it.
+    pub fn set_crop(&mut self, crop: Option<Crop>) {
+        self.crop = crop.filter(|crop| !crop.is_identity());
     }
 
     /// The item the buffer holds the edit of.
@@ -113,8 +171,9 @@ impl DevelopSession {
     /// Replace the buffer with `item`'s edit (navigation or a persistence
     /// load). Live drags report against the item that owned them, so reset
     /// drag tracking too.
-    pub fn load_edit(&mut self, item: i64, buffer: DevelopSettings) {
-        self.buffer = buffer;
+    pub fn load_edit(&mut self, item: i64, edit: LoadedEdit) {
+        self.buffer = edit.develop;
+        self.crop = edit.crop;
         self.owner = Some(item);
         self.dragging = None;
     }
@@ -240,23 +299,23 @@ impl RenderQueue {
 #[derive(Default)]
 pub struct SidecarQueue {
     inflight: HashSet<i64>,
-    queued: HashMap<i64, String>,
+    queued: HashMap<i64, EditJson>,
 }
 
 impl SidecarQueue {
-    /// Submit an edit's JSON. `Some` when the caller should write it now;
-    /// `None` when it queued behind a write already in flight for the item.
-    pub fn submit(&mut self, item: i64, json: String) -> Option<String> {
+    /// Submit an edit. `Some` when the caller should write it now; `None`
+    /// when it queued behind a write already in flight for the item.
+    pub fn submit(&mut self, item: i64, edit: EditJson) -> Option<EditJson> {
         if self.inflight.insert(item) {
-            Some(json)
+            Some(edit)
         } else {
-            self.queued.insert(item, json);
+            self.queued.insert(item, edit);
             None
         }
     }
 
-    /// The item's write finished: the queued JSON to write next, if any.
-    pub fn ack(&mut self, item: i64) -> Option<String> {
+    /// The item's write finished: the queued edit to write next, if any.
+    pub fn ack(&mut self, item: i64) -> Option<EditJson> {
         let next = self.queued.remove(&item);
         if next.is_none() {
             self.inflight.remove(&item);
@@ -265,7 +324,7 @@ impl SidecarQueue {
     }
 
     /// Everything still queued, for the quit flush.
-    pub fn drain_queued(&mut self) -> Vec<(i64, String)> {
+    pub fn drain_queued(&mut self) -> Vec<(i64, EditJson)> {
         self.queued.drain().collect()
     }
 }
@@ -304,7 +363,13 @@ mod tests {
         let mut session = DevelopSession::new(DevelopSettings::default());
         session.set_slider(SliderId::Contrast, 40.0);
         let fresh = DevelopSettings::default();
-        session.load_edit(7, fresh);
+        session.load_edit(
+            7,
+            LoadedEdit {
+                develop: fresh,
+                crop: None,
+            },
+        );
         assert_eq!(session.dragging, None);
         assert_eq!(session.owner(), Some(7));
         assert_eq!(session.slider_value(SliderId::Contrast), 0.0);
@@ -316,7 +381,13 @@ mod tests {
         assert_eq!(session.owner(), None);
         let mut edited = DevelopSettings::default();
         SliderId::Exposure.set(&mut edited, 1.5);
-        session.load_edit(3, edited);
+        session.load_edit(
+            3,
+            LoadedEdit {
+                develop: edited,
+                crop: None,
+            },
+        );
         session.disown();
         // The previous values stay (nothing silently reverts to defaults),
         // but no item owns them any more.
@@ -437,20 +508,91 @@ mod tests {
         assert!(queue.should_kick(2, None));
     }
 
+    fn edit(tag: &str) -> EditJson {
+        EditJson {
+            develop: tag.to_string(),
+            crop: None,
+        }
+    }
+
     #[test]
     fn sidecar_writes_serialize_per_item_and_the_newest_wins() {
         let mut queue = SidecarQueue::default();
-        assert_eq!(queue.submit(1, "a".into()), Some("a".into()));
+        assert_eq!(queue.submit(1, edit("a")), Some(edit("a")));
         // Behind the in-flight write for item 1: queued, newest replaces.
-        assert_eq!(queue.submit(1, "b".into()), None);
-        assert_eq!(queue.submit(1, "c".into()), None);
+        assert_eq!(queue.submit(1, edit("b")), None);
+        assert_eq!(queue.submit(1, edit("c")), None);
         // Another item is independent.
-        assert_eq!(queue.submit(2, "x".into()), Some("x".into()));
-        assert_eq!(queue.ack(1), Some("c".into()));
+        assert_eq!(queue.submit(2, edit("x")), Some(edit("x")));
+        assert_eq!(queue.ack(1), Some(edit("c")));
         assert_eq!(queue.ack(1), None);
         // Item 1 is idle again.
-        assert_eq!(queue.submit(1, "d".into()), Some("d".into()));
-        assert_eq!(queue.submit(2, "y".into()), None);
-        assert_eq!(queue.drain_queued(), vec![(2, "y".to_string())]);
+        assert_eq!(queue.submit(1, edit("d")), Some(edit("d")));
+        assert_eq!(queue.submit(2, edit("y")), None);
+        assert_eq!(queue.drain_queued(), vec![(2, edit("y"))]);
+    }
+
+    fn straightened() -> Crop {
+        Crop {
+            rect: edit_core::Rect::new(0.1, 0.15, 0.7, 0.6),
+            rotation_degrees: -2.5,
+            aspect: Some(edit_core::Aspect::ThreeTwo),
+            aspect_flipped: false,
+        }
+    }
+
+    #[test]
+    fn a_crop_round_trips_through_the_stored_strings() {
+        let mut develop = DevelopSettings::default();
+        SliderId::Exposure.set(&mut develop, 0.7);
+        let stored = edit_json(&develop, Some(&straightened())).unwrap();
+        assert!(stored.crop.is_some());
+
+        let loaded = LoadedEdit::parse(&stored.develop, stored.crop.as_deref()).unwrap();
+        assert_eq!(loaded.crop, Some(straightened()));
+        assert_eq!(SliderId::Exposure.get(&loaded.develop), 0.7);
+
+        let mut session = DevelopSession::new(DevelopSettings::default());
+        session.load_edit(5, loaded);
+        assert_eq!(session.crop(), Some(&straightened()));
+        assert_eq!(session.owner(), Some(5));
+    }
+
+    #[test]
+    fn an_identity_crop_is_stored_as_none() {
+        let develop = DevelopSettings::default();
+        assert_eq!(edit_json(&develop, None).unwrap().crop, None);
+        assert_eq!(
+            edit_json(&develop, Some(&Crop::default())).unwrap().crop,
+            None
+        );
+        let mut session = DevelopSession::new(develop);
+        session.set_crop(Some(straightened()));
+        assert!(session.crop().is_some());
+        session.set_crop(Some(Crop::default()));
+        assert_eq!(session.crop(), None);
+    }
+
+    #[test]
+    fn an_unreadable_crop_is_an_unreadable_edit() {
+        let develop = serde_json::to_string(&DevelopSettings::default()).unwrap();
+        let err = LoadedEdit::parse(&develop, Some("{\"rect\": 3}")).unwrap_err();
+        assert!(err.starts_with("Crop is unreadable"), "{err}");
+        let err = LoadedEdit::parse("nope", None).unwrap_err();
+        assert!(err.starts_with("Edit is unreadable"), "{err}");
+    }
+
+    #[test]
+    fn navigation_replaces_the_crop_with_the_next_items() {
+        let mut session = DevelopSession::new(DevelopSettings::default());
+        session.set_crop(Some(straightened()));
+        session.load_edit(
+            2,
+            LoadedEdit {
+                develop: DevelopSettings::default(),
+                crop: None,
+            },
+        );
+        assert_eq!(session.crop(), None);
     }
 }

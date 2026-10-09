@@ -19,6 +19,8 @@
 //! | Drag | pan while zoomed |
 //! | `0`–`5` | rating |
 //! | `O` | open a folder (native picker) |
+//! | `C` | crop mode: enter, or apply and leave |
+//! | `Enter` / `Esc` | apply / cancel the crop draft |
 
 use std::cell::Cell;
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet, VecDeque};
@@ -44,14 +46,19 @@ use crate::browse::{
     list_browse_items, pair_key, plan_template_apply, run_catalog_scan,
     template_apply_payloads_with,
 };
-use crate::develop::{DevelopSession, RenderQueue, SidecarQueue, SliderId};
+use crate::crop::{CropSession, Grab, Latest};
+use crate::develop::{
+    DevelopSession, EditJson, LoadedEdit, RenderQueue, SidecarQueue, SliderId, edit_json,
+};
 use crate::preview::BrowsePreviewProvider;
-use edit_core::{CancelToken, DevelopSettings, RenderSize};
+use edit_core::{CancelToken, Crop, DevelopSettings, RenderSize};
 use edit_metadata::{CodeReplacements, MetadataWritePayload, TemplateFields};
 use edit_render::{PROXY_DRAG_LONG_EDGE, PROXY_RELEASE_LONG_EDGE, RenderService};
 use gpui_kit::component::slider::{
     Slider as DevelopSliderElement, SliderEvent, SliderState, SliderValue,
 };
+
+mod crop_ui;
 
 /// Cells per contact-sheet row over `uniform_list`.
 pub const GRID_COLS: usize = 4;
@@ -103,7 +110,11 @@ gpui_kit::actions!(
         Rate2,
         Rate3,
         Rate4,
-        Rate5
+        Rate5,
+        ToggleCrop,
+        ApplyCrop,
+        CancelCrop,
+        FlipCrop
     ]
 );
 
@@ -113,6 +124,18 @@ pub enum Mode {
     #[default]
     Grid,
     Single,
+}
+
+/// One develop render the worker takes: what to draw and how.
+struct RenderJob {
+    /// Whether it draws the whole uncropped photo for crop mode.
+    straightened: bool,
+    item_id: i64,
+    path: String,
+    size: RenderSize,
+    develop: DevelopSettings,
+    crop: Option<Crop>,
+    token: CancelToken,
 }
 
 /// Root browse entity: snapshot rows plus the interaction state around them.
@@ -158,7 +181,7 @@ pub struct Browser {
     sidecars: SidecarQueue,
     /// Edits whose catalog write failed, retried at every commit point and
     /// at quit; a newer commit of the same item supersedes the entry.
-    unsaved: BTreeMap<i64, String>,
+    unsaved: BTreeMap<i64, EditJson>,
     /// The resolved develop output, swapped with the store on completion
     /// (plan section 1.5). DisplaySrgb path — the canvas paints it.
     develop_image: Option<Arc<RenderImage>>,
@@ -167,6 +190,24 @@ pub struct Browser {
     develop_dirty: bool,
     /// Diagnostics for the develop panel status line.
     develop_status: String,
+    /// Crop mode's draft, while the mode is active.
+    crop: Option<CropSession>,
+    /// The straighten slider in the crop panel.
+    straighten: Entity<SliderState>,
+    straighten_dragging: bool,
+    /// Whether `develop_image` is the straightened canvas crop mode edits.
+    straightened_image: bool,
+    /// Where the canvas last painted the image, for crop pointer mapping.
+    crop_frame: Rc<Cell<Option<crop_ui::ImageFrame>>>,
+    /// The uncropped render crop mode paints, and the same image ready to
+    /// paint; a small copy of it is what a moving angle turns.
+    crop_base: Option<Arc<image::RgbaImage>>,
+    crop_base_image: Option<Arc<RenderImage>>,
+    crop_small: Option<Arc<image::RgbaImage>>,
+    /// Newest straighten request for the background worker.
+    crop_turn: Latest<(f32, bool)>,
+    /// What the pointer is over on the crop canvas, for the cursor.
+    crop_hover: Option<Grab>,
     /// The resolved rendered develop output through `render_path`.
     renderer: Arc<RenderService>,
     scan_jobs: Vec<JobId>,
@@ -244,6 +285,10 @@ impl Browser {
             KeyBinding::new("3", Rate3, None),
             KeyBinding::new("4", Rate4, None),
             KeyBinding::new("5", Rate5, None),
+            KeyBinding::new("c", ToggleCrop, Some("!Input")),
+            KeyBinding::new("enter", ApplyCrop, Some("!Input")),
+            KeyBinding::new("escape", CancelCrop, Some("!Input")),
+            KeyBinding::new("x", FlipCrop, Some("!Input")),
         ]);
         let browser = Self {
             catalog,
@@ -276,6 +321,16 @@ impl Browser {
             develop_image_item: None,
             develop_dirty: false,
             develop_status: String::new(),
+            crop: None,
+            straighten: crop_ui::straighten_slider(cx),
+            straighten_dragging: false,
+            straightened_image: false,
+            crop_frame: Rc::new(Cell::new(None)),
+            crop_base: None,
+            crop_base_image: None,
+            crop_small: None,
+            crop_turn: Latest::default(),
+            crop_hover: None,
             renderer,
             scan_jobs: Vec::new(),
             template_status: String::new(),
@@ -744,6 +799,7 @@ impl Browser {
             return;
         }
         // An outgoing item commits its edit buffer before the cursor moves.
+        self.finish_crop(true, cx);
         self.persist_current_edit(cx);
         self.selection.move_cursor(delta, extend, len);
         self.current = self.selection.cursor;
@@ -759,6 +815,7 @@ impl Browser {
             return;
         }
         // An outgoing item commits its edit buffer before the cursor moves.
+        self.finish_crop(true, cx);
         self.persist_current_edit(cx);
         self.selection.select_single(index, self.rows.len());
         self.current = self.selection.cursor;
@@ -884,16 +941,18 @@ impl Browser {
                 .background_executor()
                 .spawn(async move {
                     let stored = match unsaved {
-                        Some(json) => Some(json),
+                        Some(edit) => Some((edit.develop, edit.crop)),
                         None => match catalog.get_edit(item_id) {
-                            Ok(edit) => edit.map(|edit| edit.develop_json),
+                            Ok(edit) => edit.map(|edit| (edit.develop_json, edit.crop_json)),
                             Err(e) => return Err(format!("Edit read failed: {e}")),
                         },
                     };
                     match stored {
-                        None => Ok(DevelopSettings::default()),
-                        Some(json) => serde_json::from_str::<DevelopSettings>(&json)
-                            .map_err(|e| format!("Edit is unreadable: {e}")),
+                        None => Ok(LoadedEdit {
+                            develop: DevelopSettings::default(),
+                            crop: None,
+                        }),
+                        Some((develop, crop)) => LoadedEdit::parse(&develop, crop.as_deref()),
                     }
                 })
                 .await;
@@ -909,7 +968,7 @@ impl Browser {
     fn apply_edit_load(
         &mut self,
         item_id: i64,
-        outcome: std::result::Result<DevelopSettings, String>,
+        outcome: std::result::Result<LoadedEdit, String>,
         cx: &mut Context<Self>,
     ) {
         // The cursor moved on while the row was being read.
@@ -918,10 +977,10 @@ impl Browser {
             return;
         }
         match outcome {
-            Ok(buffer) => {
+            Ok(edit) => {
                 // A buffer already owned by this item may hold live edits.
                 if self.develop.owner() != Some(item_id) {
-                    self.develop.load_edit(item_id, buffer);
+                    self.develop.load_edit(item_id, edit);
                     self.develop_dirty = false;
                 }
                 self.develop_status.clear();
@@ -1093,19 +1152,20 @@ impl Browser {
     }
 
     /// The worker's next job against the current item, or `None` to rest.
-    fn take_render_job(
-        &mut self,
-    ) -> Option<(i64, String, RenderSize, DevelopSettings, CancelToken)> {
+    fn take_render_job(&mut self) -> Option<RenderJob> {
         loop {
             let (size, token) = self.queue.take()?;
             if let Some(item) = self.current_item() {
-                return Some((
-                    item.item_id,
-                    item.display_path.clone(),
+                let (crop, straightened) = self.render_crop();
+                return Some(RenderJob {
+                    straightened,
+                    item_id: item.item_id,
+                    path: item.display_path.clone(),
                     size,
-                    self.develop.buffer().clone(),
+                    develop: self.develop.buffer().clone(),
+                    crop,
                     token,
-                ));
+                });
             }
             self.queue.complete(false);
         }
@@ -1122,20 +1182,35 @@ impl Browser {
                     .update(cx, |this, _| this.take_render_job())
                     .ok()
                     .flatten();
-                let Some((item_id, path, size, develop, token)) = job else {
+                let Some(RenderJob {
+                    straightened,
+                    item_id,
+                    path,
+                    size,
+                    develop,
+                    crop,
+                    token,
+                }) = job
+                else {
                     break;
                 };
                 let frame = {
                     let renderer = Arc::clone(&renderer);
                     cx.background_executor()
                         .spawn(async move {
-                            renderer.render_path(Path::new(&path), size, &develop, None, &token)
+                            renderer.render_path(
+                                Path::new(&path),
+                                size,
+                                &develop,
+                                crop.as_ref(),
+                                &token,
+                            )
                         })
                         .await
                 };
                 let applied = this
                     .update(cx, |this, cx| {
-                        this.finish_render(item_id, frame, cx);
+                        this.finish_render(item_id, frame, straightened, cx);
                         cx.notify();
                     })
                     .is_ok();
@@ -1156,14 +1231,19 @@ impl Browser {
         &mut self,
         item_id: i64,
         frame: edit_core::Result<edit_core::Frame>,
+        straightened: bool,
         cx: &mut Context<Self>,
     ) {
         match frame {
             Ok(frame) => {
                 self.queue.complete(true);
                 self.queue.finish(item_id);
-                if self.develop_item_id() == item_id {
-                    self.insert_develop_frame(item_id, frame);
+                if self.develop_item_id() == item_id && self.takes_frame(straightened) {
+                    if straightened {
+                        self.set_crop_base(frame, cx);
+                    } else {
+                        self.insert_develop_frame(item_id, frame);
+                    }
                     self.prewarm_neighbors(cx);
                 }
             }
@@ -1241,8 +1321,8 @@ impl Browser {
     /// `crs:` sidecar fans out best-effort in the background, serialized per
     /// item (review M1).
     fn persist_current_edit(&mut self, cx: &mut Context<Self>) {
-        for (item_id, json) in self.commit_catalog() {
-            self.write_sidecar(item_id, json, cx);
+        for (item_id, edit) in self.commit_catalog() {
+            self.write_sidecar(item_id, edit, cx);
         }
         cx.notify();
     }
@@ -1251,25 +1331,28 @@ impl Browser {
     /// the dirty buffer. Returns what landed. A failed write stays recorded
     /// (retried at the next commit point and at quit) and surfaces in the
     /// panel; nothing is marked clean before the catalog acknowledged it.
-    fn commit_catalog(&mut self) -> Vec<(i64, String)> {
+    fn commit_catalog(&mut self) -> Vec<(i64, EditJson)> {
         if self.develop_dirty
             && let Some(item_id) = self.develop.owner()
         {
-            match serde_json::to_string(self.develop.buffer()) {
-                Ok(json) => {
-                    self.unsaved.insert(item_id, json);
+            match edit_json(self.develop.buffer(), self.develop.crop()) {
+                Ok(edit) => {
+                    self.unsaved.insert(item_id, edit);
                     self.develop_dirty = false;
                 }
                 Err(e) => self.develop_status = format!("Edit save failed: {e}"),
             }
         }
         let mut landed = Vec::new();
-        for (item_id, json) in std::mem::take(&mut self.unsaved) {
-            match self.catalog.upsert_edit(item_id, &json, None) {
-                Ok(()) => landed.push((item_id, json)),
+        for (item_id, edit) in std::mem::take(&mut self.unsaved) {
+            match self
+                .catalog
+                .upsert_edit(item_id, &edit.develop, edit.crop.as_deref())
+            {
+                Ok(()) => landed.push((item_id, edit)),
                 Err(e) => {
                     self.develop_status = format!("Edit save failed: {e}");
-                    self.unsaved.insert(item_id, json);
+                    self.unsaved.insert(item_id, edit);
                 }
             }
         }
@@ -1282,15 +1365,15 @@ impl Browser {
     }
 
     /// Best-effort `crs:` sidecar write; the newest edit per item wins.
-    fn write_sidecar(&mut self, item_id: i64, develop_json: String, cx: &mut Context<Self>) {
-        if let Some(json) = self.sidecars.submit(item_id, develop_json) {
-            self.spawn_sidecar(item_id, json, cx);
+    fn write_sidecar(&mut self, item_id: i64, edit: EditJson, cx: &mut Context<Self>) {
+        if let Some(edit) = self.sidecars.submit(item_id, edit) {
+            self.spawn_sidecar(item_id, edit, cx);
         }
     }
 
     /// One sidecar write on the background executor. Its ack starts the
     /// item's queued write, if any, and the outcome surfaces in the panel.
-    fn spawn_sidecar(&mut self, item_id: i64, json: String, cx: &mut Context<Self>) {
+    fn spawn_sidecar(&mut self, item_id: i64, edit: EditJson, cx: &mut Context<Self>) {
         let Some(sidecar) = self.sidecar_path(item_id) else {
             if let Some(next) = self.sidecars.ack(item_id) {
                 self.spawn_sidecar(item_id, next, cx);
@@ -1302,7 +1385,13 @@ impl Browser {
             let outcome = cx
                 .background_executor()
                 .spawn(async move {
-                    edit_metadata::persist_sidecar(&catalog, item_id, &json, None, &sidecar)
+                    edit_metadata::persist_sidecar(
+                        &catalog,
+                        item_id,
+                        &edit.develop,
+                        edit.crop.as_deref(),
+                        &sidecar,
+                    )
                 })
                 .await;
             this.update(cx, |this, cx| {
@@ -1334,14 +1423,21 @@ impl Browser {
     ) -> impl Future<Output = ()> + 'static + use<> {
         let mut writes = self.commit_catalog();
         writes.extend(self.sidecars.drain_queued());
-        let jobs: Vec<(i64, String, PathBuf)> = writes
+        let jobs: Vec<(i64, EditJson, PathBuf)> = writes
             .into_iter()
-            .filter_map(|(item_id, json)| Some((item_id, json, self.sidecar_path(item_id)?)))
+            .filter_map(|(item_id, edit)| Some((item_id, edit, self.sidecar_path(item_id)?)))
             .collect();
         let catalog = Arc::clone(&self.catalog);
         cx.background_executor().spawn(async move {
-            for (item_id, json, sidecar) in jobs {
-                edit_metadata::persist_sidecar(&catalog, item_id, &json, None, &sidecar).ok();
+            for (item_id, edit, sidecar) in jobs {
+                edit_metadata::persist_sidecar(
+                    &catalog,
+                    item_id,
+                    &edit.develop,
+                    edit.crop.as_deref(),
+                    &sidecar,
+                )
+                .ok();
             }
         })
     }
@@ -1604,6 +1700,9 @@ impl Browser {
         });
         let zoom = self.zoom;
         let fit_cell = Rc::clone(&self.fit_scale);
+        let crop_frame = Rc::clone(&self.crop_frame);
+        let crop_overlay = self.crop_overlay(cx);
+        let crop_cursor = self.crop_cursor();
         let title = item
             .as_ref()
             .map(|row| row.base_name.clone())
@@ -1622,6 +1721,7 @@ impl Browser {
             .child(
                 div()
                     .id("single-canvas")
+                    .when_some(crop_cursor, |canvas, cursor| canvas.cursor(cursor))
                     .flex_1()
                     .size_full()
                     .overflow_hidden()
@@ -1630,6 +1730,7 @@ impl Browser {
                         canvas(
                             |bounds, _, _| bounds,
                             move |bounds, bounds_state, window, _| {
+                                crop_frame.set(None);
                                 if let Some(image) = image.clone() {
                                     let img_size = image.size(0);
                                     let w = img_size.width.0 as f32;
@@ -1657,6 +1758,16 @@ impl Browser {
                                             0,
                                             false,
                                         );
+                                        let frame = crop_ui::ImageFrame {
+                                            x: origin.x.into(),
+                                            y: origin.y.into(),
+                                            w: dw.into(),
+                                            h: dh.into(),
+                                        };
+                                        crop_frame.set(Some(frame));
+                                        if let Some(overlay) = crop_overlay {
+                                            crop_ui::paint_overlay(window, frame, overlay);
+                                        }
                                     }
                                 }
                             },
@@ -1666,6 +1777,9 @@ impl Browser {
                         .size_full(),
                     )
                     .on_scroll_wheel(cx.listener(|this, event: &ScrollWheelEvent, _, cx| {
+                        if this.crop_active() {
+                            return;
+                        }
                         let dy: f32 = match &event.delta {
                             ScrollDelta::Pixels(p) => p.y.into(),
                             ScrollDelta::Lines(p) => p.y * 20.0,
@@ -1680,11 +1794,17 @@ impl Browser {
                     }))
                     .on_mouse_down(
                         MouseButton::Left,
-                        cx.listener(|this, event: &MouseDownEvent, _, _| {
+                        cx.listener(|this, event: &MouseDownEvent, _, cx| {
+                            if this.crop_pointer_down(event.position, cx) {
+                                return;
+                            }
                             this.drag_from = Some(event.position);
                         }),
                     )
                     .on_mouse_move(cx.listener(|this, event: &MouseMoveEvent, _, cx| {
+                        if this.crop_pointer_move(event.position, cx) {
+                            return;
+                        }
                         if let Some(from) = this.drag_from {
                             let dx_pixels: f32 = (event.position.x - from.x).into();
                             let dy_pixels: f32 = (event.position.y - from.y).into();
@@ -1696,7 +1816,10 @@ impl Browser {
                     }))
                     .on_mouse_up(
                         MouseButton::Left,
-                        cx.listener(|this, _: &MouseUpEvent, _, _| {
+                        cx.listener(|this, _: &MouseUpEvent, _, cx| {
+                            if this.crop_pointer_up(cx) {
+                                return;
+                            }
                             this.drag_from = None;
                         }),
                     ),
@@ -1847,6 +1970,7 @@ impl Browser {
 impl Render for Browser {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         self.sync_sliders(window, cx);
+        self.sync_straighten(window, cx);
         let center: AnyElement = match self.mode {
             Mode::Grid => self.render_grid(cx).into_any_element(),
             Mode::Single => self.render_single(cx).into_any_element(),
@@ -1854,6 +1978,7 @@ impl Render for Browser {
         // Right column collapses in grid mode (plan section 2.1).
         let right: AnyElement = match self.mode {
             Mode::Grid => div().into_any_element(),
+            Mode::Single if self.crop.is_some() => self.render_crop_panel(cx).into_any_element(),
             Mode::Single => self.render_develop_panel(cx).into_any_element(),
         };
         v_flex()
@@ -1878,7 +2003,22 @@ impl Render for Browser {
                     .on_action(cx.listener(|this, _: &ExtendPrevRow, _, cx| {
                         this.walk(-(GRID_COLS as isize), true, cx);
                     }))
+                    .on_action(cx.listener(|this, _: &ToggleCrop, _, cx| {
+                        if this.mode == Mode::Single {
+                            this.toggle_crop(cx);
+                        }
+                    }))
+                    .on_action(cx.listener(|this, _: &ApplyCrop, _, cx| {
+                        this.finish_crop(true, cx);
+                    }))
+                    .on_action(cx.listener(|this, _: &CancelCrop, _, cx| {
+                        this.finish_crop(false, cx);
+                    }))
+                    .on_action(cx.listener(|this, _: &FlipCrop, _, cx| {
+                        this.flip_crop_orientation(cx);
+                    }))
                     .on_action(cx.listener(|this, _: &ToggleView, _, cx| {
+                        this.finish_crop(true, cx);
                         this.mode = match this.mode {
                             Mode::Grid => Mode::Single,
                             Mode::Single => Mode::Grid,
@@ -1925,7 +2065,7 @@ impl Render for Browser {
                         (false, true) => self.template_status.clone(),
                         (false, false) => format!("{}; {}", self.template_status, self.scan_status),
                     })
-                    .right("O open folder, I ingest, G grid or single, Z fit, Shift Z 100%, T templates"),
+                    .right("O open folder, I ingest, G grid or single, C crop, Z fit, Shift Z 100%, T templates"),
             )
     }
 }

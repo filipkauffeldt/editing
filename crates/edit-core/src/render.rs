@@ -1,6 +1,6 @@
 use serde::{Deserialize, Serialize};
 
-use crate::geometry::Rect;
+use crate::crop::Crop;
 use crate::ids::ItemId;
 use crate::retouch::RetouchRecipe;
 use crate::{DevelopSettings, Error, Result};
@@ -24,38 +24,6 @@ pub enum OutputColor {
     DisplaySrgb,
     /// Export path (file with embedded profile handling).
     ExportSrgb,
-}
-
-/// Free crop + aspect lock + rotate/straighten state for one item.
-#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
-pub struct Crop {
-    /// Normalized crop rect in source coordinates.
-    pub rect: Rect,
-    /// Straighten angle in degrees (positive is clockwise).
-    pub rotation_degrees: f32,
-    /// Locked aspect preset, if any.
-    pub aspect: Option<Aspect>,
-}
-
-impl Default for Crop {
-    fn default() -> Self {
-        Self {
-            rect: Rect::full(),
-            rotation_degrees: 0.0,
-            aspect: None,
-        }
-    }
-}
-
-/// Aspect-ratio presets offered by the crop UI (plan section 2.5).
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
-pub enum Aspect {
-    Original,
-    Square,
-    ThreeTwo,
-    TwoThree,
-    FourThree,
-    SixteenNine,
 }
 
 /// One render request: everything the develop engine needs.
@@ -174,13 +142,5 @@ mod tests {
             pixels: vec![0; 8],
         };
         assert!(bad.validate().is_err());
-    }
-
-    #[test]
-    fn crop_defaults_to_full_frame() {
-        let crop = Crop::default();
-        assert_eq!(crop.rect, Rect::full());
-        assert_eq!(crop.rotation_degrees, 0.0);
-        assert_eq!(crop.aspect, None);
     }
 }

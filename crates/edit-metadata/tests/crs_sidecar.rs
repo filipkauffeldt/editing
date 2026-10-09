@@ -36,6 +36,7 @@ fn demo_crop() -> Crop {
         rect: Rect::new(0.05, 0.1, 0.9, 0.8),
         rotation_degrees: 0.0,
         aspect: None,
+        aspect_flipped: false,
     }
 }
 

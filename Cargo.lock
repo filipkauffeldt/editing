@@ -204,6 +204,7 @@ dependencies = [
  "lightcraft-raw",
  "serde",
  "serde_json",
+ "tempfile",
 ]
 
 [[package]]
