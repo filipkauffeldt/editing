@@ -274,6 +274,10 @@ fn only_locked_photos_are_copied_and_the_rest_are_skipped(cx: &mut TestAppContex
         .map(|path| path.rsplit('/').next().unwrap())
         .collect();
     assert_eq!(names, ["DSC_0001.NEF", "DSC_0003.NEF"]);
+    // No template is required: the ingest started without one, and kept
+    // the card's file names.
+    assert_eq!(payload.iptc_fields_json, None);
+    assert!(fx.catalog.list_iptc_templates().unwrap().is_empty());
     std::fs::remove_dir_all(&dir).ok();
 }
 

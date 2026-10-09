@@ -719,24 +719,17 @@ impl IngestDialog {
         cx.notify();
     }
 
-    /// Reload the template rows and rebuild the selector. The default is the
-    /// newest ingest-scoped template (the ingest snapshot), else "None"; a
-    /// still-existing earlier pick is kept.
+    /// Reload the template rows and rebuild the selector. No template is
+    /// required: the choice is "None" unless the user picked one earlier
+    /// and it still exists.
     fn reload_templates(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         self.templates = self.catalog.list_iptc_templates().unwrap_or_default();
         self.templates.sort_by_key(|row| row.name.to_lowercase());
         let previous = self.template_select.read(cx).selected_value().cloned();
-        let default = self
-            .templates
-            .iter()
-            .filter(|row| row.scope == "ingest")
-            .max_by_key(|row| row.updated_at)
-            .map(|row| row.name.clone());
         let mut names = vec![NO_TEMPLATE.to_string()];
         names.extend(self.templates.iter().map(|row| row.name.clone()));
         let pick = previous
             .filter(|name| names.contains(name))
-            .or(default)
             .unwrap_or_else(|| NO_TEMPLATE.to_string());
         self.template_select.update(cx, |select, cx| {
             select.set_items(SearchableVec::new(names), window, cx);
