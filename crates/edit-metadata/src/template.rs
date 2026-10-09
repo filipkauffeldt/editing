@@ -60,6 +60,14 @@ impl TemplateFields {
     pub fn is_empty(&self) -> bool {
         self.0.is_empty()
     }
+
+    pub fn len(&self) -> usize {
+        self.0.len()
+    }
+
+    pub fn contains(&self, id: &str) -> bool {
+        self.0.contains_key(id)
+    }
 }
 
 impl Serialize for TemplateFields {

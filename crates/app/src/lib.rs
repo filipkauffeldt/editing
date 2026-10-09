@@ -18,4 +18,5 @@ pub mod panel;
 pub mod preset_store;
 pub mod preview;
 pub mod templates;
+pub mod sidebar;
 pub mod views;

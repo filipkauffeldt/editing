@@ -21,6 +21,7 @@
 //! | `O` | open a folder (native picker) |
 //! | `C` | crop mode: enter, or apply and leave |
 //! | `Enter` / `Esc` | apply / cancel the crop draft |
+//! | `Ctrl+S` | save the metadata form |
 
 use std::cell::Cell;
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet, VecDeque};
@@ -43,7 +44,7 @@ use crate::browse::{
     BrowseFilter, BrowseItem, CatalogScanPayload, MetaBadge, SelectionModel, SortOrder,
     ThumbPayload, ThumbState, UploadBadge, ZoomMode, ZoomState, apply_filter_sort, canonical_root,
     list_browse_items, pair_key, plan_template_apply, run_catalog_scan,
-    template_apply_payloads_with,
+    template_apply_payloads_opts,
 };
 use crate::crop::{CropSession, Grab, Latest};
 use crate::develop::{
@@ -52,6 +53,7 @@ use crate::develop::{
 use crate::develop_panel::{DevelopPanel, PanelEvent, PresetEntry, none_entry};
 use crate::panel::{self, BUILTIN_PRESETS, PresetValues};
 use crate::preview::BrowsePreviewProvider;
+use crate::sidebar::{MetadataSidebar, SaveMetadata, SidebarEvent};
 use edit_core::{CancelToken, Crop, DevelopSettings, RenderSize};
 use edit_ingest::{IngestCopyPayload, dest_root_path};
 use edit_metadata::{CodeReplacements, MetadataWritePayload, TemplateFields};
@@ -260,6 +262,13 @@ pub struct Browser {
     /// Fit scale painted by the last canvas frame; scroll-zoom reads it to
     /// enter a free scale from Fit. UI-thread only, hence `Rc`.
     fit_scale: Rc<Cell<f32>>,
+    /// Metadata form; built on the first render (inputs need a window).
+    sidebar: Option<Entity<MetadataSidebar>>,
+    /// Selection and rows the sidebar was last fed.
+    sidebar_sel: Vec<usize>,
+    sidebar_rows: usize,
+    /// Display paths whose metadata was written; the sidebar rereads them.
+    sidebar_stale: Vec<String>,
 }
 
 impl Browser {
@@ -278,28 +287,29 @@ impl Browser {
         .detach();
         let user_presets = crate::preset_store::list(&catalog);
         cx.bind_keys([
-            KeyBinding::new("right", NextItem, None),
-            KeyBinding::new("left", PrevItem, None),
-            KeyBinding::new("down", NextRow, None),
-            KeyBinding::new("up", PrevRow, None),
-            KeyBinding::new("shift-right", ExtendNext, None),
-            KeyBinding::new("shift-left", ExtendPrev, None),
-            KeyBinding::new("shift-down", ExtendNextRow, None),
-            KeyBinding::new("shift-up", ExtendPrevRow, None),
-            KeyBinding::new("g", ToggleView, None),
-            KeyBinding::new("z", FitView, None),
-            KeyBinding::new("shift-z", HundredView, None),
-            KeyBinding::new("ctrl-a", SelectAllItems, None),
-            KeyBinding::new("0", Rate0, None),
-            KeyBinding::new("1", Rate1, None),
-            KeyBinding::new("2", Rate2, None),
-            KeyBinding::new("3", Rate3, None),
-            KeyBinding::new("4", Rate4, None),
-            KeyBinding::new("5", Rate5, None),
+            KeyBinding::new("right", NextItem, Some("Workspace && !Input")),
+            KeyBinding::new("left", PrevItem, Some("Workspace && !Input")),
+            KeyBinding::new("down", NextRow, Some("Workspace && !Input")),
+            KeyBinding::new("up", PrevRow, Some("Workspace && !Input")),
+            KeyBinding::new("shift-right", ExtendNext, Some("Workspace && !Input")),
+            KeyBinding::new("shift-left", ExtendPrev, Some("Workspace && !Input")),
+            KeyBinding::new("shift-down", ExtendNextRow, Some("Workspace && !Input")),
+            KeyBinding::new("shift-up", ExtendPrevRow, Some("Workspace && !Input")),
+            KeyBinding::new("g", ToggleView, Some("Workspace && !Input")),
+            KeyBinding::new("z", FitView, Some("Workspace && !Input")),
+            KeyBinding::new("shift-z", HundredView, Some("Workspace && !Input")),
+            KeyBinding::new("ctrl-a", SelectAllItems, Some("Workspace && !Input")),
+            KeyBinding::new("0", Rate0, Some("Workspace && !Input")),
+            KeyBinding::new("1", Rate1, Some("Workspace && !Input")),
+            KeyBinding::new("2", Rate2, Some("Workspace && !Input")),
+            KeyBinding::new("3", Rate3, Some("Workspace && !Input")),
+            KeyBinding::new("4", Rate4, Some("Workspace && !Input")),
+            KeyBinding::new("5", Rate5, Some("Workspace && !Input")),
             KeyBinding::new("c", ToggleCrop, Some("!Input")),
             KeyBinding::new("enter", ApplyCrop, Some("!Input")),
             KeyBinding::new("escape", CancelCrop, Some("!Input")),
             KeyBinding::new("x", FlipCrop, Some("!Input")),
+            KeyBinding::new("ctrl-s", SaveMetadata, Some("Workspace")),
         ]);
         let browser = Self {
             catalog,
@@ -357,6 +367,10 @@ impl Browser {
             drag_from: None,
             strip_scroll: ScrollHandle::new(),
             fit_scale: Rc::new(Cell::new(1.0)),
+            sidebar: None,
+            sidebar_sel: Vec::new(),
+            sidebar_rows: 0,
+            sidebar_stale: Vec::new(),
         };
         cx.on_app_quit(|this, cx| this.flush_for_quit(cx)).detach();
         browser
@@ -626,12 +640,44 @@ impl Browser {
         replacements: Option<CodeReplacements>,
         cx: &mut Context<Self>,
     ) {
-        if fields == TemplateFields::default() {
+        if fields.is_empty() {
             self.template_status = "Apply skipped: template is empty.".into();
             cx.notify();
             return;
         }
-        let plan = plan_template_apply(&self.selected_items(), &self.catalog);
+        let items = self.selected_items();
+        let label =
+            |count: usize| format!("Applying template \"{template_name}\" to {count} photos…");
+        self.queue_writes(items, fields, replacements, false, label, cx);
+    }
+
+    /// Write the form's changed fields to `items` (the sidebar's Save).
+    fn write_form(
+        &mut self,
+        items: Vec<BrowseItem>,
+        fields: TemplateFields,
+        cx: &mut Context<Self>,
+    ) {
+        let label = |count: usize| {
+            format!(
+                "Saving metadata for {count} photo{}…",
+                if count == 1 { "" } else { "s" }
+            )
+        };
+        self.queue_writes(items, fields, None, true, label, cx);
+    }
+
+    /// Enqueue one durable `metadata_write` job per cataloged item.
+    fn queue_writes(
+        &mut self,
+        items: Vec<BrowseItem>,
+        fields: TemplateFields,
+        replacements: Option<CodeReplacements>,
+        clear_empty: bool,
+        label: impl Fn(usize) -> String,
+        cx: &mut Context<Self>,
+    ) {
+        let plan = plan_template_apply(&items, &self.catalog);
         if plan.is_empty() {
             self.template_status = "Apply skipped: no cataloged item in the selection.".into();
             cx.notify();
@@ -642,21 +688,19 @@ impl Browser {
             self.set_meta_quiet(*item_id, MetaBadge::Queued);
         }
         self.rebuild_rows();
-        self.template_status = format!(
-            "Applying template \"{template_name}\" to {} photos…",
-            item_ids.len()
-        );
+        self.template_status = label(item_ids.len());
         cx.notify();
 
         let catalog = Arc::clone(&self.catalog);
         let fields_json = serde_json::to_string(&fields).unwrap_or_else(|_| "{}".to_string());
         cx.spawn(async move |this, cx| {
             let enqueue = cx.background_executor().spawn(async move {
-                let payloads = template_apply_payloads_with(
+                let payloads = template_apply_payloads_opts(
                     &plan,
                     &fields_json,
                     edit_catalog::db::now_unix(),
                     replacements,
+                    clear_empty,
                 );
                 catalog.enqueue_jobs_batch(JobKind::MetadataWrite, &payloads)
             });
@@ -809,7 +853,7 @@ impl Browser {
                 } else if let Some(item_id) = self.meta_item_id(event.id) {
                     self.set_meta(item_id, MetaBadge::Writing);
                     if self.template_status.is_empty() {
-                        self.template_status = "Writing template metadata…".into();
+                        self.template_status = "Writing metadata…".into();
                     }
                 } else {
                     self.on_ingest_event(event.id, &event.kind);
@@ -821,7 +865,7 @@ impl Browser {
                     self.scan_status = format!("Scanning {done} of {total}");
                     self.refresh_items();
                 } else if self.meta_jobs.contains_key(&event.id) {
-                    self.template_status = format!("Writing template metadata: {done}/{total}");
+                    self.template_status = format!("Writing metadata: {done}/{total}");
                 } else {
                     self.on_ingest_event(event.id, &event.kind);
                 }
@@ -836,6 +880,9 @@ impl Browser {
                     self.rebuild_rows();
                 } else if let Some(item_id) = self.meta_item_id(event.id) {
                     self.meta_jobs.remove(&event.id);
+                    if let Some(row) = self.items.iter().find(|row| row.item_id == item_id) {
+                        self.sidebar_stale.push(row.display_path.clone());
+                    }
                     self.set_meta(item_id, MetaBadge::Done);
                     let in_flight = self
                         .items
@@ -849,11 +896,11 @@ impl Browser {
                         .count();
                     self.template_status = if in_flight == 0 {
                         format!(
-                            "Template applied: {done_count} photo{}.",
+                            "Metadata written: {done_count} photo{}.",
                             if done_count == 1 { "" } else { "s" }
                         )
                     } else {
-                        format!("Template applied: {done_count} done, {in_flight} in flight…")
+                        format!("Metadata written: {done_count} done, {in_flight} in flight…")
                     };
                 } else {
                     self.on_ingest_event(event.id, &event.kind);
@@ -868,7 +915,7 @@ impl Browser {
                 } else if let Some(item_id) = self.meta_item_id(event.id) {
                     self.meta_jobs.remove(&event.id);
                     self.set_meta(item_id, MetaBadge::Failed);
-                    self.template_status = format!("Template apply failed: {error}");
+                    self.template_status = format!("Metadata write failed: {error}");
                 } else {
                     self.on_ingest_event(event.id, &event.kind);
                 }
@@ -2138,58 +2185,55 @@ impl Browser {
             .children(cells)
     }
 
-    /// Left metadata panel: item summary plus the template entry point
-    /// (plan section 2.7: the template editor opens over the shell).
-    fn render_metadata(&self, cx: &mut Context<Self>) -> impl IntoElement {
-        let theme = cx.theme();
-        let (panel_bg, panel_fg, panel_border, muted, warning) = (
-            theme.sidebar,
-            theme.sidebar_foreground,
-            theme.sidebar_border,
-            theme.muted_foreground,
-            theme.warning,
-        );
-        let (title, dir, rating, meta_state) = match self.current_item() {
-            Some(row) => (
-                row.base_name.clone(),
-                row.dir.clone(),
-                row.rating,
-                Self::meta_text(row.meta),
-            ),
-            None => (String::new(), String::new(), 0, String::new()),
-        };
-        v_flex()
-            .w(px(220.0))
-            .h_full()
-            .px_2()
-            .py_1()
-            .gap_1()
-            .bg(panel_bg)
-            .text_color(panel_fg)
-            .border_r_1()
-            .border_color(panel_border)
-            .child(Label::new(title).text_sm())
-            .child(Label::new(dir).text_xs().text_color(muted))
-            .child(
-                Label::new(if rating > 0 {
-                    "★".repeat(rating.clamp(0, 5) as usize)
-                } else {
-                    "Not rated".to_string()
+    /// Left panel: the metadata form of the selection. It is fed the
+    /// selection when that changes and the photos whose write finished.
+    fn render_metadata(
+        &mut self,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> Entity<MetadataSidebar> {
+        let sidebar = match &self.sidebar {
+            Some(sidebar) => sidebar.clone(),
+            None => {
+                let (catalog, focus) = (Arc::clone(&self.catalog), self.focus.clone());
+                let sidebar = cx.new(|cx| MetadataSidebar::new(catalog, focus, window, cx));
+                cx.subscribe(&sidebar, |this, _, event: &SidebarEvent, cx| match event {
+                    SidebarEvent::Save { items, fields } => {
+                        this.write_form(items.clone(), fields.clone(), cx);
+                    }
                 })
-                .text_xs(),
-            )
-            .when(!meta_state.is_empty(), |panel| {
-                panel.child(Label::new(meta_state).text_xs().text_color(warning))
-            })
+                .detach();
+                self.sidebar = Some(sidebar.clone());
+                sidebar
+            }
+        };
+        let rows_id = Arc::as_ptr(&self.rows) as usize;
+        let selected: Vec<usize> = self.selection.selected.iter().copied().collect();
+        if selected != self.sidebar_sel || rows_id != self.sidebar_rows {
+            self.sidebar_sel = selected;
+            self.sidebar_rows = rows_id;
+            let items = self.selected_items();
+            sidebar.update(cx, |sidebar, cx| sidebar.set_target(items, cx));
+        }
+        if !self.sidebar_stale.is_empty() {
+            let stale = std::mem::take(&mut self.sidebar_stale);
+            sidebar.update(cx, |sidebar, cx| sidebar.invalidate(&stale, cx));
+        }
+        let badge = self
+            .current_item()
+            .map(|row| Self::meta_text(row.meta))
+            .unwrap_or_default();
+        sidebar.update(cx, |sidebar, cx| sidebar.set_badge(badge, cx));
+        sidebar
     }
 
     fn meta_text(meta: MetaBadge) -> String {
         match meta {
             MetaBadge::None => String::new(),
-            MetaBadge::Queued => "Template queued".to_string(),
-            MetaBadge::Writing => "Writing template…".to_string(),
-            MetaBadge::Done => "Template applied".to_string(),
-            MetaBadge::Failed => "Template failed".to_string(),
+            MetaBadge::Queued => "Queued".to_string(),
+            MetaBadge::Writing => "Writing".to_string(),
+            MetaBadge::Done => "Saved".to_string(),
+            MetaBadge::Failed => "Save failed".to_string(),
         }
     }
 }
@@ -2197,6 +2241,7 @@ impl Browser {
 impl Render for Browser {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         self.sync_straighten(window, cx);
+        let metadata = self.render_metadata(window, cx);
         let center: AnyElement = match self.mode {
             Mode::Grid => self.render_grid(cx).into_any_element(),
             Mode::Single => self.render_single(cx).into_any_element(),
@@ -2264,6 +2309,11 @@ impl Render for Browser {
                         this.clamp_to_visible();
                         cx.notify();
                     }))
+                    .on_action(cx.listener(|this, _: &SaveMetadata, _, cx| {
+                        if let Some(sidebar) = &this.sidebar {
+                            sidebar.update(cx, |sidebar, cx| sidebar.save(cx));
+                        }
+                    }))
                     .on_action(cx.listener(|this, _: &Rate0, _, cx| this.set_rating(0, cx)))
                     .on_action(cx.listener(|this, _: &Rate1, _, cx| this.set_rating(1, cx)))
                     .on_action(cx.listener(|this, _: &Rate2, _, cx| this.set_rating(2, cx)))
@@ -2279,7 +2329,7 @@ impl Render for Browser {
                         h_flex()
                             .flex_1()
                             .size_full()
-                            .child(self.render_metadata(cx))
+                            .child(metadata)
                             .child(div().flex_1().size_full().overflow_hidden().child(center))
                             .child(right),
                     ),
