@@ -6,7 +6,6 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use app::browse::run_catalog_scan;
-use app::develop::SliderId;
 use app::views::Browser;
 use edit_catalog::{Catalog, JobEvent, JobEventKind};
 use edit_render::RenderService;
@@ -101,9 +100,11 @@ fn clicking_the_slider_track_renders_a_new_preview(cx: &mut TestAppContext) {
     let rig = rig(cx);
     cx.simulate_keystrokes(rig.handle, "g");
     settle(cx, &rig, |_| true);
+    let panel = cx.update(|cx| rig.browser.read(cx).develop_panel());
+    settle(cx, &rig, |_| true);
     let slider = cx
-        .update(|cx| rig.browser.read(cx).develop_slider(SliderId::Exposure))
-        .unwrap();
+        .update(|cx| panel.read(cx).slider("light.exposure"))
+        .expect("the tone section is open");
     // The photo's edit loads in the background; wait for the panel to be live.
     settle(cx, &rig, |b| b.develop_owner().is_some());
     let before = cx.update(|cx| rig.browser.read(cx).develop_frames());
@@ -130,7 +131,7 @@ fn clicking_the_slider_track_renders_a_new_preview(cx: &mut TestAppContext) {
     });
     assert!(value > 2.0, "the knob should jump to the click: {value}");
     settle(cx, &rig, |b| b.develop_frames() > before);
-    let exposure = cx.update(|cx| rig.browser.read(cx).develop_value(SliderId::Exposure));
+    let exposure = cx.update(|cx| rig.browser.read(cx).develop_value("light.exposure"));
     assert!(
         (exposure - value as f64).abs() < 0.05,
         "{exposure} vs {value}"
