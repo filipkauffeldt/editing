@@ -16,22 +16,23 @@ use edit_catalog::{Catalog, JobEvent, JobEventKind, JobId, JobKind};
 use edit_core::IngestFileState;
 use edit_ingest::{IngestCopyPayload, Volume, batch_volume_identity};
 
+use crate::assets::LOCK_ICON;
 use crate::ingest_job::{IngestStart, saved_code_replacements, start_ingest};
 use gpui_kit::component::WindowExt as _;
 use gpui_kit::component::alert::Alert;
 use gpui_kit::component::button::{Button, ButtonVariants as _};
-use gpui_kit::component::checkbox::Checkbox;
 use gpui_kit::component::dialog::DialogClose;
 use gpui_kit::component::input::{Input, InputState};
 use gpui_kit::component::label::Label;
 use gpui_kit::component::progress::Progress;
-use gpui_kit::component::radio::RadioGroup;
+use gpui_kit::component::radio::{Radio, RadioGroup};
 use gpui_kit::component::scroll::{ScrollableElement as _, Scrollbar};
 use gpui_kit::component::searchable_list::SearchableVec;
 use gpui_kit::component::select::{Select, SelectState};
 use gpui_kit::component::switch::Switch;
 use gpui_kit::component::{
-    ActiveTheme as _, Disableable as _, IconName, Sizable as _, StyledExt as _, h_flex, v_flex,
+    ActiveTheme as _, Disableable as _, Icon, IconName, Sizable as _, StyledExt as _, h_flex,
+    v_flex,
 };
 use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::*;
@@ -422,20 +423,23 @@ pub fn format_bytes(bytes: u64) -> String {
 /// Template choice meaning "ingest without stamping".
 const NO_TEMPLATE: &str = "None";
 
-/// What to copy from the card, as in Photo Mechanic's ingest.
+/// What to copy from the card.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum CopyScope {
     All,
-    Tagged,
+    /// Only photos locked (protected) in the camera.
+    Locked,
 }
 
-/// One photo on the chosen card, with its tag (checkbox) state.
+/// One photo on the chosen card.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CardPhoto {
     pub path: String,
     pub name: String,
     pub bytes: u64,
-    pub tagged: bool,
+    /// Locked in the camera; always false when the card is read-only, as
+    /// every file looks read-only then and the lock cannot be told.
+    pub locked: bool,
 }
 
 /// Reading the chosen card's file list happens off the UI thread.
@@ -446,14 +450,14 @@ enum CardScan {
     Failed(String),
 }
 
-/// Photos the ingest would copy: every photo, or only the tagged ones.
+/// Photos the ingest would copy: every photo (`None`), or only the locked ones.
 pub fn chosen_sources(photos: &[CardPhoto], scope: CopyScope) -> Option<Vec<String>> {
     match scope {
         CopyScope::All => None,
-        CopyScope::Tagged => Some(
+        CopyScope::Locked => Some(
             photos
                 .iter()
-                .filter(|photo| photo.tagged)
+                .filter(|photo| photo.locked)
                 .map(|photo| photo.path.clone())
                 .collect(),
         ),
@@ -461,8 +465,9 @@ pub fn chosen_sources(photos: &[CardPhoto], scope: CopyScope) -> Option<Vec<Stri
 }
 
 /// Ingest dialog body (plan section 2.8), hosted by a modal `Dialog`: the
-/// source (card or folder), what to copy, where it goes, optional renaming,
-/// an optional IPTC template, and the live file list. The footer is
+/// source (card or folder), what to copy (all, or only photos locked in the
+/// camera), where it goes, optional renaming, an optional IPTC template, and
+/// the file list. The footer is
 /// [`IngestFooter`].
 pub struct IngestDialog {
     state: Entity<AppState>,
@@ -472,6 +477,8 @@ pub struct IngestDialog {
     /// Folders the user picked with "Choose folder…".
     folders: Vec<Volume>,
     photos: Vec<CardPhoto>,
+    /// Whether lock marks on this source can be trusted (not a read-only card).
+    locks_known: bool,
     scan: CardScan,
     scan_task: Option<Task<()>>,
     pub scope: CopyScope,
@@ -508,6 +515,7 @@ impl IngestDialog {
             selected: None,
             folders: Vec::new(),
             photos: Vec::new(),
+            locks_known: true,
             scan: CardScan::Idle,
             scan_task: None,
             scope: CopyScope::All,
@@ -565,15 +573,27 @@ impl IngestDialog {
         self.status_is_error = is_error;
     }
 
-    pub fn tagged_count(&self) -> usize {
-        self.photos.iter().filter(|photo| photo.tagged).count()
+    /// Photos locked in the camera.
+    pub fn locked_count(&self) -> usize {
+        self.photos.iter().filter(|photo| photo.locked).count()
+    }
+
+    /// Whether "Only locked photos" can be chosen, and why not.
+    pub fn locked_unavailable(&self) -> Option<&'static str> {
+        if !self.locks_known {
+            Some("Locks can't be read from a read-only card.")
+        } else if self.locked_count() == 0 {
+            Some("No photos are locked in the camera.")
+        } else {
+            None
+        }
     }
 
     /// How many photos the primary button would copy.
     pub fn photo_count(&self) -> usize {
         match self.scope {
             CopyScope::All => self.photos.len(),
-            CopyScope::Tagged => self.tagged_count(),
+            CopyScope::Locked => self.locked_count(),
         }
     }
 
@@ -620,6 +640,7 @@ impl IngestDialog {
         };
         self.selected = Some(identity);
         self.photos.clear();
+        self.locks_known = !source.read_only;
         self.scan = CardScan::Reading;
         self.show_progress = false;
         let root = source.mount_point.clone();
@@ -636,16 +657,20 @@ impl IngestDialog {
                 }
                 match found {
                     Ok(files) => {
+                        let known = this.locks_known;
                         this.photos = files
                             .into_iter()
                             .map(|file| CardPhoto {
                                 path: file.path.to_string_lossy().into_owned(),
                                 name: file.original_name,
                                 bytes: file.bytes,
-                                tagged: true,
+                                locked: known && file.locked,
                             })
                             .collect();
                         this.scan = CardScan::Idle;
+                        if this.locked_unavailable().is_some() {
+                            this.scope = CopyScope::All;
+                        }
                     }
                     Err(error) => this.scan = CardScan::Failed(error.to_string()),
                 }
@@ -682,21 +707,10 @@ impl IngestDialog {
         .detach();
     }
 
-    pub fn set_all_tags(&mut self, tagged: bool, cx: &mut Context<Self>) {
-        for photo in &mut self.photos {
-            photo.tagged = tagged;
-        }
-        cx.notify();
-    }
-
-    pub fn set_tag(&mut self, index: usize, tagged: bool, cx: &mut Context<Self>) {
-        if let Some(photo) = self.photos.get_mut(index) {
-            photo.tagged = tagged;
-            cx.notify();
-        }
-    }
-
     pub fn set_scope(&mut self, scope: CopyScope, cx: &mut Context<Self>) {
+        if scope == CopyScope::Locked && self.locked_unavailable().is_some() {
+            return;
+        }
         self.scope = scope;
         cx.notify();
     }
@@ -900,24 +914,33 @@ impl IngestDialog {
     fn render_scope(&self, cx: &mut Context<Self>) -> impl IntoElement + use<> {
         let selected = match self.scope {
             CopyScope::All => 0,
-            CopyScope::Tagged => 1,
+            CopyScope::Locked => 1,
+        };
+        let unavailable = self.locked_unavailable();
+        let locked = Radio::new("scope-locked")
+            .label("Only locked photos")
+            .disabled(unavailable.is_some());
+        let locked = match unavailable {
+            Some(why) => locked.tooltip(why),
+            None => locked,
         };
         RadioGroup::horizontal("copy-scope")
-            .children(["All photos", "Only tagged photos"])
+            .child(Radio::new("scope-all").label("All photos"))
+            .child(locked)
             .selected_index(Some(selected))
             .on_change(cx.listener(|this, index: &usize, _, cx| {
                 this.set_scope(
                     if *index == 0 {
                         CopyScope::All
                     } else {
-                        CopyScope::Tagged
+                        CopyScope::Locked
                     },
                     cx,
                 );
             }))
     }
 
-    /// The photo list: tag checkboxes before the copy, progress after it.
+    /// The photo list with lock marks, or the ingest's progress after Start.
     fn render_files(&mut self, cx: &mut Context<Self>) -> impl IntoElement {
         let muted = cx.theme().muted_foreground;
         if self.show_progress {
@@ -950,68 +973,36 @@ impl IngestDialog {
                 )
                 .into_any_element();
         }
-        match (&self.scan, self.scope) {
-            (CardScan::Reading, _) => {
+        match &self.scan {
+            CardScan::Reading => {
                 return Label::new("Reading the card…")
                     .text_sm()
                     .text_color(muted)
                     .into_any_element();
             }
-            (CardScan::Failed(error), _) => {
+            CardScan::Failed(error) => {
                 return Alert::error("scan-failed", format!("Could not read the card: {error}"))
                     .into_any_element();
             }
-            (CardScan::Idle, CopyScope::All) => {
-                let total: u64 = self.photos.iter().map(|photo| photo.bytes).sum();
-                let line = if self.selected.is_none() {
-                    "Choose a card or folder to see its photos.".to_string()
-                } else {
-                    format!("{} photos, {}", self.photos.len(), format_bytes(total))
-                };
-                return Label::new(line)
+            CardScan::Idle if self.selected.is_none() => {
+                return Label::new("Choose a card or folder to see its photos.")
                     .text_sm()
                     .text_color(muted)
                     .into_any_element();
             }
-            (CardScan::Idle, CopyScope::Tagged) => {}
+            CardScan::Idle => {}
         }
         let count = self.photos.len();
-        let tagged = self.tagged_count();
+        let summary = if self.locks_known {
+            format!("{} of {count} locked in camera", self.locked_count())
+        } else {
+            let total: u64 = self.photos.iter().map(|photo| photo.bytes).sum();
+            format!("{count} photos, {}", format_bytes(total))
+        };
+        let only_locked = self.scope == CopyScope::Locked;
         v_flex()
             .gap_2()
-            .child(
-                h_flex()
-                    .w_full()
-                    .justify_between()
-                    .items_center()
-                    .child(
-                        Label::new(format!("{tagged} of {count} tagged"))
-                            .text_sm()
-                            .font_semibold(),
-                    )
-                    .child(
-                        h_flex()
-                            .gap_1()
-                            .child(
-                                Button::new("tag-all")
-                                    .small()
-                                    .ghost()
-                                    .label("Tag all")
-                                    .on_click(cx.listener(|this, _, _, cx| {
-                                        this.set_all_tags(true, cx);
-                                    })),
-                            )
-                            .child(
-                                Button::new("untag-all")
-                                    .small()
-                                    .ghost()
-                                    .label("Untag all")
-                                    .on_click(cx.listener(|this, _, _, cx| {
-                                        this.set_all_tags(false, cx);
-                                    })),
-                            ),
-                    ),
-            )
+            .child(Label::new(summary).text_sm().font_semibold())
             .child(
                 div()
                     .relative()
@@ -1023,11 +1014,13 @@ impl IngestDialog {
                         uniform_list(
                             "card-photos",
                             count,
-                            cx.processor(|this, range: Range<usize>, _window, cx| {
+                            cx.processor(move |this, range: Range<usize>, _window, cx| {
                                 let muted = cx.theme().muted_foreground;
                                 range
                                     .filter_map(|index| {
                                         let photo = this.photos.get(index)?;
+                                        // Photos the scope leaves out read as muted.
+                                        let skipped = only_locked && !photo.locked;
                                         Some(
                                             h_flex()
                                                 .id(("photo", index))
@@ -1035,19 +1028,21 @@ impl IngestDialog {
                                                 .px_2()
                                                 .gap_2()
                                                 .items_center()
-                                                .child(
-                                                    Checkbox::new(("tag", index))
-                                                        .checked(photo.tagged)
-                                                        .on_change(cx.listener(
-                                                            move |this, next: &bool, _, cx| {
-                                                                this.set_tag(index, *next, cx);
-                                                            },
-                                                        )),
-                                                )
+                                                .child(div().w_4().when(photo.locked, |slot| {
+                                                    slot.child(
+                                                        Icon::empty()
+                                                            .path(LOCK_ICON)
+                                                            .small()
+                                                            .text_color(muted),
+                                                    )
+                                                }))
                                                 .child(
                                                     Label::new(photo.name.clone())
                                                         .text_sm()
-                                                        .flex_1(),
+                                                        .flex_1()
+                                                        .when(skipped, |label| {
+                                                            label.text_color(muted)
+                                                        }),
                                                 )
                                                 .child(
                                                     Label::new(format_bytes(photo.bytes))
@@ -1249,6 +1244,7 @@ mod tests {
             state: IngestFileState::Duplicate,
             error: None,
             created_at: 0,
+            locked: false,
         });
         assert_eq!(row.name, "DSC0001.NEF");
         assert_eq!(row.bytes, 2048);
@@ -1285,6 +1281,7 @@ mod tests {
             state,
             error: error.map(str::to_string),
             created_at: 0,
+            locked: false,
         }
     }
 

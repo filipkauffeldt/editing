@@ -7,6 +7,7 @@
 //! mode drag and aspect logic; [`views`] renders them;
 //! [`ingest_job`] runs the durable ingest copy job.
 
+pub mod assets;
 pub mod browse;
 pub mod crop;
 pub mod develop;

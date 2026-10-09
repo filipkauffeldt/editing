@@ -231,7 +231,7 @@ fn main() {
     let pending_folder: Option<PathBuf> = std::env::args().nth(1).map(PathBuf::from);
     let browser_renderer = Arc::clone(&renderer);
 
-    let app = gpui_kit::application().with_assets(gpui_kit::assets::Assets);
+    let app = gpui_kit::application().with_assets(app::assets::AppAssets);
     app.run(move |cx| {
         gpui_kit::init(cx);
         // The component library starts in its light theme; a photo editor
