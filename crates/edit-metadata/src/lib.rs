@@ -7,6 +7,7 @@
 pub mod apply;
 pub mod code_replacements;
 pub mod crs;
+pub mod crs_keys;
 pub mod error;
 pub mod persist;
 pub mod photo;

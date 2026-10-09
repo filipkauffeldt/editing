@@ -21,7 +21,9 @@
 use std::path::Path;
 
 use edit_core::{Crop, DevelopSettings};
-use lightcraft_develop::WbMode;
+use lightcraft_develop::{ControlSpec, WbMode, controls};
+
+use crate::crs_keys::crs_controls;
 
 use crate::error::Result;
 
@@ -33,9 +35,6 @@ pub const PROCESS_VERSION: &str = "11.0";
 /// `Temperature`/`Tint` are Custom-WB only: stamping the 6500 K default
 /// over an as-shot file would lie about the illuminant.
 pub fn develop_attributes(develop: &DevelopSettings) -> Vec<(String, String)> {
-    let light = &develop.light;
-    let effects = &develop.effects;
-    let curve = &develop.curve;
     let mut attrs = vec![
         ("ProcessVersion".into(), PROCESS_VERSION.into()),
         ("HasSettings".into(), "True".into()),
@@ -48,29 +47,91 @@ pub fn develop_attributes(develop: &DevelopSettings) -> Vec<(String, String)> {
         ));
         attrs.push(("Tint".into(), format!("{:+.0}", develop.wb.tint)));
     }
-    attrs.extend(
-        [
-            ("Exposure2012", format!("{:+.2}", light.exposure)),
-            ("Contrast2012", int_tag(light.contrast)),
-            ("Highlights2012", int_tag(light.highlights)),
-            ("Shadows2012", int_tag(light.shadows)),
-            ("Whites2012", int_tag(light.whites)),
-            ("Blacks2012", int_tag(light.blacks)),
-            ("Clarity2012", int_tag(effects.clarity)),
-            ("Texture", int_tag(effects.texture)),
-            ("Dehaze", int_tag(effects.dehaze)),
-            ("ParametricShadows", int_tag(curve.shadows)),
-            ("ParametricDarks", int_tag(curve.darks)),
-            ("ParametricLights", int_tag(curve.lights)),
-            ("ParametricHighlights", int_tag(curve.highlights)),
-            ("ParametricShadowSplit", int_tag(curve.split_shadows)),
-            ("ParametricMidtoneSplit", int_tag(curve.split_mid)),
-            ("ParametricHighlightSplit", int_tag(curve.split_highlights)),
-        ]
-        .into_iter()
-        .map(|(k, v)| (k.to_owned(), v)),
-    );
+    for (id, key) in crs_controls() {
+        let Some(spec) = controls::find(id) else {
+            continue;
+        };
+        let Some(value) = controls::get(develop, id) else {
+            continue;
+        };
+        // The 2012 tone set is always stamped (Lightroom treats a missing
+        // slider as the old process); everything else only when moved.
+        let always = key.ends_with("2012") || key.starts_with("Parametric");
+        if !always && (value - spec.default).abs() < 1e-9 {
+            continue;
+        }
+        attrs.push((
+            key.clone(),
+            format_value(spec, value, key == "Exposure2012"),
+        ));
+    }
+    let optics = &develop.optics;
+    if optics.lens_profile {
+        attrs.push(("LensProfileEnable".into(), "1".into()));
+    }
+    if optics.remove_ca {
+        attrs.push(("AutoLateralCA".into(), "1".into()));
+    }
+    if develop.vignette.amount != 0.0 {
+        attrs.push(("PostCropVignetteStyle".into(), "1".into()));
+    }
     attrs
+}
+
+/// The `crs:` attributes of an `.xmp` packet, in file order.
+pub fn parse_attributes(xml: &str) -> Vec<(String, String)> {
+    use quick_xml::events::Event;
+    let mut reader = quick_xml::Reader::from_str(xml);
+    let mut out = Vec::new();
+    while let Ok(event) = reader.read_event() {
+        match event {
+            Event::Start(e) | Event::Empty(e) => {
+                for attr in e.attributes().flatten() {
+                    let key = String::from_utf8_lossy(attr.key.as_ref()).into_owned();
+                    if let Some(name) = key.strip_prefix("crs:")
+                        && let Ok(value) = attr.normalized_value(quick_xml::XmlVersion::Implicit1_0)
+                    {
+                        out.push((name.to_owned(), value.into_owned()));
+                    }
+                }
+            }
+            Event::Eof => break,
+            _ => {}
+        }
+    }
+    out
+}
+
+/// Apply `crs:` attributes onto `develop`: the inverse of
+/// [`develop_attributes`] for every control with a row in the key table,
+/// plus the white balance and the lens toggles. Unknown keys are ignored.
+pub fn apply_attributes(develop: &mut DevelopSettings, attrs: &[(String, String)]) {
+    let value_of = |key: &str| {
+        attrs
+            .iter()
+            .find(|(k, _)| k == key)
+            .and_then(|(_, v)| v.trim().parse::<f64>().ok())
+    };
+    for (id, key) in crs_controls() {
+        if let Some(value) = value_of(key) {
+            controls::set(develop, id, value);
+        }
+    }
+    if let Some((_, label)) = attrs.iter().find(|(k, _)| k == "WhiteBalance")
+        && let Some(mode) = WbMode::ALL.iter().find(|m| m.label() == label)
+    {
+        develop.wb.mode = *mode;
+    }
+    if develop.wb.mode == WbMode::Custom {
+        if let Some(temp) = value_of("Temperature") {
+            controls::set(develop, "wb.temp", temp);
+        }
+        if let Some(tint) = value_of("Tint") {
+            controls::set(develop, "wb.tint", tint);
+        }
+    }
+    develop.optics.lens_profile = value_of("LensProfileEnable") == Some(1.0);
+    develop.optics.remove_ca = value_of("AutoLateralCA") == Some(1.0);
 }
 
 /// Translate [`develop_attributes`] + [`crop_attributes`] into exiftool
@@ -152,6 +213,19 @@ fn curve_points(points: impl Iterator<Item = (f64, f64)>) -> Option<Vec<(u8, u8)
 
 fn scale_curve(v: &f64) -> u8 {
     (v * 255.0).round().clamp(0.0, 255.0) as u8
+}
+
+/// One slider value as Lightroom writes it: signed two-decimal exposure,
+/// plain integers for whole-number controls, the control's own decimals
+/// otherwise.
+fn format_value(spec: &ControlSpec, value: f64, signed_exposure: bool) -> String {
+    if signed_exposure {
+        format!("{value:+.2}")
+    } else if spec.decimals == 0 {
+        int_tag(value)
+    } else {
+        format!("{:.*}", spec.decimals as usize, value)
+    }
 }
 
 fn int_tag(value: f64) -> String {
@@ -282,6 +356,94 @@ fn write_atomic(path: &Path, bytes: &[u8]) -> Result<()> {
 
 #[cfg(test)]
 mod tests {
+    /// A settings value that differs from the default and survives the
+    /// control's own display precision.
+    fn moved(spec: &lightcraft_develop::ControlSpec) -> f64 {
+        let target = if spec.default < spec.max - (spec.max - spec.min) * 0.3 {
+            spec.default + (spec.max - spec.min) * 0.3
+        } else {
+            spec.default - (spec.max - spec.min) * 0.3
+        };
+        let step = spec.step.max(10f64.powi(-(spec.decimals as i32)));
+        spec.clamp((target / step).round() * step)
+    }
+
+    #[test]
+    fn every_crs_key_row_names_a_real_control() {
+        for (id, key) in crs_controls() {
+            assert!(controls::find(id).is_some(), "{id} -> {key}");
+        }
+        let mut keys: Vec<_> = crs_controls().iter().map(|(_, k)| k).collect();
+        keys.sort();
+        keys.dedup();
+        assert_eq!(keys.len(), crs_controls().len(), "duplicate crs key");
+    }
+
+    #[test]
+    fn every_mapped_control_round_trips_through_the_sidecar() {
+        let mut edited = DevelopSettings::default();
+        for (id, _) in crs_controls() {
+            let spec = controls::find(id).unwrap();
+            controls::set(&mut edited, id, moved(spec));
+        }
+        edited.wb.mode = WbMode::Custom;
+        edited.wb.temp = 5200.0;
+        edited.wb.tint = 12.0;
+        edited.optics.lens_profile = true;
+        edited.optics.remove_ca = true;
+
+        let packet = sidecar_packet(&edited, None);
+        let mut restored = DevelopSettings::default();
+        apply_attributes(&mut restored, &parse_attributes(&packet));
+
+        for (id, key) in crs_controls() {
+            let spec = controls::find(id).unwrap();
+            let (want, got) = (
+                controls::get(&edited, id).unwrap(),
+                controls::get(&restored, id).unwrap(),
+            );
+            let tolerance = 10f64.powi(-(spec.decimals as i32)) / 2.0 + 1e-9;
+            assert!(
+                (want - got).abs() <= tolerance,
+                "{id} ({key}): {want} -> {got}"
+            );
+        }
+        assert_eq!(restored.wb.mode, WbMode::Custom);
+        assert_eq!(restored.wb.temp, 5200.0);
+        assert_eq!(restored.wb.tint, 12.0);
+        assert!(restored.optics.lens_profile && restored.optics.remove_ca);
+    }
+
+    #[test]
+    fn untouched_controls_stay_out_of_the_sidecar() {
+        let attrs = develop_attributes(&DevelopSettings::default());
+        assert!(
+            !attrs
+                .iter()
+                .any(|(k, _)| k == "Vibrance" || k == "GrainAmount")
+        );
+        assert!(attrs.iter().any(|(k, _)| k == "Exposure2012"));
+    }
+
+    #[test]
+    fn sidecar_file_round_trips_on_disk() {
+        let mut edited = DevelopSettings::default();
+        controls::set(&mut edited, "color.vibrance", 35.0);
+        controls::set(&mut edited, "mixer.aqua.hue", -20.0);
+        let dir = std::env::temp_dir().join(format!("crs-roundtrip-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("a.xmp");
+        write_sidecar(&path, &edited, None).unwrap();
+        let mut restored = DevelopSettings::default();
+        apply_attributes(
+            &mut restored,
+            &parse_attributes(&std::fs::read_to_string(&path).unwrap()),
+        );
+        assert_eq!(controls::get(&restored, "color.vibrance"), Some(35.0));
+        assert_eq!(controls::get(&restored, "mixer.aqua.hue"), Some(-20.0));
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
     use super::*;
     use edit_core::Rect;
     use serde_json::json;

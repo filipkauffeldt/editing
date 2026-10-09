@@ -17,6 +17,7 @@ license = "Apache-2.0"
 # and lightcraft-raw (embedded previews) and never calls the pipeline
 # itself. A revision bump is one small PR.
 lightcraft-develop = { git = "https://github.com/storytold/lightcraft", rev = "f2f449611d248a907f755d6e18f3701db5755f03" }
+lightcraft-tiff = { git = "https://github.com/storytold/lightcraft", rev = "f2f449611d248a907f755d6e18f3701db5755f03" }
 lightcraft-raw = { git = "https://github.com/storytold/lightcraft", rev = "f2f449611d248a907f755d6e18f3701db5755f03" }
 lightcraft-pipeline = { git = "https://github.com/storytold/lightcraft", rev = "f2f449611d248a907f755d6e18f3701db5755f03" }
 lightcraft-codecs = { git = "https://github.com/storytold/lightcraft", rev = "f2f449611d248a907f755d6e18f3701db5755f03", default-features = false }

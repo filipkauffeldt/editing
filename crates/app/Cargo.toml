@@ -18,6 +18,8 @@ serde_json.workspace = true
 flume.workspace = true
 lightcraft-raw.workspace = true
 lightcraft-develop.workspace = true
+lightcraft-tiff.workspace = true
+moxcms.workspace = true
 image.workspace = true
 
 [dev-dependencies]

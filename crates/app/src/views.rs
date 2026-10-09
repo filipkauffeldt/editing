@@ -30,12 +30,11 @@ use std::rc::Rc;
 use std::sync::Arc;
 
 use edit_catalog::{Catalog, JobEvent, JobEventKind, JobId, JobKind};
-use gpui_kit::component::button::{Button, ButtonVariants as _};
 use gpui_kit::component::label::Label;
+use gpui_kit::component::slider::SliderState;
 use gpui_kit::component::tooltip::Tooltip;
 use gpui_kit::component::{
-    ActiveTheme as _, Disableable as _, Icon, IconName, Sizable as _, h_flex,
-    status_bar::StatusBar, v_flex,
+    ActiveTheme as _, Icon, IconName, h_flex, status_bar::StatusBar, v_flex,
 };
 use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::*;
@@ -48,16 +47,15 @@ use crate::browse::{
 };
 use crate::crop::{CropSession, Grab, Latest};
 use crate::develop::{
-    DevelopSession, EditJson, LoadedEdit, RenderQueue, SidecarQueue, SliderId, edit_json,
+    ControlId, DevelopSession, EditJson, LoadedEdit, RenderQueue, SidecarQueue, edit_json,
 };
+use crate::develop_panel::{DevelopPanel, PanelEvent, PresetEntry, none_entry};
+use crate::panel::{self, BUILTIN_PRESETS, PresetValues};
 use crate::preview::BrowsePreviewProvider;
 use edit_core::{CancelToken, Crop, DevelopSettings, RenderSize};
 use edit_ingest::{IngestCopyPayload, dest_root_path};
 use edit_metadata::{CodeReplacements, MetadataWritePayload, TemplateFields};
 use edit_render::{PROXY_DRAG_LONG_EDGE, PROXY_RELEASE_LONG_EDGE, RenderService};
-use gpui_kit::component::slider::{
-    Slider as DevelopSliderElement, SliderEvent, SliderState, SliderValue,
-};
 
 mod crop_ui;
 
@@ -68,6 +66,8 @@ pub const THUMB_LONG_EDGE: u32 = 320;
 /// Bounded decoded-thumbnail cache: the grid and strip share it, so a
 /// 10k-photo folder cannot grow the UI process without limit.
 pub const THUMB_CACHE_CAP: usize = 256;
+/// Full-size previews kept for the single view.
+const PREVIEW_CACHE_CAP: usize = 6;
 /// New background decodes kicked off per frame at most.
 const THUMB_REQUEST_BUDGET: usize = 24;
 
@@ -88,6 +88,14 @@ fn paint_origin(
     let ox = (vw - dw) / 2.0 + dw * zoom.pan_x;
     let oy = (vh - dh) / 2.0 + dh * zoom.pan_y;
     (ox, oy)
+}
+
+/// GPUI paints BGRA, so swap the decoder's RGBA once at the boundary.
+fn bgra_image(mut rgba: image::RgbaImage) -> Arc<RenderImage> {
+    for px in rgba.as_chunks_mut::<4>().0 {
+        px.swap(0, 2);
+    }
+    Arc::new(RenderImage::new([image::Frame::new(rgba)]))
 }
 
 gpui_kit::actions!(
@@ -188,7 +196,10 @@ pub struct Browser {
     last_ingest_refresh: Option<std::time::Instant>,
     ingest_refresh_gap: std::time::Duration,
     develop: DevelopSession,
-    develop_sliders: Vec<(SliderId, Entity<SliderState>)>,
+    /// The develop sidebar; reports user actions as [`PanelEvent`]s.
+    panel: Entity<DevelopPanel>,
+    /// Saved user presets: `(name, file path)`.
+    user_presets: Vec<(String, String)>,
     /// Develop render scheduling: the latest wanted size for the one worker,
     /// cancellation of stale renders, and per-item terminal failures that
     /// stop the paint-time kick.
@@ -206,6 +217,16 @@ pub struct Browser {
     /// (plan section 1.5). DisplaySrgb path — the canvas paints it.
     develop_image: Option<Arc<RenderImage>>,
     develop_image_item: Option<i64>,
+    /// Developed frames received so far (lets tests see a render land).
+    develop_frames: u64,
+    /// The item whose saved edit was read into the develop buffer. Reading
+    /// never renders: the developed image only replaces the camera preview
+    /// once the photo has edits or the user changes a control.
+    develop_loaded: Option<i64>,
+    /// Full-size camera previews for the single view, newest last.
+    previews: HashMap<i64, Arc<RenderImage>>,
+    preview_order: VecDeque<i64>,
+    preview_pending: HashSet<i64>,
     /// Whether the develop buffer holds unsaved slider changes.
     develop_dirty: bool,
     /// Diagnostics for the develop panel status line.
@@ -249,43 +270,13 @@ impl Browser {
         cx: &mut Context<Self>,
     ) -> Self {
         let focus = cx.focus_handle();
-        let develop_sliders: Vec<(SliderId, Entity<SliderState>)> = SliderId::ALL
-            .iter()
-            .map(|id| {
-                // Widget ranges come from LightCraft's own control table, so
-                // the panel can never disagree with the edit model.
-                let control = match id.spec() {
-                    Some(spec) => cx.new(|_| {
-                        SliderState::new()
-                            .min(spec.min as f32)
-                            .max(spec.max as f32)
-                            .step(spec.step as f32)
-                            .default_value(spec.default as f32)
-                    }),
-                    None => cx.new(|_| SliderState::new()),
-                };
-                (*id, control)
-            })
-            .collect();
-        for (id, control) in &develop_sliders {
-            let id: SliderId = *id;
-            cx.subscribe(control, move |this, _, event: &SliderEvent, cx| {
-                let value = match event {
-                    SliderEvent::Change(value) | SliderEvent::Release(value) => Some(*value),
-                }
-                .and_then(|value| match value {
-                    SliderValue::Single(v) => Some(v),
-                    _ => None,
-                });
-                match (event, value) {
-                    (SliderEvent::Change(_), Some(v)) => this.on_develop_change(id, v, cx),
-                    (SliderEvent::Release(_), Some(v)) => this.on_develop_release(id, v, cx),
-                    _ => {}
-                }
-                cx.notify();
-            })
-            .detach();
-        }
+        let panel = cx.new(|_| DevelopPanel::new());
+        cx.subscribe(&panel, |this, _, event: &PanelEvent, cx| {
+            this.on_panel_event(event.clone(), cx);
+            cx.notify();
+        })
+        .detach();
+        let user_presets = crate::preset_store::list(&catalog);
         cx.bind_keys([
             KeyBinding::new("right", NextItem, None),
             KeyBinding::new("left", PrevItem, None),
@@ -334,7 +325,8 @@ impl Browser {
             last_ingest_refresh: None,
             ingest_refresh_gap: INGEST_REFRESH_GAP,
             develop: DevelopSession::new(DevelopSettings::default()),
-            develop_sliders,
+            panel,
+            user_presets,
             queue: RenderQueue::default(),
             prewarm_token: CancelToken::new(),
             prewarmed: HashSet::new(),
@@ -342,6 +334,11 @@ impl Browser {
             unsaved: BTreeMap::new(),
             develop_image: None,
             develop_image_item: None,
+            develop_frames: 0,
+            develop_loaded: None,
+            previews: HashMap::new(),
+            preview_order: VecDeque::new(),
+            preview_pending: HashSet::new(),
             develop_dirty: false,
             develop_status: String::new(),
             crop: None,
@@ -972,6 +969,9 @@ impl Browser {
             {
                 if let Some(item) = rows.get(neighbor) {
                     self.request_thumb(cx, item.item_id, item.display_path.clone());
+                    if self.mode == Mode::Single && offset == 1 {
+                        self.request_preview(cx, item.item_id, item.display_path.clone());
+                    }
                 }
             }
         }
@@ -988,13 +988,7 @@ impl Browser {
             let rgba = cx
                 .background_executor()
                 .spawn(async move {
-                    let bytes = BrowsePreviewProvider::thumbnail_bytes(Path::new(&path))?;
-                    let decoded = image::load_from_memory(&bytes).ok()?;
-                    Some(
-                        decoded
-                            .thumbnail(THUMB_LONG_EDGE, THUMB_LONG_EDGE)
-                            .to_rgba8(),
-                    )
+                    BrowsePreviewProvider::decode_preview(Path::new(&path), Some(THUMB_LONG_EDGE))
                 })
                 .await;
             if let Some(rgba) = rgba {
@@ -1016,10 +1010,8 @@ impl Browser {
 
     /// Insert a decoded frame, evicting the oldest entries past the cap.
     /// Stored BGRA, matching what `paint_image` expects.
-    fn insert_thumb(&mut self, item_id: i64, mut rgba: image::RgbaImage) {
-        for px in rgba.as_chunks_mut::<4>().0 {
-            px.swap(0, 2);
-        }
+    fn insert_thumb(&mut self, item_id: i64, rgba: image::RgbaImage) {
+        let image = bgra_image(rgba);
         if !self.thumbs.contains_key(&item_id)
             && self.thumbs.len() >= THUMB_CACHE_CAP
             && let Some(old) = self.thumb_order.pop_front()
@@ -1030,11 +1022,42 @@ impl Browser {
             self.thumb_order.remove(pos);
         }
         self.thumb_order.push_back(item_id);
-        self.thumbs.insert(
-            item_id,
-            Arc::new(RenderImage::new([image::Frame::new(rgba)])),
-        );
+        self.thumbs.insert(item_id, image);
         self.thumb_pending.remove(&item_id);
+    }
+
+    /// Decode the camera preview at single-view size off-thread, unless
+    /// cached or already queued.
+    fn request_preview(&mut self, cx: &mut Context<Self>, item_id: i64, path: String) {
+        if self.previews.contains_key(&item_id) || !self.preview_pending.insert(item_id) {
+            return;
+        }
+        cx.spawn(async move |this, cx| {
+            let rgba = cx
+                .background_executor()
+                .spawn(async move {
+                    BrowsePreviewProvider::decode_preview(
+                        Path::new(&path),
+                        Some(PROXY_RELEASE_LONG_EDGE as u32),
+                    )
+                })
+                .await;
+            this.update(cx, |this, cx| {
+                this.preview_pending.remove(&item_id);
+                if let Some(rgba) = rgba {
+                    if this.previews.len() >= PREVIEW_CACHE_CAP
+                        && let Some(old) = this.preview_order.pop_front()
+                    {
+                        this.previews.remove(&old);
+                    }
+                    this.preview_order.push_back(item_id);
+                    this.previews.insert(item_id, bgra_image(rgba));
+                }
+                cx.notify();
+            })
+            .ok();
+        })
+        .detach();
     }
 
     /// Read the current item's edit row into the develop session on the
@@ -1099,11 +1122,18 @@ impl Browser {
                     self.develop_dirty = false;
                 }
                 self.develop_status.clear();
-                self.request_render(
-                    RenderSize::Proxy(PROXY_DRAG_LONG_EDGE),
-                    Some(RenderSize::Proxy(PROXY_RELEASE_LONG_EDGE)),
-                    cx,
-                );
+                self.develop_loaded = Some(item_id);
+                // An unedited photo keeps showing the camera preview; the
+                // developed render starts with the first edit.
+                if !self.develop.buffer().is_unedited() || self.develop_dirty {
+                    self.request_render(
+                        RenderSize::Proxy(PROXY_DRAG_LONG_EDGE),
+                        Some(RenderSize::Proxy(PROXY_RELEASE_LONG_EDGE)),
+                        cx,
+                    );
+                } else {
+                    self.queue.finish(item_id);
+                }
             }
             Err(diagnostic) => {
                 self.develop.disown();
@@ -1114,121 +1144,170 @@ impl Browser {
         }
     }
 
-    /// The develop panel (plan sections 2.1 and 2.3): Presets placeholder on
-    /// top, then the six LR-style tone sliders driving `DevelopSettings`
-    /// through the render service.
-    fn render_develop_panel(&mut self, cx: &mut Context<Self>) -> impl IntoElement {
-        let theme = cx.theme();
-        let (bg, fg, border, muted) = (
-            theme.sidebar,
-            theme.sidebar_foreground,
-            theme.sidebar_border,
-            theme.muted_foreground,
-        );
+    /// The develop panel: pushes the edit buffer into the panel entity and
+    /// shows it.
+    fn render_develop_panel(
+        &mut self,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> impl IntoElement {
+        let editable = self.develop.owner() == Some(self.develop_item_id());
+        let presets = self.preset_entries();
+        let buffer = self.develop.buffer().clone();
         let status = self.develop_status.clone();
-        v_flex()
-            .w(px(240.0))
-            .h_full()
-            .p_3()
-            .gap_3()
-            .bg(bg)
-            .text_color(fg)
-            .border_l_1()
-            .border_color(border)
-            .children(self.render_develop_rows(cx))
-            .when(!status.is_empty(), |panel| {
-                panel.child(Label::new(status).text_xs().text_color(muted))
-            })
+        self.panel.update(cx, |panel, cx| {
+            panel.set_state(&buffer, editable, &status, &presets, window, cx);
+        });
+        self.panel.clone()
     }
 
-    /// One block per slider: name, live value readout, a reset button, then
-    /// the slider (which dispatches actions from its own listeners against
-    /// the browser entity). Double-clicking the name row resets too.
-    fn render_develop_rows(&mut self, cx: &mut Context<Self>) -> Vec<impl IntoElement> {
-        let muted = cx.theme().muted_foreground;
-        let mut rows = Vec::with_capacity(SliderId::ALL.len());
-        for (id, control) in &self.develop_sliders {
-            let id = *id;
-            let Some(spec) = id.spec() else { continue };
-            let value = self.develop.slider_value(id);
-            let at_default = (value - spec.default).abs() < 1e-6;
-            let entity_id = control.entity_id().as_u64();
-            rows.push(
-                v_flex()
-                    .w_full()
-                    .gap_1()
-                    .child(
-                        h_flex()
-                            .id(("develop-row", entity_id))
-                            .w_full()
-                            .items_center()
-                            .justify_between()
-                            .on_click(cx.listener(move |this, event: &ClickEvent, _, cx| {
-                                if event.click_count() == 2 {
-                                    this.reset_develop_slider(id, cx);
-                                }
-                            }))
-                            .child(Label::new(spec.label).text_xs())
-                            .child(
-                                h_flex()
-                                    .items_center()
-                                    .gap_1()
-                                    .child(
-                                        Label::new(spec.format(value)).text_xs().text_color(muted),
-                                    )
-                                    .child(
-                                        Button::new(("develop-reset", entity_id))
-                                            .ghost()
-                                            .xsmall()
-                                            .icon(IconName::Undo2)
-                                            .tooltip("Reset")
-                                            .disabled(at_default)
-                                            .on_click(cx.listener(move |this, _, _, cx| {
-                                                this.reset_develop_slider(id, cx);
-                                            })),
-                                    ),
-                            ),
-                    )
-                    .child(DevelopSliderElement::new(control)),
-            );
-        }
-        rows
+    /// The preset list: None, the starters, then the user's saved presets.
+    fn preset_entries(&self) -> Vec<PresetEntry> {
+        let mut entries = vec![none_entry()];
+        entries.extend(BUILTIN_PRESETS.iter().map(|preset| PresetEntry {
+            key: format!("builtin:{}", preset.name).into(),
+            title: preset.name.into(),
+        }));
+        entries.extend(self.user_presets.iter().map(|(name, _)| PresetEntry {
+            key: format!("user:{name}").into(),
+            title: name.clone().into(),
+        }));
+        entries
     }
 
-    /// Put one slider back to its default: the same commit a released drag
-    /// makes, so the render and the saved edit follow.
-    fn reset_develop_slider(&mut self, id: SliderId, cx: &mut Context<Self>) {
-        if let Some(spec) = id.spec() {
-            self.on_develop_release(id, spec.default as f32, cx);
-            cx.notify();
+    /// What the user did in the develop panel.
+    fn on_panel_event(&mut self, event: PanelEvent, cx: &mut Context<Self>) {
+        match event {
+            PanelEvent::Change(id, value) => self.on_develop_change(id, value, cx),
+            PanelEvent::Release(id, value) => self.on_develop_release(id, value, cx),
+            PanelEvent::ResetSection(key) => {
+                self.edit_buffer(|settings| panel::reset_section(settings, key), cx);
+            }
+            PanelEvent::ResetAll => self.edit_buffer(panel::reset_all, cx),
+            PanelEvent::Toggle(id, on) => {
+                self.edit_buffer(|settings| panel::toggle_set(settings, id, on), cx);
+            }
+            PanelEvent::WhiteBalance(mode) => {
+                self.edit_buffer(|settings| settings.wb.mode = mode, cx);
+            }
+            PanelEvent::ApplyPreset(key) => self.apply_preset(&key, cx),
+            PanelEvent::SavePreset(name) => self.save_preset(&name, cx),
         }
     }
 
-    /// Sync the edit buffer's slider values into the widget states. A live
-    /// drag on one slider keeps its thumb where the gesture put it; the rest
-    /// track the buffer.
-    fn sync_sliders(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        for (id, control) in &self.develop_sliders {
-            let session_value = self.develop.slider_value(*id) as f32;
-            let matches_slider = matches!(control.read(cx).value(), SliderValue::Single(v) if (v - session_value).abs() < 1e-3);
-            let dragging_this = self.develop.dragging == Some(*id);
-            if !matches_slider && !dragging_this {
-                control.update(cx, |control, cx| {
-                    control.set_value(session_value, window, cx);
-                });
+    /// Change the edit buffer in one step (reset, toggle, preset) and follow
+    /// it with a render and a save, like a released slider.
+    fn edit_buffer(&mut self, change: impl FnOnce(&mut DevelopSettings), cx: &mut Context<Self>) {
+        let item = self.develop_item_id();
+        if self.develop.owner() != Some(item) {
+            return;
+        }
+        if self.develop.edit(change) {
+            self.develop_dirty = true;
+            self.queue.clear_failed(item);
+            self.request_render(RenderSize::Proxy(PROXY_RELEASE_LONG_EDGE), None, cx);
+            self.persist_current_edit(cx);
+        }
+    }
+
+    fn resolve_preset(&self, key: &str) -> Option<PresetValues> {
+        if let Some(name) = key.strip_prefix("builtin:") {
+            return BUILTIN_PRESETS
+                .iter()
+                .find(|preset| preset.name == name)
+                .map(|preset| preset.to_values());
+        }
+        let name = key.strip_prefix("user:")?;
+        let (_, path) = self.user_presets.iter().find(|(n, _)| n == name)?;
+        crate::preset_store::load(Path::new(path)).ok()
+    }
+
+    /// Apply a preset to the current photo and to every selected photo.
+    pub fn apply_preset(&mut self, key: &str, cx: &mut Context<Self>) {
+        let Some(values) = self.resolve_preset(key) else {
+            return;
+        };
+        let current = self.develop_item_id();
+        let targets: Vec<i64> = self
+            .selection
+            .selected
+            .iter()
+            .filter_map(|index| self.rows.get(*index).map(|row| row.item_id))
+            .filter(|item| *item != current)
+            .collect();
+        self.edit_buffer(|settings| values.apply(settings), cx);
+        for item in targets {
+            self.apply_values_to_stored(item, &values, cx);
+        }
+    }
+
+    /// Apply a preset to a photo that is not open: read its stored edit,
+    /// change it and write it back with its sidecar.
+    fn apply_values_to_stored(&mut self, item: i64, values: &PresetValues, cx: &mut Context<Self>) {
+        let stored = match self.unsaved.get(&item) {
+            Some(edit) => Some((edit.develop.clone(), edit.crop.clone())),
+            None => match self.catalog.get_edit(item) {
+                Ok(edit) => edit.map(|edit| (edit.develop_json, edit.crop_json)),
+                Err(e) => {
+                    self.develop_status = format!("Edit read failed: {e}");
+                    return;
+                }
+            },
+        };
+        let mut edit = match stored {
+            Some((develop, crop)) => match LoadedEdit::parse(&develop, crop.as_deref()) {
+                Ok(edit) => edit,
+                Err(e) => {
+                    self.develop_status = e;
+                    return;
+                }
+            },
+            None => LoadedEdit {
+                develop: DevelopSettings::default(),
+                crop: None,
+            },
+        };
+        values.apply(&mut edit.develop);
+        let Ok(json) = edit_json(&edit.develop, edit.crop.as_ref()) else {
+            return;
+        };
+        match self
+            .catalog
+            .upsert_edit(item, &json.develop, json.crop.as_deref())
+        {
+            Ok(()) => {
+                self.unsaved.remove(&item);
+                self.write_sidecar(item, json, cx);
+            }
+            Err(e) => {
+                self.develop_status = format!("Edit save failed: {e}");
+                self.unsaved.insert(item, json);
             }
         }
+    }
+
+    /// Save the current edit's changed controls as a named preset.
+    pub fn save_preset(&mut self, name: &str, cx: &mut Context<Self>) {
+        let values = PresetValues::from_settings(self.develop.buffer());
+        match crate::preset_store::save(&self.catalog, name, &values) {
+            Ok(()) => {
+                self.user_presets = crate::preset_store::list(&self.catalog);
+                self.develop_status = format!("Saved preset {}", name.trim());
+            }
+            Err(e) => self.develop_status = format!("Preset not saved: {e}"),
+        }
+        cx.notify();
     }
 
     /// Subscribe-backed live slider change (`SliderEvent::Change`): write the
     /// change to the edit buffer, then render the downscaled proxy live
     /// through the coalescing worker.
-    pub fn on_develop_change(&mut self, id: SliderId, value: f32, cx: &mut Context<Self>) {
+    pub fn on_develop_change(&mut self, id: ControlId, value: f64, cx: &mut Context<Self>) {
         let item = self.develop_item_id();
         if self.develop.owner() != Some(item) {
             return;
         }
-        self.develop.set_slider(id, value as f64);
+        self.develop.set_slider(id, value);
         self.develop_dirty = true;
         self.queue.clear_failed(item);
         self.request_render(RenderSize::Proxy(PROXY_DRAG_LONG_EDGE), None, cx);
@@ -1236,12 +1315,12 @@ impl Browser {
 
     /// Drag released (`SliderEvent::Release`): final value in the buffer, the
     /// bounded release proxy renders in the background, and the edit persists.
-    pub fn on_develop_release(&mut self, id: SliderId, value: f32, cx: &mut Context<Self>) {
+    pub fn on_develop_release(&mut self, id: ControlId, value: f64, cx: &mut Context<Self>) {
         let item = self.develop_item_id();
         if self.develop.owner() != Some(item) {
             return;
         }
-        self.develop.end_drag(id, value as f64);
+        self.develop.end_drag(id, value);
         self.develop_dirty = true;
         self.queue.clear_failed(item);
         self.request_render(RenderSize::Proxy(PROXY_RELEASE_LONG_EDGE), None, cx);
@@ -1378,7 +1457,37 @@ impl Browser {
         if let Some(rgba) = image::RgbaImage::from_raw(frame.width, frame.height, frame.pixels) {
             self.develop_image = Some(Arc::new(RenderImage::new([image::Frame::new(rgba)])));
             self.develop_image_item = Some(item_id);
+            self.develop_frames += 1;
         }
+    }
+
+    /// The single view's zoom as the status label shows it.
+    pub fn zoom_label(&self) -> String {
+        match self.zoom.mode {
+            ZoomMode::Fit => "Fit".to_string(),
+            ZoomMode::Hundred => "100%".to_string(),
+            ZoomMode::Scale(s) => format!("{:.0}%", s * 100.0),
+        }
+    }
+
+    /// The item whose edit the develop buffer holds, once loaded.
+    pub fn develop_owner(&self) -> Option<i64> {
+        self.develop.owner()
+    }
+
+    /// A develop slider's value in the edit buffer.
+    pub fn develop_value(&self, id: &str) -> f64 {
+        self.develop.slider_value(id)
+    }
+
+    /// Developed frames received so far.
+    pub fn develop_frames(&self) -> u64 {
+        self.develop_frames
+    }
+
+    /// The develop sidebar entity.
+    pub fn develop_panel(&self) -> Entity<DevelopPanel> {
+        self.panel.clone()
     }
 
     /// Warm the drag-edge proxy decode for the current item's neighbors
@@ -1797,11 +1906,13 @@ impl Browser {
         };
         if let Some(row) = item.as_ref() {
             self.request_thumb(cx, row.item_id, row.display_path.clone());
-            // Kick the develop load and render for a photo with no resolved
-            // art yet, unless it already failed (failures are terminal here).
-            if self.queue.should_kick(row.item_id, self.develop_image_item) {
+            self.request_preview(cx, row.item_id, row.display_path.clone());
+            // Read the saved edit once per photo (reads never render), unless
+            // it already failed (failures are terminal here).
+            if self.queue.should_kick(row.item_id, self.develop_loaded) {
                 self.develop_image = None;
                 self.develop_image_item = None;
+                self.develop_loaded = None;
                 self.queue.begin(row.item_id);
                 self.schedule_current_edit_load(cx);
             }
@@ -1811,6 +1922,7 @@ impl Browser {
                 .as_ref()
                 .filter(|_| self.develop_image_item == Some(row.item_id))
                 .map(Arc::clone)
+                .or_else(|| self.previews.get(&row.item_id).map(Arc::clone))
                 .or_else(|| self.thumbs.get(&row.item_id).map(Arc::clone))
         });
         let zoom = self.zoom;
@@ -2084,7 +2196,6 @@ impl Browser {
 
 impl Render for Browser {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
-        self.sync_sliders(window, cx);
         self.sync_straighten(window, cx);
         let center: AnyElement = match self.mode {
             Mode::Grid => self.render_grid(cx).into_any_element(),
@@ -2094,7 +2205,7 @@ impl Render for Browser {
         let right: AnyElement = match self.mode {
             Mode::Grid => div().into_any_element(),
             Mode::Single if self.crop.is_some() => self.render_crop_panel(cx).into_any_element(),
-            Mode::Single => self.render_develop_panel(cx).into_any_element(),
+            Mode::Single => self.render_develop_panel(window, cx).into_any_element(),
         };
         v_flex()
             .size_full()

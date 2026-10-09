@@ -11,6 +11,9 @@ use std::collections::{HashMap, HashSet};
 use edit_core::{CancelToken, Crop, DevelopSettings, RenderSize};
 use lightcraft_develop::ControlSpec;
 
+/// A LightCraft control id, for example `light.exposure`.
+pub type ControlId = &'static str;
+
 /// The six LR-style tone sliders in develop-panel order.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum SliderId {
@@ -118,7 +121,7 @@ pub struct DevelopSession {
     /// values, so edits and saves must not touch the new item.
     owner: Option<i64>,
     /// Slider a drag is live on, if any.
-    pub dragging: Option<crate::develop::SliderId>,
+    pub dragging: Option<ControlId>,
 }
 
 impl DevelopSession {
@@ -151,19 +154,27 @@ impl DevelopSession {
         self.owner
     }
 
-    pub fn slider_value(&self, id: SliderId) -> f64 {
-        id.get(&self.buffer)
+    pub fn slider_value(&self, id: &str) -> f64 {
+        lightcraft_develop::controls::get(&self.buffer, id).unwrap_or(0.0)
     }
 
     /// Apply a live slider change (from `SliderEvent::Change`).
-    pub fn set_slider(&mut self, id: SliderId, value: f64) {
+    pub fn set_slider(&mut self, id: ControlId, value: f64) {
         self.dragging = Some(id);
-        let clamped = id.spec().map(|spec| spec.clamp(value)).unwrap_or(value);
-        id.set(&mut self.buffer, clamped);
+        crate::panel::set_slider(&mut self.buffer, id, value);
+    }
+
+    /// Change the buffer outside a drag (reset, preset, toggle). Returns
+    /// whether anything changed.
+    pub fn edit(&mut self, change: impl FnOnce(&mut DevelopSettings)) -> bool {
+        let before = self.buffer.clone();
+        change(&mut self.buffer);
+        self.dragging = None;
+        self.buffer != before
     }
 
     /// The drag ended (`SliderEvent::Release`): final value, no drag live.
-    pub fn end_drag(&mut self, id: SliderId, value: f64) {
+    pub fn end_drag(&mut self, id: ControlId, value: f64) {
         self.set_slider(id, value);
         self.dragging = None;
     }
@@ -184,6 +195,14 @@ impl DevelopSession {
     pub fn disown(&mut self) {
         self.owner = None;
         self.dragging = None;
+    }
+}
+
+/// Pixel budget of a render size, for comparing requests.
+fn rank(size: RenderSize) -> u32 {
+    match size {
+        RenderSize::Proxy(edge) => u32::from(edge),
+        RenderSize::Full => u32::MAX,
     }
 }
 
@@ -214,7 +233,13 @@ impl RenderQueue {
     pub fn request(&mut self, size: RenderSize, then: Option<RenderSize>) -> bool {
         self.wanted = Some(size);
         self.followup = then;
-        if self.inflight.is_some_and(|running| running != size) {
+        // Only a smaller request supersedes a running render (the user is
+        // moving a slider again). A click or release asks for a bigger one:
+        // the running frame is the same edit, so let it land and show.
+        if self
+            .inflight
+            .is_some_and(|running| rank(size) < rank(running))
+        {
             self.token.cancel();
         }
         !std::mem::replace(&mut self.worker, true)
@@ -336,32 +361,32 @@ mod tests {
     #[test]
     fn sliders_address_the_six_tone_controls() {
         let mut session = DevelopSession::new(DevelopSettings::default());
-        assert_eq!(session.slider_value(SliderId::Exposure), 0.0);
-        session.set_slider(SliderId::Exposure, 0.5);
-        session.set_slider(SliderId::Shadows, 30.0);
-        session.set_slider(SliderId::Highlights, -20.0);
-        assert_eq!(session.slider_value(SliderId::Exposure), 0.5);
-        assert_eq!(session.slider_value(SliderId::Shadows), 30.0);
-        assert_eq!(session.slider_value(SliderId::Highlights), -20.0);
+        assert_eq!(session.slider_value("light.exposure"), 0.0);
+        session.set_slider("light.exposure", 0.5);
+        session.set_slider("light.shadows", 30.0);
+        session.set_slider("light.highlights", -20.0);
+        assert_eq!(session.slider_value("light.exposure"), 0.5);
+        assert_eq!(session.slider_value("light.shadows"), 30.0);
+        assert_eq!(session.slider_value("light.highlights"), -20.0);
         // Exposure clamps to the spec range (-5..5).
-        session.set_slider(SliderId::Exposure, 99.0);
-        assert_eq!(session.slider_value(SliderId::Exposure), 5.0);
+        session.set_slider("light.exposure", 99.0);
+        assert_eq!(session.slider_value("light.exposure"), 5.0);
     }
 
     #[test]
     fn release_clears_the_drag_and_keeps_the_final_value() {
         let mut session = DevelopSession::new(DevelopSettings::default());
-        session.set_slider(SliderId::Whites, 10.0);
-        assert_eq!(session.dragging, Some(SliderId::Whites));
-        session.end_drag(SliderId::Whites, 12.0);
+        session.set_slider("light.whites", 10.0);
+        assert_eq!(session.dragging, Some("light.whites"));
+        session.end_drag("light.whites", 12.0);
         assert_eq!(session.dragging, None);
-        assert_eq!(session.slider_value(SliderId::Whites), 12.0);
+        assert_eq!(session.slider_value("light.whites"), 12.0);
     }
 
     #[test]
     fn navigation_replaces_the_buffer_and_resets_the_drag() {
         let mut session = DevelopSession::new(DevelopSettings::default());
-        session.set_slider(SliderId::Contrast, 40.0);
+        session.set_slider("light.contrast", 40.0);
         let fresh = DevelopSettings::default();
         session.load_edit(
             7,
@@ -372,7 +397,7 @@ mod tests {
         );
         assert_eq!(session.dragging, None);
         assert_eq!(session.owner(), Some(7));
-        assert_eq!(session.slider_value(SliderId::Contrast), 0.0);
+        assert_eq!(session.slider_value("light.contrast"), 0.0);
     }
 
     #[test]
@@ -380,7 +405,7 @@ mod tests {
         let mut session = DevelopSession::new(DevelopSettings::default());
         assert_eq!(session.owner(), None);
         let mut edited = DevelopSettings::default();
-        SliderId::Exposure.set(&mut edited, 1.5);
+        lightcraft_develop::controls::set(&mut edited, "light.exposure", 1.5);
         session.load_edit(
             3,
             LoadedEdit {
@@ -392,11 +417,35 @@ mod tests {
         // The previous values stay (nothing silently reverts to defaults),
         // but no item owns them any more.
         assert_eq!(session.owner(), None);
-        assert_eq!(session.slider_value(SliderId::Exposure), 1.5);
+        assert_eq!(session.slider_value("light.exposure"), 1.5);
     }
 
     const DRAG: RenderSize = RenderSize::Proxy(edit_render::PROXY_DRAG_LONG_EDGE);
     const RELEASE: RenderSize = RenderSize::Proxy(edit_render::PROXY_RELEASE_LONG_EDGE);
+
+    #[test]
+    fn a_click_does_not_cancel_the_drag_frame_already_rendering() {
+        // Mouse down renders the drag proxy; mouse up asks for the release
+        // proxy while it is still running. Cancelling the drag frame left
+        // the preview unchanged until the slow release render finished.
+        let mut queue = RenderQueue::default();
+        assert!(queue.request(DRAG, None));
+        let (_, token) = queue.take().unwrap();
+        assert!(!queue.request(RELEASE, None));
+        assert!(!token.is_cancelled(), "the drag frame must still land");
+        queue.complete(true);
+        let (size, _) = queue.take().expect("the release render follows");
+        assert_eq!(size, RELEASE);
+    }
+
+    #[test]
+    fn moving_again_cancels_a_running_release_render() {
+        let mut queue = RenderQueue::default();
+        assert!(queue.request(RELEASE, None));
+        let (_, token) = queue.take().unwrap();
+        assert!(!queue.request(DRAG, None));
+        assert!(token.is_cancelled());
+    }
 
     #[test]
     fn slider_changes_coalesce_into_one_latest_request() {
@@ -414,17 +463,17 @@ mod tests {
     }
 
     #[test]
-    fn a_second_request_cancels_the_first_when_it_is_stale() {
+    fn a_smaller_request_cancels_a_running_render_and_a_bigger_one_waits() {
         let mut queue = RenderQueue::default();
         queue.request(DRAG, None);
         let (_, first) = queue.take().unwrap();
         // Same class while dragging: the running render finishes.
         queue.request(DRAG, None);
         assert!(!first.is_cancelled());
-        // Release supersedes the drag-edge render: cancelled.
+        // Release asks for more pixels of the same edit: it waits its turn.
         queue.request(RELEASE, None);
-        assert!(first.is_cancelled());
-        queue.complete(false);
+        assert!(!first.is_cancelled());
+        queue.complete(true);
         let (size, second) = queue.take().unwrap();
         assert_eq!(size, RELEASE);
         assert!(!second.is_cancelled());
@@ -544,13 +593,16 @@ mod tests {
     #[test]
     fn a_crop_round_trips_through_the_stored_strings() {
         let mut develop = DevelopSettings::default();
-        SliderId::Exposure.set(&mut develop, 0.7);
+        lightcraft_develop::controls::set(&mut develop, "light.exposure", 0.7);
         let stored = edit_json(&develop, Some(&straightened())).unwrap();
         assert!(stored.crop.is_some());
 
         let loaded = LoadedEdit::parse(&stored.develop, stored.crop.as_deref()).unwrap();
         assert_eq!(loaded.crop, Some(straightened()));
-        assert_eq!(SliderId::Exposure.get(&loaded.develop), 0.7);
+        assert_eq!(
+            lightcraft_develop::controls::get(&loaded.develop, "light.exposure"),
+            Some(0.7)
+        );
 
         let mut session = DevelopSession::new(DevelopSettings::default());
         session.load_edit(5, loaded);
