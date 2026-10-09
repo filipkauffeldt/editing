@@ -1,0 +1,301 @@
+//! The develop sidebar driven through its real widgets in a test window:
+//! sections, resets, typed values, presets, the save popover and scrolling.
+
+use std::path::PathBuf;
+use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
+
+use app::browse::run_catalog_scan;
+use app::views::Browser;
+use edit_catalog::{Catalog, JobEvent, JobEventKind};
+use edit_render::RenderService;
+use gpui_kit::test::TestWindowExt;
+use gpui_kit::{
+    AppContext, Bounds, Entity, ScrollDelta, TestAppContext, WindowBounds, WindowOptions, point,
+    px, size,
+};
+
+static NEXT_DIR: AtomicU64 = AtomicU64::new(0);
+
+fn photo_dir() -> PathBuf {
+    let n = NEXT_DIR.fetch_add(1, Ordering::SeqCst);
+    let dir = std::env::temp_dir().join(format!("edit-slider-{}-{n}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let img = image::RgbImage::from_fn(600, 400, |x, y| {
+        image::Rgb([(x / 3) as u8, (y / 2) as u8, 120])
+    });
+    let mut bytes = Vec::new();
+    img.write_to(
+        &mut std::io::Cursor::new(&mut bytes),
+        image::ImageFormat::Jpeg,
+    )
+    .unwrap();
+    std::fs::write(dir.join("DSC0001.JPG"), bytes).unwrap();
+    dir
+}
+
+struct Rig {
+    handle: gpui_kit::AnyWindowHandle,
+    browser: Entity<Browser>,
+    catalog: Arc<Catalog>,
+    dir: PathBuf,
+}
+
+fn rig(cx: &mut TestAppContext) -> Rig {
+    cx.update(gpui_kit::init);
+    let dir = photo_dir();
+    let catalog = Arc::new(Catalog::open(&dir.join("slider.sqlite")).unwrap());
+    let (_, rx) = flume::unbounded();
+    let (handle, browser) = cx.update(|cx| {
+        gpui_kit::open_window(
+            WindowOptions {
+                window_bounds: Some(WindowBounds::Windowed(Bounds::new(
+                    Default::default(),
+                    size(px(1400.0), px(900.0)),
+                ))),
+                ..Default::default()
+            },
+            cx,
+            |_, cx| {
+                cx.new(|cx| {
+                    Browser::new(Arc::clone(&catalog), rx, Arc::new(RenderService::new()), cx)
+                })
+            },
+        )
+        .expect("open test window")
+    });
+    cx.update(|cx| browser.update(cx, |b, cx| b.open_folder(dir.clone(), cx)));
+    let scan_id = cx.update(|cx| browser.read(cx).last_scan_job().unwrap());
+    run_catalog_scan(&catalog, &dir, &|_, _| {}).unwrap();
+    cx.update(|cx| {
+        browser.update(cx, |b, _| {
+            b.on_job_event(&JobEvent {
+                id: scan_id,
+                kind: JobEventKind::Succeeded,
+            });
+        });
+    });
+    cx.update_window(handle, |_, window, cx| {
+        let focus = browser.read(cx).focus_handle();
+        window.focus(&focus, cx);
+    })
+    .unwrap();
+    Rig {
+        handle,
+        browser,
+        catalog,
+        dir,
+    }
+}
+
+fn settle(cx: &mut TestAppContext, rig: &Rig, done: impl Fn(&Browser) -> bool) {
+    for _ in 0..300 {
+        cx.update_window(rig.handle, |_, window, cx| window.render_frame(cx))
+            .unwrap();
+        cx.run_until_parked();
+        if cx.update(|cx| done(rig.browser.read(cx))) {
+            return;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(10));
+    }
+    panic!("the view never settled");
+}
+
+fn open_single(cx: &mut TestAppContext) -> Rig {
+    let rig = rig(cx);
+    cx.simulate_keystrokes(rig.handle, "g");
+    settle(cx, &rig, |_| true);
+    settle(cx, &rig, |b| b.develop_owner().is_some());
+    rig
+}
+
+fn click(cx: &mut TestAppContext, rig: &Rig, id: &'static str) {
+    cx.update_window(rig.handle, |_, window, cx| {
+        window.render_frame(cx);
+        window.click(id, cx);
+    })
+    .unwrap();
+    settle(cx, rig, |_| true);
+}
+
+fn press(cx: &mut TestAppContext, rig: &Rig, key: &'static str) {
+    cx.update_window(rig.handle, |_, window, cx| window.press(key, cx))
+        .unwrap();
+    settle(cx, rig, |_| true);
+}
+
+fn exists(cx: &mut TestAppContext, rig: &Rig, id: &'static str) -> bool {
+    cx.update_window(rig.handle, |_, window, cx| {
+        window.render_frame(cx);
+        window.try_find(id).is_some()
+    })
+    .unwrap()
+}
+
+fn value(cx: &mut TestAppContext, rig: &Rig, id: &str) -> f64 {
+    cx.update(|cx| rig.browser.read(cx).develop_value(id))
+}
+
+fn set(cx: &mut TestAppContext, rig: &Rig, id: &'static str, v: f64) {
+    cx.update(|cx| {
+        rig.browser
+            .update(cx, |b, cx| b.on_develop_release(id, v, cx))
+    });
+    settle(cx, rig, |_| true);
+}
+
+#[gpui_kit::test]
+fn only_the_basic_sections_start_open_and_the_rest_open_on_demand(cx: &mut TestAppContext) {
+    let rig = open_single(cx);
+    let panel = cx.update(|cx| rig.browser.read(cx).develop_panel());
+    let open = cx.update(|cx| panel.read(cx).open_sections().to_vec());
+    assert_eq!(open, ["white-balance", "tone", "presence"]);
+    assert!(exists(cx, &rig, "develop-reset-light.exposure"));
+    assert!(!exists(cx, &rig, "develop-reset-mixer.red.hue"));
+    cx.update(|cx| panel.update(cx, |p, cx| p.set_open(&["color-mixer"], cx)));
+    settle(cx, &rig, |_| true);
+    assert!(exists(cx, &rig, "develop-reset-mixer.red.hue"));
+    assert!(!exists(cx, &rig, "develop-reset-light.exposure"));
+}
+
+#[gpui_kit::test]
+fn reset_buttons_put_a_row_a_section_and_everything_back(cx: &mut TestAppContext) {
+    let rig = open_single(cx);
+    set(cx, &rig, "light.exposure", 1.0);
+    set(cx, &rig, "light.contrast", 30.0);
+    set(cx, &rig, "color.vibrance", 20.0);
+    click(cx, &rig, "develop-reset-light.exposure");
+    assert_eq!(value(cx, &rig, "light.exposure"), 0.0);
+    assert_eq!(value(cx, &rig, "light.contrast"), 30.0);
+    click(cx, &rig, "develop-section-reset-tone");
+    assert_eq!(value(cx, &rig, "light.contrast"), 0.0);
+    assert_eq!(value(cx, &rig, "color.vibrance"), 20.0);
+    click(cx, &rig, "develop-reset-all");
+    assert_eq!(value(cx, &rig, "color.vibrance"), 0.0);
+}
+
+#[gpui_kit::test]
+fn a_typed_number_commits_clamped_and_is_saved(cx: &mut TestAppContext) {
+    let rig = open_single(cx);
+    let panel = cx.update(|cx| rig.browser.read(cx).develop_panel());
+    let input = cx
+        .update(|cx| panel.read(cx).number_input("light.exposure"))
+        .unwrap();
+    click(cx, &rig, "develop-value-light.exposure");
+    cx.update_window(rig.handle, |_, window, cx| {
+        window.press("secondary-a", cx);
+        window.input("9", cx);
+    })
+    .unwrap();
+    cx.update_window(rig.handle, |_, window, cx| {
+        window.press("enter", cx);
+    })
+    .unwrap();
+    settle(cx, &rig, |_| true);
+    // Exposure is limited to +5 stops.
+    assert_eq!(value(cx, &rig, "light.exposure"), 5.0);
+    let item = cx.update(|cx| rig.browser.read(cx).visible()[0].item_id);
+    let stored = rig.catalog.get_edit(item).unwrap().expect("saved row");
+    assert!(
+        stored.develop_json.contains("\"exposure\":5.0"),
+        "{}",
+        stored.develop_json
+    );
+    let sidecar = std::fs::read_to_string(rig.dir.join("DSC0001.xmp")).unwrap_or_default();
+    // The sidecar is written in the background.
+    if !sidecar.is_empty() {
+        assert!(sidecar.contains("Exposure2012"));
+    }
+}
+
+#[gpui_kit::test]
+fn presets_apply_to_the_photo_and_save_through_a_popover_that_escape_closes(
+    cx: &mut TestAppContext,
+) {
+    let rig = open_single(cx);
+    set(cx, &rig, "light.exposure", 0.5);
+    cx.update(|cx| {
+        rig.browser
+            .update(cx, |b, cx| b.apply_preset("builtin:Punchy", cx))
+    });
+    settle(cx, &rig, |_| true);
+    assert_eq!(value(cx, &rig, "light.contrast"), 25.0);
+    assert_eq!(value(cx, &rig, "color.vibrance"), 30.0);
+    // A preset only sets its own controls.
+    assert_eq!(value(cx, &rig, "light.exposure"), 0.5);
+
+    // Escape closes the save popover without saving.
+    click(cx, &rig, "develop-save-preset-button");
+    assert!(exists(cx, &rig, "develop-save-preset-confirm"));
+    press(cx, &rig, "escape");
+    assert!(!exists(cx, &rig, "develop-save-preset-confirm"));
+    assert!(app::preset_store::list(&rig.catalog).is_empty());
+
+    // Typing a name and pressing Enter saves it.
+    click(cx, &rig, "develop-save-preset-button");
+    cx.update_window(rig.handle, |_, window, cx| window.input("Mine", cx))
+        .unwrap();
+    press(cx, &rig, "enter");
+    let saved = app::preset_store::list(&rig.catalog);
+    assert_eq!(saved.len(), 1, "{saved:?}");
+    assert_eq!(saved[0].0, "Mine");
+
+    // Applying the saved preset to a reset photo brings its values back.
+    click(cx, &rig, "develop-reset-all");
+    assert_eq!(value(cx, &rig, "light.contrast"), 0.0);
+    cx.update(|cx| {
+        rig.browser
+            .update(cx, |b, cx| b.apply_preset("user:Mine", cx))
+    });
+    settle(cx, &rig, |_| true);
+    assert_eq!(value(cx, &rig, "light.contrast"), 25.0);
+    assert_eq!(value(cx, &rig, "light.exposure"), 0.5);
+}
+
+#[gpui_kit::test]
+fn the_wheel_scrolls_the_panel_and_never_zooms_the_photo(cx: &mut TestAppContext) {
+    let rig = open_single(cx);
+    let panel = cx.update(|cx| rig.browser.read(cx).develop_panel());
+    cx.update(|cx| {
+        panel.update(cx, |p, cx| {
+            p.set_open(
+                &[
+                    "white-balance",
+                    "tone",
+                    "presence",
+                    "color-mixer",
+                    "color-grading",
+                ],
+                cx,
+            )
+        })
+    });
+    settle(cx, &rig, |_| true);
+    let top = |cx: &mut TestAppContext, rig: &Rig| {
+        cx.update_window(rig.handle, |_, window, cx| {
+            window.render_frame(cx);
+            window.find("develop-reset-light.exposure").bounds().top()
+        })
+        .unwrap()
+    };
+    let before = top(cx, &rig);
+    let zoom_before = cx.update(|cx| rig.browser.read(cx).zoom_label());
+    cx.update_window(rig.handle, |_, window, cx| {
+        window.scroll(
+            "develop-reset-light.exposure",
+            ScrollDelta::Pixels(point(px(0.0), px(-240.0))),
+            cx,
+        );
+    })
+    .unwrap();
+    settle(cx, &rig, |_| true);
+    let after = top(cx, &rig);
+    assert!(
+        after < before - px(100.0),
+        "the panel did not scroll: {before:?} -> {after:?}"
+    );
+    assert_eq!(
+        cx.update(|cx| rig.browser.read(cx).zoom_label()),
+        zoom_before
+    );
+}

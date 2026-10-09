@@ -1461,6 +1461,15 @@ impl Browser {
         }
     }
 
+    /// The single view's zoom as the status label shows it.
+    pub fn zoom_label(&self) -> String {
+        match self.zoom.mode {
+            ZoomMode::Fit => "Fit".to_string(),
+            ZoomMode::Hundred => "100%".to_string(),
+            ZoomMode::Scale(s) => format!("{:.0}%", s * 100.0),
+        }
+    }
+
     /// The item whose edit the develop buffer holds, once loaded.
     pub fn develop_owner(&self) -> Option<i64> {
         self.develop.owner()

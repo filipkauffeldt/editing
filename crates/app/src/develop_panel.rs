@@ -376,7 +376,12 @@ impl DevelopPanel {
     fn sync_rows(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let ids: Vec<ControlId> = self.rows.keys().copied().collect();
         for id in ids {
-            if self.dragging == Some(id) || self.typing == Some(id) {
+            let typing = self.typing == Some(id)
+                || self
+                    .rows
+                    .get(id)
+                    .is_some_and(|row| row.input.focus_handle(cx).is_focused(window));
+            if self.dragging == Some(id) || typing {
                 continue;
             }
             if let Some(value) = lightcraft_develop::controls::get(&self.settings, id) {
@@ -541,6 +546,7 @@ impl DevelopPanel {
                                 .gap(spacing.xs)
                                 .child(
                                     Input::new(&input)
+                                        .id(SharedString::from(format!("develop-value-{id}")))
                                         .xsmall()
                                         .w_16()
                                         .text_right()
