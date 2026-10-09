@@ -36,7 +36,6 @@ gpui_kit::actions!(metadata_sidebar, [SaveMetadata]);
 
 /// Photos whose values stay cached; past this the cache starts over.
 const CACHE_CAP: usize = 4096;
-const LABEL_WIDTH: f32 = 96.0;
 
 type Choices = SearchableVec<String>;
 
@@ -204,7 +203,7 @@ impl MetadataSidebar {
     ) -> Control {
         let id = spec.id;
         match spec.kind {
-            Kind::Multi(_) => {
+            Kind::Multi(_) | Kind::List => {
                 let state = cx.new(|cx| TextareaState::new(window, cx));
                 cx.subscribe(&state, move |this, _, event: &InputEvent, cx| {
                     this.edited(id, event, cx)
@@ -520,6 +519,8 @@ impl MetadataSidebar {
             Control::Area(state) => {
                 let rows = match spec.kind {
                     Kind::Multi(rows) => rows,
+                    Kind::List if spec.id == "keywords" => 3,
+                    Kind::List => 2,
                     _ => 3,
                 };
                 Textarea::new(state)
@@ -541,18 +542,17 @@ impl MetadataSidebar {
         } else {
             theme.muted_foreground
         };
-        h_flex()
+        v_flex()
             .w_full()
-            .gap(cx.theme().spacing_tokens().sm)
-            .items_start()
+            .gap(cx.theme().spacing_tokens().xs)
             .child(
                 div()
-                    .w(px(LABEL_WIDTH))
+                    .w_full()
                     .flex_none()
-                    .pt(px(5.0))
+                    .truncate()
                     .child(Label::new(widget.spec.label).text_xs().text_color(color)),
             )
-            .child(div().flex_1().min_w_0().child(self.render_control(widget)))
+            .child(self.render_control(widget))
     }
 
     fn render_form(&self, edited: &TemplateFields, cx: &mut Context<Self>) -> impl IntoElement {
@@ -561,7 +561,8 @@ impl MetadataSidebar {
         let mut accordion = Accordion::new("metadata-groups")
             .multiple(true)
             .bordered(false)
-            .small();
+            .small()
+            .h_auto();
         for (index, group) in Group::ALL.iter().enumerate() {
             let rows: Vec<_> = self
                 .widgets
@@ -619,7 +620,7 @@ impl MetadataSidebar {
                                 ),
                             ),
                     )
-                    .child(content)
+                    .when(open, |item| item.child(content))
             });
         }
         accordion.on_toggle_click(move |open, _, cx| {
