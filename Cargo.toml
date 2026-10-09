@@ -64,3 +64,8 @@ gpui_platform = { package = "gpui-pre-platform", version = "=0.3.8", features = 
 # gpui-base, gpui-component and default assets together, and pins gpui-pre
 # 0.3.8 exactly (a crates.io snapshot of zed@279fe07).
 gpui-kit = "=0.7.1"
+
+# The straighten preview turns a ~1000 px image on every pointer move; an
+# unoptimized build of that loop cannot hold a frame.
+[profile.dev.package.edit-render]
+opt-level = 3

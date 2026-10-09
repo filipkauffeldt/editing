@@ -17,6 +17,7 @@
 
 pub mod lightcraft;
 pub mod plain;
+pub mod straighten;
 
 use std::borrow::Cow;
 use std::collections::{HashMap, VecDeque};
@@ -815,6 +816,44 @@ mod tests {
         assert!(near(at(fw, 2), colors[1]), "TR {:?}", at(fw, 2));
         assert!(near(at(fw, fh), colors[2]), "BR {:?}", at(fw, fh));
         assert!(near(at(2, fh), colors[3]), "BL {:?}", at(2, fh));
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn the_straighten_preview_matches_the_pipeline_crop() {
+        // The live preview turns the rendered image; the pipeline turns the
+        // source. Cropping the preview to the same frame has to give the same
+        // picture, or the frame would jump when the accurate render lands.
+        let dir = scratch("straighten-agree");
+        let path = dir.join("scene.png");
+        let (w, h) = (640u32, 400u32);
+        let img = image::RgbImage::from_fn(w, h, |x, y| {
+            let (dx, dy) = (x as f32 - 400.0, y as f32 - 150.0);
+            let blob = (1.0 - (dx * dx + dy * dy).sqrt() / 70.0).clamp(0.0, 1.0);
+            let base = 50.0 + 60.0 * x as f32 / w as f32 + 40.0 * y as f32 / h as f32;
+            image::Rgb([(base + 140.0 * blob).min(255.0) as u8; 3])
+        });
+        write_png(&path, &img);
+        let crop = Crop {
+            rect: edit_core::Rect::new(0.25, 0.25, 0.5, 0.5),
+            rotation_degrees: 7.0,
+            aspect: None,
+        };
+        let engine = render_full(&path, Some(&crop));
+        assert_eq!((engine.width, engine.height), (320, 200));
+
+        let rgba = image::DynamicImage::ImageRgb8(img).to_rgba8();
+        let turned = straighten::straighten_preview(&rgba, 7.0);
+        let (x0, y0) = (160u32, 100u32);
+        let mut diff = 0.0f32;
+        for y in 0..200 {
+            for x in 0..320 {
+                let p = turned.get_pixel(x0 + x, y0 + y)[0] as f32;
+                diff += (p - bright(&engine, x, y)).abs();
+            }
+        }
+        diff /= (320 * 200) as f32;
+        assert!(diff < 8.0, "preview and pipeline differ by {diff} levels");
         std::fs::remove_dir_all(&dir).ok();
     }
 
