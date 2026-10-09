@@ -913,10 +913,12 @@ impl IngestDialog {
     fn render_scope(&self, cx: &mut Context<Self>) -> impl IntoElement + use<> {
         let locked_on = self.scope == CopyScope::Locked;
         let unavailable = self.locked_unavailable();
+        // Each button handles its own click, so Space and Enter work too.
         let locked = Button::new("scope-locked")
             .label("Only locked photos")
             .selected(locked_on)
-            .disabled(unavailable.is_some());
+            .disabled(unavailable.is_some())
+            .on_click(cx.listener(|this, _, _, cx| this.set_scope(CopyScope::Locked, cx)));
         let locked = match unavailable {
             Some(why) => locked.tooltip(why),
             None => locked,
@@ -926,19 +928,10 @@ impl IngestDialog {
             .child(
                 Button::new("scope-all")
                     .label("All photos")
-                    .selected(!locked_on),
+                    .selected(!locked_on)
+                    .on_click(cx.listener(|this, _, _, cx| this.set_scope(CopyScope::All, cx))),
             )
             .child(locked)
-            .on_click(cx.listener(|this, indexes: &Vec<usize>, _, cx| {
-                this.set_scope(
-                    if indexes.contains(&1) {
-                        CopyScope::Locked
-                    } else {
-                        CopyScope::All
-                    },
-                    cx,
-                );
-            }))
     }
 
     /// The photo list with lock marks, or the ingest's progress after Start.
