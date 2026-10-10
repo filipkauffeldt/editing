@@ -830,6 +830,9 @@ impl Render for DevelopPanel {
         let mut accordion = Accordion::new("develop-sections")
             .multiple(true)
             .bordered(false)
+            // The accordion fills its parent by default, and its items share
+            // out the spare height, which spreads collapsed sections apart.
+            .h_auto()
             .small();
         for section in PANEL {
             let open = self.open.contains(&section.key);
