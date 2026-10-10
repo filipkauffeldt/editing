@@ -432,3 +432,44 @@ fn the_rotate_buttons_and_reset_work_and_the_turn_is_saved(cx: &mut TestAppConte
     let stored: Crop = serde_json::from_str(&row.crop_json.expect("a crop")).unwrap();
     assert_eq!(stored.quarter_turns, 1);
 }
+
+#[gpui_kit::test]
+fn a_thumbnail_follows_the_crop_once_it_is_committed(cx: &mut TestAppContext) {
+    let rig = rig(cx);
+    cx.simulate_keystrokes(rig.handle, "g");
+    settle(cx, &rig, |b| b.thumb_size(b.visible()[0].item_id).is_some());
+    let landscape = cx
+        .update(|cx| rig.browser.read(cx).thumb_size(rig.item_id))
+        .expect("a thumbnail");
+    assert!(landscape.0 > landscape.1, "{landscape:?}");
+
+    enter_crop(cx, &rig, false);
+    cx.simulate_keystrokes(rig.handle, "]");
+    settle(cx, &rig, |_| true);
+    // Only a committed crop reaches the thumbnail, not the draft.
+    let during = cx.update(|cx| rig.browser.read(cx).thumb_size(rig.item_id));
+    assert_eq!(during, Some(landscape));
+
+    cx.simulate_keystrokes(rig.handle, "enter");
+    settle(cx, &rig, |b| {
+        b.thumb_size(rig.item_id).is_some_and(|(w, h)| h > w)
+    });
+    let portrait = cx
+        .update(|cx| rig.browser.read(cx).thumb_size(rig.item_id))
+        .unwrap();
+    assert!(portrait.1 > portrait.0, "{portrait:?}");
+
+    // Cropping the turned photo to its top half changes it again.
+    enter_crop(cx, &rig, false);
+    cx.update(|cx| rig.browser.update(cx, |b, cx| b.set_crop_aspect(None, cx)));
+    drag(cx, &rig, (0.995, 0.995), (0.995, 0.5));
+    cx.simulate_keystrokes(rig.handle, "enter");
+    settle(cx, &rig, |b| {
+        b.thumb_size(rig.item_id)
+            .is_some_and(|(w, h)| (h as f32 / w as f32) < 1.0)
+    });
+    let cut = cx
+        .update(|cx| rig.browser.read(cx).thumb_size(rig.item_id))
+        .unwrap();
+    assert!(cut.0 > cut.1, "{cut:?}");
+}
