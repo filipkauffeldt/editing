@@ -135,6 +135,8 @@ gpui_kit::actions!(
         ApplyCrop,
         CancelCrop,
         FlipCrop,
+        RotateCropLeft,
+        RotateCropRight,
         CopySettings,
         PasteSettings,
         ApplyPrevious,
@@ -270,6 +272,10 @@ pub struct Browser {
     /// The uncropped render crop mode paints, and the same image ready to
     /// paint; a small copy of it is what a moving angle turns.
     crop_base: Option<Arc<image::RgbaImage>>,
+    /// Clockwise quarter turns the crop canvas image has had applied (the render's own plus later rotates).
+    crop_base_turns: u8,
+    /// Quarter turns the uncropped crop-mode render was asked to carry.
+    crop_render_turns: u8,
     crop_base_image: Option<Arc<RenderImage>>,
     crop_small: Option<Arc<image::RgbaImage>>,
     /// Newest straighten request for the background worker.
@@ -334,6 +340,8 @@ impl Browser {
             KeyBinding::new("enter", ApplyCrop, Some("!Input")),
             KeyBinding::new("escape", CancelCrop, Some("!Input")),
             KeyBinding::new("x", FlipCrop, Some("!Input")),
+            KeyBinding::new("[", RotateCropLeft, Some("!Input")),
+            KeyBinding::new("]", RotateCropRight, Some("!Input")),
             KeyBinding::new("ctrl-c", CopySettings, Some("!Input")),
             KeyBinding::new("ctrl-v", PasteSettings, Some("!Input")),
             KeyBinding::new("ctrl-alt-v", ApplyPrevious, Some("!Input")),
@@ -392,6 +400,8 @@ impl Browser {
             straightened_image: false,
             crop_frame: Rc::new(Cell::new(None)),
             crop_base: None,
+            crop_base_turns: 0,
+            crop_render_turns: 0,
             crop_base_image: None,
             crop_small: None,
             crop_turn: Latest::default(),
@@ -2464,6 +2474,12 @@ impl Render for Browser {
                     }))
                     .on_action(cx.listener(|this, _: &FlipCrop, _, cx| {
                         this.flip_crop_orientation(cx);
+                    }))
+                    .on_action(cx.listener(|this, _: &RotateCropLeft, _, cx| {
+                        this.rotate_crop(false, cx);
+                    }))
+                    .on_action(cx.listener(|this, _: &RotateCropRight, _, cx| {
+                        this.rotate_crop(true, cx);
                     }))
                     .on_action(cx.listener(|this, _: &ToggleView, _, cx| {
                         this.finish_crop(true, cx);

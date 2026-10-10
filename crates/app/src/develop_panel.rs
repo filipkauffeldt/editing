@@ -19,7 +19,7 @@ use gpui_kit::component::scroll::ScrollableElement as _;
 use gpui_kit::component::select::{
     SearchableVec, Select, SelectEvent, SelectGroup, SelectItem, SelectState,
 };
-use gpui_kit::component::slider::{Slider, SliderEvent, SliderState, SliderValue};
+use gpui_kit::component::slider::{SliderEvent, SliderState, SliderValue};
 use gpui_kit::component::{
     ActiveTheme as _, Disableable as _, IconName, IndexPath, Sizable as _, StyledExt as _, h_flex,
     v_flex,
@@ -30,6 +30,7 @@ use lightcraft_develop::WbMode;
 
 use crate::develop::ControlId;
 use crate::panel::{self, Item, PANEL};
+use crate::slider_row::SliderRow;
 
 /// What the user did in the panel.
 #[derive(Clone, Debug, PartialEq)]
@@ -737,52 +738,26 @@ impl DevelopPanel {
         let (slider, input) = (row.slider.clone(), row.input.clone());
         let value = lightcraft_develop::controls::get(&self.settings, id).unwrap_or(spec.default);
         let at_default = (value - spec.default).abs() < 1e-9;
-        let spacing = cx.theme().spacing_tokens();
         let editable = self.editable;
         Some(
-            v_flex()
-                .w_full()
-                .gap(spacing.xs)
-                .child(
-                    h_flex()
-                        .id(SharedString::from(format!("develop-row-{id}")))
-                        .w_full()
-                        .h_6()
-                        .items_center()
-                        .justify_between()
-                        .gap(spacing.sm)
-                        .on_click(cx.listener(move |this, event: &ClickEvent, _, cx| {
-                            if event.click_count() == 2 && this.editable {
-                                cx.emit(PanelEvent::Release(id, spec.default));
-                            }
-                        }))
-                        .child(Label::new(label).text_xs())
-                        .child(
-                            h_flex()
-                                .items_center()
-                                .gap(spacing.xs)
-                                .child(
-                                    Input::new(&input)
-                                        .id(SharedString::from(format!("develop-value-{id}")))
-                                        .xsmall()
-                                        .w_16()
-                                        .text_right()
-                                        .disabled(!editable),
-                                )
-                                .child(
-                                    Button::new(SharedString::from(format!("develop-reset-{id}")))
-                                        .ghost()
-                                        .xsmall()
-                                        .icon(IconName::Undo2)
-                                        .tooltip("Reset")
-                                        .disabled(at_default || !editable)
-                                        .on_click(cx.listener(move |_, _, _, cx| {
-                                            cx.emit(PanelEvent::Release(id, spec.default));
-                                        })),
-                                ),
-                        ),
+            SliderRow::new("develop", id, label, &slider)
+                .value(
+                    Input::new(&input)
+                        .id(SharedString::from(format!("develop-value-{id}")))
+                        .xsmall()
+                        .w_16()
+                        .text_right()
+                        .disabled(!editable),
                 )
-                .child(Slider::new(&slider).disabled(!editable))
+                .at_default(at_default)
+                .disabled(!editable)
+                .on_reset({
+                    let panel = cx.entity();
+                    move |_, cx| {
+                        panel.update(cx, |_, cx| cx.emit(PanelEvent::Release(id, spec.default)));
+                    }
+                })
+                .reset_on_double_click()
                 .into_any_element(),
         )
     }
