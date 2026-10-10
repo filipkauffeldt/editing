@@ -21,4 +21,5 @@ pub mod preview;
 pub mod sidebar;
 pub mod smart;
 pub mod templates;
+pub mod transfer;
 pub mod views;
