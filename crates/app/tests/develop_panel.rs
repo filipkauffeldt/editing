@@ -232,17 +232,16 @@ fn presets_apply_to_the_photo_and_save_through_a_popover_that_escape_closes(
     cx.update_window(rig.handle, |_, window, cx| window.input("Mine", cx))
         .unwrap();
     press(cx, &rig, "enter");
+    settle(cx, &rig, |b| !b.indexed_presets().is_empty());
     let saved = app::preset_store::list(&rig.catalog);
     assert_eq!(saved.len(), 1, "{saved:?}");
-    assert_eq!(saved[0].0, "Mine");
+    assert_eq!(saved[0].name, "Mine");
 
     // Applying the saved preset to a reset photo brings its values back.
     click(cx, &rig, "develop-reset-all");
     assert_eq!(value(cx, &rig, "light.contrast"), 0.0);
-    cx.update(|cx| {
-        rig.browser
-            .update(cx, |b, cx| b.apply_preset("user:Mine", cx))
-    });
+    let key = format!("user:{}", saved[0].path);
+    cx.update(|cx| rig.browser.update(cx, |b, cx| b.apply_preset(&key, cx)));
     settle(cx, &rig, |_| true);
     assert_eq!(value(cx, &rig, "light.contrast"), 25.0);
     assert_eq!(value(cx, &rig, "light.exposure"), 0.5);
@@ -294,4 +293,101 @@ fn the_wheel_scrolls_the_panel_and_never_zooms_the_photo(cx: &mut TestAppContext
         cx.update(|cx| rig.browser.read(cx).zoom_label()),
         zoom_before
     );
+}
+
+fn fixtures() -> PathBuf {
+    PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../edit-metadata/tests/fixtures/presets")
+}
+
+fn copy_tree(from: &std::path::Path, to: &std::path::Path) {
+    std::fs::create_dir_all(to).unwrap();
+    for entry in std::fs::read_dir(from).unwrap().flatten() {
+        let dest = to.join(entry.file_name());
+        if entry.path().is_dir() {
+            copy_tree(&entry.path(), &dest);
+        } else {
+            std::fs::copy(entry.path(), dest).unwrap();
+        }
+    }
+}
+
+#[gpui_kit::test]
+fn the_preset_bar_groups_presets_by_folder_after_a_background_scan(cx: &mut TestAppContext) {
+    let rig = open_single(cx);
+    let folder = rig.dir.join("my-presets");
+    copy_tree(&fixtures(), &folder);
+    cx.update(|cx| {
+        rig.browser
+            .update(cx, |b, cx| b.set_preset_folder(folder.clone(), cx))
+    });
+    settle(cx, &rig, |b| b.indexed_presets().len() == 4);
+    let panel = cx.update(|cx| rig.browser.read(cx).develop_panel());
+    let groups: Vec<String> = cx.update(|cx| {
+        panel
+            .read(cx)
+            .preset_groups()
+            .into_iter()
+            .map(|(title, _)| title.to_string())
+            .collect()
+    });
+    assert_eq!(
+        groups,
+        ["Built in", "User presets", "Film", "Portraits / Studio"]
+    );
+    // A preset from a subfolder applies like any other.
+    let key = cx.update(|cx| {
+        let browser = rig.browser.read(cx);
+        let row = browser
+            .indexed_presets()
+            .iter()
+            .find(|p| p.name == "Faded film")
+            .unwrap();
+        format!("user:{}", row.path)
+    });
+    cx.update(|cx| rig.browser.update(cx, |b, cx| b.apply_preset(&key, cx)));
+    settle(cx, &rig, |_| true);
+    assert_eq!(value(cx, &rig, "light.blacks"), 30.0);
+    assert_eq!(value(cx, &rig, "grain.amount"), 25.0);
+}
+
+#[gpui_kit::test]
+fn the_preset_menu_imports_and_exports_and_escape_closes_it(cx: &mut TestAppContext) {
+    let rig = open_single(cx);
+    click(cx, &rig, "develop-preset-menu-button");
+    for id in [
+        "develop-preset-import",
+        "develop-preset-export-settings",
+        "develop-preset-export-preset",
+        "develop-preset-folder",
+    ] {
+        assert!(exists(cx, &rig, id), "{id}");
+    }
+    press(cx, &rig, "escape");
+    assert!(!exists(cx, &rig, "develop-preset-import"));
+
+    let source = fixtures().join("Film/Unknown keys.xmp");
+    cx.update(|cx| {
+        rig.browser
+            .update(cx, |b, cx| b.import_presets(vec![source.clone()], cx))
+    });
+    settle(cx, &rig, |b| b.develop_status().starts_with("Imported"));
+    let status = cx.update(|cx| rig.browser.read(cx).develop_status().to_owned());
+    assert_eq!(
+        status,
+        "Imported Unknown keys, 4 unsupported settings left out"
+    );
+    assert_eq!(
+        cx.update(|cx| rig.browser.read(cx).indexed_presets().len()),
+        1
+    );
+
+    set(cx, &rig, "light.exposure", 0.5);
+    let dest = rig.dir.join("Out.xmp");
+    cx.update(|cx| {
+        rig.browser
+            .update(cx, |b, cx| b.export_settings_to(&dest, cx))
+    });
+    let xml = std::fs::read_to_string(&dest).unwrap();
+    assert!(xml.contains("crs:PresetType=\"Normal\""));
+    assert!(xml.contains("crs:Exposure2012=\"+0.50\""));
 }

@@ -16,7 +16,9 @@ use gpui_kit::component::input::{Input, InputEvent, InputState};
 use gpui_kit::component::label::Label;
 use gpui_kit::component::popover::Popover;
 use gpui_kit::component::scroll::ScrollableElement as _;
-use gpui_kit::component::select::{SearchableVec, Select, SelectEvent, SelectItem, SelectState};
+use gpui_kit::component::select::{
+    SearchableVec, Select, SelectEvent, SelectGroup, SelectItem, SelectState,
+};
 use gpui_kit::component::slider::{Slider, SliderEvent, SliderState, SliderValue};
 use gpui_kit::component::{
     ActiveTheme as _, Disableable as _, IconName, IndexPath, Sizable as _, StyledExt as _, h_flex,
@@ -44,14 +46,45 @@ pub enum PanelEvent {
     ApplyPreset(SharedString),
     /// "Save preset" confirmed with this name.
     SavePreset(String),
+    /// Pick preset or sidecar files to bring in.
+    ImportPresets,
+    /// Save the current settings as a preset file.
+    ExportSettings,
+    /// Copy the chosen preset's file somewhere.
+    ExportPreset,
+    /// Pick the folder presets are kept in.
+    ChoosePresetFolder,
 }
 
 /// One line of the preset list.
 #[derive(Clone, Debug, PartialEq)]
 pub struct PresetEntry {
-    /// `none`, `builtin:<name>` or `user:<name>`.
+    /// `none`, `builtin:<name>` or `user:<file path>`.
     pub key: SharedString,
     pub title: SharedString,
+    /// The heading the preset is listed under.
+    pub group: SharedString,
+}
+
+/// The list as headed groups, in first-seen order.
+pub fn group_entries(entries: &[PresetEntry]) -> Vec<(SharedString, Vec<PresetEntry>)> {
+    let mut groups: Vec<(SharedString, Vec<PresetEntry>)> = Vec::new();
+    for entry in entries {
+        match groups.iter_mut().find(|(name, _)| *name == entry.group) {
+            Some((_, items)) => items.push(entry.clone()),
+            None => groups.push((entry.group.clone(), vec![entry.clone()])),
+        }
+    }
+    groups
+}
+
+fn grouped(entries: &[PresetEntry]) -> SearchableVec<SelectGroup<PresetEntry>> {
+    SearchableVec::new(
+        group_entries(entries)
+            .into_iter()
+            .map(|(title, items)| SelectGroup::new(title).items(items))
+            .collect::<Vec<_>>(),
+    )
 }
 
 impl SelectItem for PresetEntry {
@@ -101,6 +134,7 @@ pub fn none_entry() -> PresetEntry {
     PresetEntry {
         key: "none".into(),
         title: "None".into(),
+        group: "Built in".into(),
     }
 }
 
@@ -123,7 +157,11 @@ pub struct DevelopPanel {
     /// The number box being typed in.
     typing: Option<ControlId>,
     presets: Vec<PresetEntry>,
-    preset_select: Option<Entity<SelectState<SearchableVec<PresetEntry>>>>,
+    preset_select: Option<Entity<SelectState<SearchableVec<SelectGroup<PresetEntry>>>>>,
+    /// The preset last picked from the list.
+    picked: Option<SharedString>,
+    menu_open: bool,
+    menu_focus: Option<FocusHandle>,
     wb_select: Option<Entity<SelectState<SearchableVec<WbEntry>>>>,
     name_input: Option<Entity<InputState>>,
     save_open: bool,
@@ -150,6 +188,9 @@ impl DevelopPanel {
             typing: None,
             presets: vec![none_entry()],
             preset_select: None,
+            picked: None,
+            menu_open: false,
+            menu_focus: None,
             wb_select: None,
             name_input: None,
             save_open: false,
@@ -179,7 +220,7 @@ impl DevelopPanel {
         if self.presets != presets {
             self.presets = presets.to_vec();
             if let Some(select) = &self.preset_select {
-                let items = SearchableVec::new(self.presets.clone());
+                let items = grouped(&self.presets);
                 select.update(cx, |state, cx| state.set_items(items, window, cx));
             }
             changed = true;
@@ -202,6 +243,7 @@ impl DevelopPanel {
     pub fn show_preset(&mut self, key: &str, window: &mut Window, cx: &mut Context<Self>) {
         if let Some(select) = &self.preset_select {
             let key: SharedString = key.to_owned().into();
+            self.picked = Some(key.clone());
             select.update(cx, |state, cx| state.set_selected_value(&key, window, cx));
         }
     }
@@ -227,14 +269,18 @@ impl DevelopPanel {
     }
 
     fn ensure_chrome(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if self.menu_focus.is_none() {
+            self.menu_focus = Some(cx.focus_handle());
+        }
         if self.preset_select.is_none() {
-            let items = SearchableVec::new(self.presets.clone());
+            let items = grouped(&self.presets);
             let select =
                 cx.new(|cx| SelectState::new(items, Some(IndexPath::default()), window, cx));
             cx.subscribe(
                 &select,
-                |_, _, event: &SelectEvent<SearchableVec<PresetEntry>>, cx| {
+                |this, _, event: &SelectEvent<SearchableVec<SelectGroup<PresetEntry>>>, cx| {
                     if let SelectEvent::Confirm(Some(key)) = event {
+                        this.picked = Some(key.clone());
                         cx.emit(PanelEvent::ApplyPreset(key.clone()));
                     }
                 },
@@ -421,6 +467,97 @@ impl DevelopPanel {
         cx.notify();
     }
 
+    /// Import, export and folder commands behind one button.
+    fn render_preset_menu(&mut self, cx: &mut Context<Self>) -> impl IntoElement {
+        let this = cx.entity();
+        let can_export_preset = self
+            .picked
+            .as_ref()
+            .is_some_and(|key| key.starts_with("user:"));
+        let editable = self.editable;
+        let focus = self.menu_focus.clone();
+        let open_focus = focus.clone();
+        Popover::new("develop-preset-menu")
+            .open(self.menu_open)
+            .on_open_change({
+                let this = this.clone();
+                move |open, window, cx| {
+                    let open = *open;
+                    if open && let Some(handle) = open_focus.clone() {
+                        window.defer(cx, move |window, cx| handle.focus(window, cx));
+                    }
+                    this.update(cx, |panel, cx| {
+                        panel.menu_open = open;
+                        cx.notify();
+                    });
+                }
+            })
+            .trigger(
+                Button::new("develop-preset-menu-button")
+                    .small()
+                    .ghost()
+                    .icon(IconName::Ellipsis),
+            )
+            .content(move |_, _, cx| {
+                let spacing = cx.theme().spacing_tokens();
+                let item =
+                    |id: &'static str, label: &'static str, enabled: bool, event: PanelEvent| {
+                        let this = this.clone();
+                        Button::new(id)
+                            .small()
+                            .ghost()
+                            .w_full()
+                            .label(label)
+                            .disabled(!enabled)
+                            .on_click(move |_, _, cx| {
+                                this.update(cx, |panel, cx| {
+                                    panel.menu_open = false;
+                                    cx.emit(event.clone());
+                                    cx.notify();
+                                });
+                            })
+                    };
+                v_flex()
+                    .id("develop-preset-menu-list")
+                    // Plain-key browser shortcuts are bound outside "Input";
+                    // typing context keeps them off while the menu has focus
+                    // and lets Escape reach the popover.
+                    .key_context("Input")
+                    .when_some(focus.clone(), |list, handle| list.track_focus(&handle))
+                    .w_48()
+                    .gap(spacing.xs)
+                    .child(item(
+                        "develop-preset-import",
+                        "Import presets…",
+                        true,
+                        PanelEvent::ImportPresets,
+                    ))
+                    .child(item(
+                        "develop-preset-export-settings",
+                        "Export settings…",
+                        editable,
+                        PanelEvent::ExportSettings,
+                    ))
+                    .child(item(
+                        "develop-preset-export-preset",
+                        "Export chosen preset…",
+                        can_export_preset,
+                        PanelEvent::ExportPreset,
+                    ))
+                    .child(item(
+                        "develop-preset-folder",
+                        "Preset folder…",
+                        true,
+                        PanelEvent::ChoosePresetFolder,
+                    ))
+            })
+    }
+
+    /// The preset list as headed groups (for tests).
+    pub fn preset_groups(&self) -> Vec<(SharedString, Vec<PresetEntry>)> {
+        group_entries(&self.presets)
+    }
+
     fn render_preset_bar(&mut self, cx: &mut Context<Self>) -> impl IntoElement {
         let this = cx.entity();
         let save_open = self.save_open;
@@ -429,9 +566,20 @@ impl DevelopPanel {
         v_flex()
             .w_full()
             .gap(spacing.sm)
-            .when_some(self.preset_select.clone(), |bar, select| {
-                bar.child(Select::new(&select).small().placeholder("Preset"))
-            })
+            .child(
+                h_flex()
+                    .w_full()
+                    .gap(spacing.sm)
+                    .when_some(self.preset_select.clone(), |bar, select| {
+                        bar.child(
+                            div()
+                                .flex_1()
+                                .min_w_0()
+                                .child(Select::new(&select).small().placeholder("Preset")),
+                        )
+                    })
+                    .child(self.render_preset_menu(cx)),
+            )
             .child(
                 h_flex()
                     .w_full()

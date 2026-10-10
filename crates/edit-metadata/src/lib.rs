@@ -14,6 +14,7 @@ pub mod fields;
 pub mod iptc_read;
 pub mod persist;
 pub mod photo;
+pub mod preset_xmp;
 pub mod template;
 pub mod writer;
 

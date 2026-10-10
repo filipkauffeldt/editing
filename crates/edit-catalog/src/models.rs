@@ -136,6 +136,9 @@ pub struct Preset {
     pub path: String,
     pub source: String,
     pub updated_at: i64,
+    /// Modified time (seconds) and size (bytes) of the file when indexed.
+    pub mtime: i64,
+    pub size: i64,
 }
 
 // ---- detections ----
