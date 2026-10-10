@@ -321,7 +321,7 @@ impl Browser {
         .detach();
     }
 
-    /// `[` and `]`: turn the picture a quarter left or right, frame and all.
+    /// `R` and `Shift+R`: turn the picture a quarter right or left, frame and all.
     /// Waits for the canvas, which the turn is applied to.
     pub fn rotate_crop(&mut self, clockwise: bool, cx: &mut Context<Self>) {
         if !self.crop_ready() {
@@ -654,7 +654,7 @@ impl Browser {
                                             .ghost()
                                             .xsmall()
                                             .icon(Icon::empty().path(ROTATE_LEFT_ICON))
-                                            .tooltip("Rotate left ([)")
+                                            .tooltip("Rotate left (Shift+R)")
                                             .disabled(!ready)
                                             .on_click(cx.listener(
                                                 |this, _: &ClickEvent, _, cx| {
@@ -667,7 +667,7 @@ impl Browser {
                                             .ghost()
                                             .xsmall()
                                             .icon(Icon::empty().path(ROTATE_RIGHT_ICON))
-                                            .tooltip("Rotate right (])")
+                                            .tooltip("Rotate right (R)")
                                             .disabled(!ready)
                                             .on_click(cx.listener(
                                                 |this, _: &ClickEvent, _, cx| {

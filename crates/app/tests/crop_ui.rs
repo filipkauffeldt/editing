@@ -377,7 +377,7 @@ fn the_rotate_keys_turn_the_canvas_and_the_frame(cx: &mut TestAppContext) {
     enter_crop(cx, &rig, true);
     assert!(canvas_ratio(cx, &rig) > 1.4, "starts landscape");
 
-    cx.simulate_keystrokes(rig.handle, "]");
+    cx.simulate_keystrokes(rig.handle, "r");
     settle(cx, &rig, |_| true);
     let right = draft(cx, &rig);
     assert_eq!(right.quarter_turns, 1);
@@ -389,14 +389,14 @@ fn the_rotate_keys_turn_the_canvas_and_the_frame(cx: &mut TestAppContext) {
         "{right:?}"
     );
 
-    cx.simulate_keystrokes(rig.handle, "[");
-    cx.simulate_keystrokes(rig.handle, "[");
+    cx.simulate_keystrokes(rig.handle, "shift-r");
+    cx.simulate_keystrokes(rig.handle, "shift-r");
     settle(cx, &rig, |_| true);
     let left = draft(cx, &rig);
     assert_eq!(left.quarter_turns, 3);
     assert!(canvas_ratio(cx, &rig) < 0.7);
 
-    cx.simulate_keystrokes(rig.handle, "]");
+    cx.simulate_keystrokes(rig.handle, "r");
     settle(cx, &rig, |_| true);
     assert_eq!(draft(cx, &rig).quarter_turns, 0);
     assert!(canvas_ratio(cx, &rig) > 1.4, "back to landscape");
@@ -454,7 +454,7 @@ fn a_thumbnail_follows_the_crop_once_it_is_committed(cx: &mut TestAppContext) {
     assert!(landscape.0 > landscape.1, "{landscape:?}");
 
     enter_crop(cx, &rig, false);
-    cx.simulate_keystrokes(rig.handle, "]");
+    cx.simulate_keystrokes(rig.handle, "r");
     settle(cx, &rig, |_| true);
     // Only a committed crop reaches the thumbnail, not the draft.
     let during = cx.update(|cx| rig.browser.read(cx).thumb_size(rig.item_id));
