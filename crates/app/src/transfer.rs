@@ -7,9 +7,8 @@ use std::rc::Rc;
 
 use edit_core::{Crop, DevelopSettings};
 use gpui_kit::component::WindowExt as _;
-use gpui_kit::component::button::Button;
+use gpui_kit::component::button::{Button, ButtonVariants as _};
 use gpui_kit::component::checkbox::Checkbox;
-use gpui_kit::component::dialog::DialogButtonProps;
 use gpui_kit::component::scroll::ScrollableElement as _;
 use gpui_kit::component::{ActiveTheme as _, Sizable as _, h_flex, v_flex};
 use gpui_kit::*;
@@ -250,22 +249,50 @@ pub fn open_transfer_dialog(
     let body = cx.new(|_| TransferDialog::new(checked));
     window.open_dialog(cx, move |dialog, _, _| {
         let chosen = body.clone();
-        let on_confirm = on_confirm.clone();
+        let confirmed = body.clone();
+        let on_ok = on_confirm.clone();
+        let on_click = on_confirm.clone();
         let restore = restore_focus.clone();
+        let restore_after = restore_focus.clone();
+        let footer = h_flex()
+            .w_full()
+            .justify_end()
+            .gap_2()
+            .child(
+                Button::new("transfer-cancel")
+                    .label("Cancel")
+                    .outline()
+                    .on_click(move |_, window, cx| {
+                        window.close_dialog(cx);
+                        restore_after.focus(window, cx);
+                    }),
+            )
+            .child(
+                Button::new("transfer-confirm")
+                    .label(kind.confirm())
+                    .primary()
+                    .on_click({
+                        let restore = restore.clone();
+                        move |_, window, cx| {
+                            let keys = confirmed.read(cx).checked();
+                            on_click(keys, window, cx);
+                            window.close_dialog(cx);
+                            restore.focus(window, cx);
+                        }
+                    }),
+            );
         dialog
             .title(kind.title())
             .w(px(360.))
             .margin_top(px(48.))
-            .button_props(
-                DialogButtonProps::default()
-                    .ok_text(kind.confirm())
-                    .show_cancel(true)
-                    .cancel_text("Cancel"),
-            )
-            .on_close(move |_, window, cx| restore.focus(window, cx))
+            .footer(footer)
+            .on_close({
+                let restore = restore.clone();
+                move |_, window, cx| restore.focus(window, cx)
+            })
             .on_ok(move |_, window, cx| {
                 let keys = chosen.read(cx).checked();
-                on_confirm(keys, window, cx);
+                on_ok(keys, window, cx);
                 true
             })
             .child(body.clone())
