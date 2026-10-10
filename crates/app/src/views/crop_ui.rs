@@ -20,12 +20,13 @@ use gpui_kit::component::button::{Button, ButtonVariants as _};
 use gpui_kit::component::label::Label;
 use gpui_kit::component::slider::{SliderEvent, SliderState, SliderValue};
 use gpui_kit::component::{
-    ActiveTheme as _, Disableable as _, IconName, Selectable as _, Sizable as _, h_flex, v_flex,
+    ActiveTheme as _, Disableable as _, Icon, Selectable as _, Sizable as _, h_flex, v_flex,
 };
 use gpui_kit::*;
 use image::RgbaImage;
 
 use super::{Browser, Mode, PROXY_DRAG_LONG_EDGE, PROXY_RELEASE_LONG_EDGE};
+use crate::assets::{ROTATE_LEFT_ICON, ROTATE_RIGHT_ICON};
 use crate::crop::{CropSession, Grab, Handle};
 use crate::slider_row::SliderRow;
 
@@ -652,7 +653,7 @@ impl Browser {
                                         Button::new("crop-rotate-left")
                                             .ghost()
                                             .xsmall()
-                                            .icon(IconName::Undo)
+                                            .icon(Icon::empty().path(ROTATE_LEFT_ICON))
                                             .tooltip("Rotate left ([)")
                                             .disabled(!ready)
                                             .on_click(cx.listener(
@@ -665,7 +666,7 @@ impl Browser {
                                         Button::new("crop-rotate-right")
                                             .ghost()
                                             .xsmall()
-                                            .icon(IconName::Redo)
+                                            .icon(Icon::empty().path(ROTATE_RIGHT_ICON))
                                             .tooltip("Rotate right (])")
                                             .disabled(!ready)
                                             .on_click(cx.listener(
