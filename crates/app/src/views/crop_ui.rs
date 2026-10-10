@@ -277,7 +277,10 @@ impl Browser {
     /// Make `base` the canvas image, turned from the quarter turns it has to
     /// the draft's, then refresh everything derived from it.
     fn install_base(&mut self, base: RgbaImage, cx: &mut Context<Self>) {
-        let want = self.crop.as_ref().map_or(0, |s| s.draft().quarter_turns % 4);
+        let want = self
+            .crop
+            .as_ref()
+            .map_or(0, |s| s.draft().quarter_turns % 4);
         let base = match (want + 4 - self.crop_base_turns % 4) % 4 {
             1 => image::imageops::rotate90(&base),
             2 => image::imageops::rotate180(&base),

@@ -311,7 +311,7 @@ impl CropSession {
 
     /// Back to the whole photo, level, unturned, locked to its own aspect.
     pub fn reset(&mut self) {
-        if self.draft.quarter_turns % 2 == 1 {
+        if !self.draft.quarter_turns.is_multiple_of(2) {
             self.source = self.source.map(|(w, h)| (h, w));
         }
         self.draft = Self::fresh();
@@ -410,7 +410,7 @@ impl CropSession {
             && rect.y.abs() < IDENTITY_SLACK
             && (rect.w - 1.0).abs() < IDENTITY_SLACK
             && (rect.h - 1.0).abs() < IDENTITY_SLACK;
-        (!full || self.draft.rotation_degrees != 0.0 || self.draft.quarter_turns % 4 != 0)
+        (!full || self.draft.rotation_degrees != 0.0 || !self.draft.quarter_turns.is_multiple_of(4))
             .then(|| self.draft.clone())
     }
 }
@@ -1073,7 +1073,13 @@ mod tests {
                 // turned-on-its-side twin on an odd one; Original is always
                 // the photo's own ratio as it stands.
                 let expected = want
-                    .map(|r: f64| if turns % 2 == 1 && r != 1.0 { 1.0 / r } else { r })
+                    .map(|r: f64| {
+                        if !turns.is_multiple_of(2) && r != 1.0 {
+                            1.0 / r
+                        } else {
+                            r
+                        }
+                    })
                     .unwrap_or(size.0 / size.1);
                 assert!(
                     near(rect_ratio(draft.rect, size), expected, 2e-3),

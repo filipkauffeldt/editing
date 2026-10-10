@@ -1189,8 +1189,7 @@ impl Browser {
         };
         if self.thumb_pending.contains(&item_id) {
             self.thumb_stale.insert(item_id);
-        } else if self.thumbs.contains_key(&item_id)
-            && self.thumb_crops.get(&item_id) != Some(crop)
+        } else if self.thumbs.contains_key(&item_id) && self.thumb_crops.get(&item_id) != Some(crop)
         {
             self.spawn_thumb(cx, item_id, path.clone());
         }

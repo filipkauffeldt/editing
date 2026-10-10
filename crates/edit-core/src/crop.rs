@@ -114,7 +114,7 @@ pub fn turn_rect(rect: Rect, clockwise: bool) -> Rect {
 
 /// The pixel size of an image of `size` after `quarter_turns`.
 pub fn turned_size(size: (f64, f64), quarter_turns: u8) -> (f64, f64) {
-    if quarter_turns % 2 == 1 {
+    if !quarter_turns.is_multiple_of(2) {
         (size.1, size.0)
     } else {
         size
@@ -279,7 +279,9 @@ impl Crop {
 
     /// Whether the crop changes nothing.
     pub fn is_identity(&self) -> bool {
-        self.rect == Rect::full() && self.rotation_degrees == 0.0 && self.quarter_turns % 4 == 0
+        self.rect == Rect::full()
+            && self.rotation_degrees == 0.0
+            && self.quarter_turns.is_multiple_of(4)
     }
 
     /// The frame as it lies in the image before the quarter turns, for
@@ -523,7 +525,11 @@ mod tests {
             let turned = turn_rect(rect, clockwise);
             let size = turned_size(source, 1);
             assert_eq!(size, (4000.0, 6000.0));
-            assert!(near(rect_ratio(turned, size), 1.0 / rect_ratio(rect, source), 1e-5));
+            assert!(near(
+                rect_ratio(turned, size),
+                1.0 / rect_ratio(rect, source),
+                1e-5
+            ));
             assert!(rect_fits(turned, 0.0, size));
         }
         assert_eq!(turned_size(source, 2), source);

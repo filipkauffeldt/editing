@@ -413,7 +413,8 @@ fn header_gaps(cx: &mut TestAppContext, rig: &Rig) -> Vec<f32> {
 fn let_animations_finish(cx: &mut TestAppContext, rig: &Rig) {
     for _ in 0..60 {
         settle(cx, rig, |_| true);
-        cx.executor().advance_clock(std::time::Duration::from_millis(50));
+        cx.executor()
+            .advance_clock(std::time::Duration::from_millis(50));
         std::thread::sleep(std::time::Duration::from_millis(20));
     }
 }
