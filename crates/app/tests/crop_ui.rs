@@ -353,3 +353,82 @@ fn dragging_outside_the_frame_turns_the_photo_and_x_flips_the_frame(cx: &mut Tes
         "{after:?}"
     );
 }
+
+/// The painted canvas's width over height.
+fn canvas_ratio(cx: &mut TestAppContext, rig: &Rig) -> f32 {
+    let (_, _, w, h) = cx
+        .update(|cx| rig.browser.read(cx).canvas_image_frame())
+        .expect("the image has painted");
+    w / h
+}
+
+fn click_button(cx: &mut TestAppContext, rig: &Rig, id: &'static str) {
+    cx.update_window(rig.handle, |_, window, cx| {
+        window.render_frame(cx);
+        window.click(id, cx);
+    })
+    .unwrap();
+    settle(cx, rig, |_| true);
+}
+
+#[gpui_kit::test]
+fn the_rotate_keys_turn_the_canvas_and_the_frame(cx: &mut TestAppContext) {
+    let rig = rig(cx);
+    enter_crop(cx, &rig, true);
+    assert!(canvas_ratio(cx, &rig) > 1.4, "starts landscape");
+
+    cx.simulate_keystrokes(rig.handle, "]");
+    settle(cx, &rig, |_| true);
+    let right = draft(cx, &rig);
+    assert_eq!(right.quarter_turns, 1);
+    assert!(canvas_ratio(cx, &rig) < 0.7, "the canvas is portrait now");
+    // Original follows the turned photo: the whole frame is still the photo.
+    assert_eq!(right.aspect, Some(Aspect::Original));
+    assert!(
+        (rect_ratio(right.rect, (400.0, 600.0)) - 2.0 / 3.0).abs() < 0.01,
+        "{right:?}"
+    );
+
+    cx.simulate_keystrokes(rig.handle, "[");
+    cx.simulate_keystrokes(rig.handle, "[");
+    settle(cx, &rig, |_| true);
+    let left = draft(cx, &rig);
+    assert_eq!(left.quarter_turns, 3);
+    assert!(canvas_ratio(cx, &rig) < 0.7);
+
+    cx.simulate_keystrokes(rig.handle, "]");
+    settle(cx, &rig, |_| true);
+    assert_eq!(draft(cx, &rig).quarter_turns, 0);
+    assert!(canvas_ratio(cx, &rig) > 1.4, "back to landscape");
+}
+
+#[gpui_kit::test]
+fn the_rotate_buttons_and_reset_work_and_the_turn_is_saved(cx: &mut TestAppContext) {
+    let rig = rig(cx);
+    enter_crop(cx, &rig, true);
+
+    click_button(cx, &rig, "crop-rotate-right");
+    assert_eq!(draft(cx, &rig).quarter_turns, 1);
+    // A straighten after a turn keeps the frame inside the turned photo.
+    cx.update(|cx| rig.browser.update(cx, |b, cx| b.straighten_to(5.0, cx)));
+    settle(cx, &rig, |_| true);
+    let straightened = draft(cx, &rig);
+    assert!(rect_fits(straightened.rect, 5.0, (400.0, 600.0)), "{straightened:?}");
+
+    click_button(cx, &rig, "crop-rotate-left");
+    click_button(cx, &rig, "crop-rotate-left");
+    assert_eq!(draft(cx, &rig).quarter_turns, 3);
+    click_button(cx, &rig, "crop-reset");
+    let reset = draft(cx, &rig);
+    assert_eq!(reset.quarter_turns, 0);
+    assert_eq!(reset.rotation_degrees, 0.0);
+    assert!(canvas_ratio(cx, &rig) > 1.4, "reset restores the landscape canvas");
+
+    // Turn, apply, and the catalog row carries the turn.
+    click_button(cx, &rig, "crop-rotate-right");
+    cx.simulate_keystrokes(rig.handle, "enter");
+    settle(cx, &rig, |b| !b.crop_active());
+    let row = rig.catalog.get_edit(rig.item_id).unwrap().expect("an edit row");
+    let stored: Crop = serde_json::from_str(&row.crop_json.expect("a crop")).unwrap();
+    assert_eq!(stored.quarter_turns, 1);
+}
