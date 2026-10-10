@@ -197,9 +197,21 @@ impl Browser {
             return;
         }
         self.transfer.previous = Some((source.clone(), keys.clone()));
-        let open = self.develop.owner();
-        let (open_target, stored): (Vec<i64>, Vec<i64>) =
-            targets.iter().partition(|item| Some(**item) == open);
+        // The buffer is live only for the photo on screen. After a move to
+        // the grid it can still belong to another photo; that photo is
+        // changed in its stored edit, so the buffer is committed and dropped
+        // and the next visit reads the new edit.
+        let live = self.current_item().map(|row| row.item_id);
+        let (open_target, stored): (Vec<i64>, Vec<i64>) = targets
+            .iter()
+            .partition(|item| Some(**item) == live && self.develop.owner() == live);
+        if let Some(owner) = self.develop.owner()
+            && Some(owner) != live
+            && stored.contains(&owner)
+        {
+            self.persist_current_edit(cx);
+            self.develop.disown();
+        }
         if !open_target.is_empty() {
             self.apply_to_open(&source, &keys, cx);
         }

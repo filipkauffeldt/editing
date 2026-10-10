@@ -287,3 +287,30 @@ fn the_preset_menu_lists_the_transfer_commands(cx: &mut TestAppContext) {
     keys(cx, &rig, "escape");
     assert!(!exists(cx, &rig, "develop-copy-settings"));
 }
+
+#[gpui_kit::test]
+fn a_photo_left_open_in_the_buffer_still_receives_a_sync_from_the_grid(cx: &mut TestAppContext) {
+    let rig = open_single(cx);
+    let ids = items(cx, &rig);
+    // The second photo owns the buffer, then the grid shows the first.
+    keys(cx, &rig, "right");
+    settle(cx, &rig, |b| b.develop_owner() == Some(ids[1]));
+    keys(cx, &rig, "g");
+    keys(cx, &rig, "left");
+    set_stored_vibrance(&rig, ids[0], 30.0);
+    keys(cx, &rig, "ctrl-a");
+    keys(cx, &rig, "ctrl-shift-s");
+    click(cx, &rig, "transfer-check-all");
+    click(cx, &rig, "transfer-confirm");
+    settle(cx, &rig, |_| stored(&rig, ids[1], "color.vibrance") == 30.0);
+    assert_eq!(stored(&rig, ids[2], "color.vibrance"), 30.0);
+}
+
+fn set_stored_vibrance(rig: &Rig, item: i64, value: f64) {
+    let mut settings = lightcraft_develop::DevelopSettings::default();
+    lightcraft_develop::controls::set(&mut settings, "color.vibrance", value);
+    let json = app::develop::edit_json(&settings, None).unwrap();
+    rig.catalog
+        .upsert_edit(item, &json.develop, json.crop.as_deref())
+        .unwrap();
+}
