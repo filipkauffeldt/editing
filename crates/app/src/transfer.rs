@@ -82,7 +82,7 @@ pub fn transfer(
                 Item::Toggle(id, _) => {
                     panel::toggle_set(develop, id, panel::toggle_get(&source.develop, id));
                 }
-                Item::WhiteBalanceMode => develop.wb = source.develop.wb.clone(),
+                Item::WhiteBalanceMode => develop.wb = source.develop.wb,
                 Item::Heading(_) => {}
             }
         }
@@ -232,11 +232,14 @@ impl Render for TransferDialog {
     }
 }
 
+/// Called with the checked group keys when the dialog is confirmed.
+pub type ConfirmHandler = Rc<dyn Fn(Vec<&'static str>, &mut Window, &mut App)>;
+
 /// Open the group dialog as a modal. `on_confirm` gets the checked keys.
 pub fn open_transfer_dialog(
     kind: TransferKind,
     checked: Vec<&'static str>,
-    on_confirm: Rc<dyn Fn(Vec<&'static str>, &mut Window, &mut App)>,
+    on_confirm: ConfirmHandler,
     restore_focus: FocusHandle,
     window: &mut Window,
     cx: &mut App,
@@ -271,8 +274,12 @@ pub fn open_transfer_dialog(
 
 #[cfg(test)]
 mod tests {
-    use super::*;
-    use crate::panel::sliders;
+    // Explicit imports: `super::*` would pull in the `gpui_kit::*` glob,
+    // whose `test` macro shadows the built-in `#[test]`.
+    use super::{Batch, CROP_KEY, Snapshot, default_keys, groups, transfer};
+    use crate::panel::{self, Item, PANEL, sliders};
+    use edit_core::{Crop, DevelopSettings};
+    use lightcraft_develop::controls;
 
     fn all_moved() -> Snapshot {
         let mut develop = DevelopSettings::default();
