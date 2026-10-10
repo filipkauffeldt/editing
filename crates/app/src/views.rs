@@ -54,6 +54,7 @@ use crate::develop_panel::{DevelopPanel, PanelEvent, PresetEntry, none_entry};
 use crate::panel::{self, BUILTIN_PRESETS, PresetValues};
 use crate::preview::BrowsePreviewProvider;
 use crate::sidebar::{MetadataSidebar, SaveMetadata, SidebarEvent};
+use crate::transfer::TransferKind;
 use edit_core::{CancelToken, Crop, DevelopSettings, RenderSize};
 use edit_ingest::{IngestCopyPayload, dest_root_path};
 use edit_metadata::{CodeReplacements, MetadataWritePayload, TemplateFields};
@@ -67,6 +68,7 @@ const PREPARING_STATUS: &str = "Preparing…";
 
 mod crop_ui;
 mod preset_ops;
+mod transfer_ops;
 
 /// Cells per contact-sheet row over `uniform_list`.
 pub const GRID_COLS: usize = 4;
@@ -132,7 +134,11 @@ gpui_kit::actions!(
         ToggleCrop,
         ApplyCrop,
         CancelCrop,
-        FlipCrop
+        FlipCrop,
+        CopySettings,
+        PasteSettings,
+        ApplyPrevious,
+        SyncSettings
     ]
 );
 
@@ -211,6 +217,10 @@ pub struct Browser {
     user_presets: Vec<crate::preset_store::PresetRow>,
     /// The preset last picked in the panel (its list key).
     picked_preset: Option<SharedString>,
+    transfer: transfer_ops::TransferState,
+    /// A transfer dialog asked for by the panel; opened at the next render,
+    /// which has the window.
+    pending_dialog: Option<TransferKind>,
     /// Develop render scheduling: the latest wanted size for the one worker,
     /// cancellation of stale renders, and per-item terminal failures that
     /// stop the paint-time kick.
@@ -324,6 +334,10 @@ impl Browser {
             KeyBinding::new("enter", ApplyCrop, Some("!Input")),
             KeyBinding::new("escape", CancelCrop, Some("!Input")),
             KeyBinding::new("x", FlipCrop, Some("!Input")),
+            KeyBinding::new("ctrl-c", CopySettings, Some("!Input")),
+            KeyBinding::new("ctrl-v", PasteSettings, Some("!Input")),
+            KeyBinding::new("ctrl-alt-v", ApplyPrevious, Some("!Input")),
+            KeyBinding::new("ctrl-shift-s", SyncSettings, Some("!Input")),
             KeyBinding::new("ctrl-s", SaveMetadata, None),
         ]);
         let mut browser = Self {
@@ -353,6 +367,8 @@ impl Browser {
             panel,
             user_presets,
             picked_preset: None,
+            transfer: Default::default(),
+            pending_dialog: None,
             queue: RenderQueue::default(),
             prewarm_token: CancelToken::new(),
             prewarmed: HashSet::new(),
@@ -1234,7 +1250,9 @@ impl Browser {
         let presets = self.preset_entries();
         let buffer = self.develop.buffer().clone();
         let status = self.develop_status.clone();
+        let transfer = self.transfer_availability();
         self.panel.update(cx, |panel, cx| {
+            panel.set_transfer(transfer, cx);
             panel.set_state(&buffer, editable, &status, &presets, window, cx);
         });
         self.panel.clone()
@@ -1281,6 +1299,13 @@ impl Browser {
             }
             PanelEvent::ApplyPreset(key) => self.apply_preset(&key, cx),
             PanelEvent::SavePreset(name) => self.save_preset(&name, cx),
+            PanelEvent::CopySettings => self.pending_dialog = Some(TransferKind::Copy),
+            PanelEvent::SyncSettings => self.pending_dialog = Some(TransferKind::Sync),
+            PanelEvent::PasteSettings => self.paste_settings(cx),
+            PanelEvent::ApplyPrevious => self.apply_previous(cx),
+            PanelEvent::StopApplying => {
+                self.cancel_transfer(cx);
+            }
             PanelEvent::ImportPresets => self.prompt_import_presets(cx),
             PanelEvent::ExportSettings => self.prompt_export_settings(cx),
             PanelEvent::ExportPreset => self.prompt_export_preset(cx),
@@ -1335,9 +1360,19 @@ impl Browser {
         }
     }
 
-    /// Apply a preset to a photo that is not open: read its stored edit,
-    /// change it and write it back with its sidecar.
+    /// Apply a preset to a photo that is not open.
     fn apply_values_to_stored(&mut self, item: i64, values: &PresetValues, cx: &mut Context<Self>) {
+        self.edit_stored(item, |edit| values.apply(&mut edit.develop), cx);
+    }
+
+    /// Change a photo that is not open: read its stored edit, change it and
+    /// write it back with its sidecar.
+    fn edit_stored(
+        &mut self,
+        item: i64,
+        change: impl FnOnce(&mut LoadedEdit),
+        cx: &mut Context<Self>,
+    ) {
         let stored = match self.unsaved.get(&item) {
             Some(edit) => Some((edit.develop.clone(), edit.crop.clone())),
             None => match self.catalog.get_edit(item) {
@@ -1361,7 +1396,7 @@ impl Browser {
                 crop: None,
             },
         };
-        values.apply(&mut edit.develop);
+        change(&mut edit);
         let Ok(json) = edit_json(&edit.develop, edit.crop.as_ref()) else {
             return;
         };
@@ -2365,6 +2400,7 @@ impl Browser {
 
 impl Render for Browser {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        self.open_pending_transfer(window, cx);
         self.sync_straighten(window, cx);
         let metadata = self.render_metadata(window, cx);
         let unsaved = metadata.read(cx).unsaved_count(cx);
@@ -2409,7 +2445,22 @@ impl Render for Browser {
                         this.finish_crop(true, cx);
                     }))
                     .on_action(cx.listener(|this, _: &CancelCrop, _, cx| {
+                        if this.cancel_transfer(cx) {
+                            return;
+                        }
                         this.finish_crop(false, cx);
+                    }))
+                    .on_action(cx.listener(|this, _: &CopySettings, window, cx| {
+                        this.copy_settings(window, cx);
+                    }))
+                    .on_action(cx.listener(|this, _: &PasteSettings, _, cx| {
+                        this.paste_settings(cx);
+                    }))
+                    .on_action(cx.listener(|this, _: &ApplyPrevious, _, cx| {
+                        this.apply_previous(cx);
+                    }))
+                    .on_action(cx.listener(|this, _: &SyncSettings, window, cx| {
+                        this.sync_settings(window, cx);
                     }))
                     .on_action(cx.listener(|this, _: &FlipCrop, _, cx| {
                         this.flip_crop_orientation(cx);
