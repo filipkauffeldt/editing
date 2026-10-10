@@ -587,6 +587,7 @@ mod tests {
             rotation_degrees: -2.5,
             aspect: Some(edit_core::Aspect::ThreeTwo),
             aspect_flipped: false,
+            quarter_turns: 0,
         }
     }
 

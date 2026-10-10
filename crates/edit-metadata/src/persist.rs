@@ -198,6 +198,7 @@ mod tests {
             rotation_degrees: 4.5,
             aspect: Some(edit_core::Aspect::FourThree),
             aspect_flipped: false,
+            quarter_turns: 0,
         })
         .unwrap();
 

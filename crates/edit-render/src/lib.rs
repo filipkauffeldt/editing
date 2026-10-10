@@ -653,10 +653,19 @@ impl RetouchStage for NoopRetouch {
 /// The frame is not pulled inside the rotated image here, because the crop
 /// canvas renders the whole straightened frame on purpose. Callers editing a
 /// frame constrain it with [`edit_core::crop::constrain_rect`]. The aspect
-/// lock is app state; the engine does not read it.
+/// lock is app state; the engine does not read it. The frame is in the image
+/// after the quarter turns, so those land in `orientation` (see the body).
 fn apply_crop(develop: &mut DevelopSettings, crop: Option<&Crop>) {
-    let geometry = &mut develop.crop.geometry;
     develop.crop.aspect = None;
+    // The quarter turns are the engine's own user orientation, applied to the
+    // oriented image before the straighten angle and the frame.
+    develop.orientation = match crop.map_or(0, |crop| crop.quarter_turns % 4) {
+        1 => lightcraft_geom::Orientation::Rotate90,
+        2 => lightcraft_geom::Orientation::Rotate180,
+        3 => lightcraft_geom::Orientation::Rotate270,
+        _ => lightcraft_geom::Orientation::Normal,
+    };
+    let geometry = &mut develop.crop.geometry;
     let Some(crop) = crop else {
         *geometry = Default::default();
         return;
@@ -684,6 +693,12 @@ fn apply_crop(develop: &mut DevelopSettings, crop: Option<&Crop>) {
 /// the source's own size.
 fn crop_box(develop: &DevelopSettings, width: usize, height: usize) -> (usize, usize) {
     let rect = develop.crop.geometry.rect;
+    // A quarter turn swaps the edges the frame is a share of.
+    let (width, height) = if develop.orientation.swaps_axes() {
+        (height, width)
+    } else {
+        (width, height)
+    };
     let px = |span: f64, edge: usize| ((span * edge as f64).round() as usize).max(1);
     (px(rect.x1 - rect.x0, width), px(rect.y1 - rect.y0, height))
 }
@@ -849,6 +864,45 @@ mod tests {
     }
 
     #[test]
+    fn quarter_turns_rotate_the_picture_clockwise_and_swap_its_size() {
+        // A bright block in the top-left corner of a 40x30 picture.
+        let dir = scratch("crop-quarter");
+        let path = dir.join("corner.png");
+        let img = image::RgbImage::from_fn(40, 30, |x, y| {
+            image::Rgb([if x < 10 && y < 8 { 250 } else { 20 }; 3])
+        });
+        write_png(&path, &img);
+        let turned = |quarter_turns: u8, rect: edit_core::Rect| {
+            render_full(
+                &path,
+                Some(&Crop {
+                    rect,
+                    quarter_turns,
+                    ..Crop::default()
+                }),
+            )
+        };
+        let full = edit_core::Rect::full();
+        // One clockwise turn: portrait, block moves to the top-right.
+        let one = turned(1, full);
+        assert_eq!((one.width, one.height), (30, 40));
+        assert!(bright(&one, 27, 3) > 200.0 && bright(&one, 3, 3) < 60.0);
+        // Two: block in the bottom-right. Three: bottom-left.
+        let two = turned(2, full);
+        assert_eq!((two.width, two.height), (40, 30));
+        assert!(bright(&two, 37, 27) > 200.0 && bright(&two, 3, 3) < 60.0);
+        let three = turned(3, full);
+        assert_eq!((three.width, three.height), (30, 40));
+        assert!(bright(&three, 3, 37) > 200.0 && bright(&three, 27, 3) < 60.0);
+        // A frame is a share of the turned picture: the top-right quarter of
+        // the portrait result holds the block and is 15 x 20 pixels.
+        let corner = turned(1, edit_core::Rect::new(0.5, 0.0, 0.5, 0.5));
+        assert_eq!((corner.width, corner.height), (15, 20));
+        assert!(bright(&corner, 12, 3) > 200.0);
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
     fn no_crop_means_no_crop_even_when_the_develop_settings_carry_one() {
         let dir = scratch("crop-none");
         let path = dir.join("plain.png");
@@ -894,6 +948,7 @@ mod tests {
                     rotation_degrees: angle,
                     aspect: None,
                     aspect_flipped: false,
+                    quarter_turns: 0,
                 }),
             )
         };
@@ -930,6 +985,7 @@ mod tests {
             rotation_degrees: 12.0,
             aspect: None,
             aspect_flipped: false,
+            quarter_turns: 0,
         };
         let corners =
             edit_core::crop::source_corners(crop.rect, crop.rotation_degrees, (w as f64, h as f64));
@@ -986,6 +1042,7 @@ mod tests {
             rotation_degrees: 7.0,
             aspect: None,
             aspect_flipped: false,
+            quarter_turns: 0,
         };
         let engine = render_full(&path, Some(&crop));
         assert_eq!((engine.width, engine.height), (320, 200));
@@ -1025,6 +1082,7 @@ mod tests {
             rotation_degrees: 7.0,
             aspect: Some(edit_core::Aspect::ThreeTwo),
             aspect_flipped: false,
+            quarter_turns: 0,
         };
         let service = RenderService::new();
         let cancel = CancelToken::new();
