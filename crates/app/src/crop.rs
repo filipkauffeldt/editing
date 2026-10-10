@@ -86,7 +86,8 @@ pub enum Grab {
     Handle(Handle),
     /// The frame body: slides the frame.
     Move,
-    /// Outside a frame that is smaller than the photo: turns the photo.
+    /// Outside the frame, including the margin around a whole-photo frame:
+    /// turns the photo.
     Rotate,
     /// On an uncropped photo: draws a new frame from the press point.
     Draw,
@@ -103,8 +104,8 @@ pub fn is_full(rect: Rect) -> bool {
 /// What a press at `at` (normalized) picks up, for an image painted `view`
 /// pixels across. Corners win over edges, edges over the body; the grab band
 /// shrinks on a small frame so the body stays reachable. Inside the frame it
-/// is the body, or a new frame when the frame is the whole photo; outside it
-/// turns the photo, which a whole-photo frame has no room for.
+/// is the body, or a new frame when the frame is the whole photo; outside it,
+/// in the margin around the photo or beside a smaller frame, turns the photo.
 pub fn hit_test(rect: Rect, at: (f32, f32), view: (f32, f32)) -> Option<Grab> {
     if view.0 <= 0.0 || view.1 <= 0.0 {
         return None;
@@ -133,7 +134,8 @@ pub fn hit_test(rect: Rect, at: (f32, f32), view: (f32, f32)) -> Option<Grab> {
                 (true, true) => Some(Grab::Draw),
                 (true, false) => Some(Grab::Move),
                 (false, false) => Some(Grab::Rotate),
-                (false, true) => None,
+                // Outside a whole-photo frame is the margin around the photo.
+                (false, true) => Some(Grab::Rotate),
             };
         }
     };
@@ -188,8 +190,12 @@ enum Drag {
         start: Rect,
         from: (f32, f32),
     },
-    /// Turning the photo from the angle it had at the press.
-    Rotate { start_angle: f32, from: (f32, f32) },
+    /// Turning the photo from the angle and frame it had at the press.
+    Rotate {
+        start_angle: f32,
+        start_rect: Rect,
+        from: (f32, f32),
+    },
     /// Drawing a new frame out from the press point.
     Draw { anchor: (f32, f32) },
 }
@@ -330,6 +336,7 @@ impl CropSession {
         self.drag = Some(match grab {
             Grab::Rotate => Drag::Rotate {
                 start_angle: self.draft.rotation_degrees,
+                start_rect: self.draft.rect,
                 from: at,
             },
             Grab::Draw => Drag::Draw {
@@ -353,10 +360,21 @@ impl CropSession {
         };
         let ratio = self.draft.aspect_ratio(source);
         match *drag {
-            Drag::Rotate { start_angle, from } => {
-                let rect = self.draft.rect;
-                let centre = (rect.x + rect.w / 2.0, rect.y + rect.h / 2.0);
-                self.set_angle(start_angle + angle_delta(centre, from, at, source));
+            Drag::Rotate {
+                start_angle,
+                start_rect,
+                from,
+            } => {
+                let centre = (
+                    start_rect.x + start_rect.w / 2.0,
+                    start_rect.y + start_rect.h / 2.0,
+                );
+                let angle = (start_angle + angle_delta(centre, from, at, source))
+                    .clamp(-MAX_ANGLE, MAX_ANGLE);
+                self.draft.rotation_degrees = angle;
+                // The frame is the press-time frame fitted to the turned
+                // photo, so turning back lets it grow back to its size.
+                self.draft.rect = constrain_rect(start_rect, angle, source);
             }
             Drag::Draw { anchor } => {
                 let drawn = draw_rect(anchor, at, ratio, source);
@@ -826,15 +844,16 @@ mod tests {
     }
 
     #[test]
-    fn a_whole_photo_frame_draws_inside_and_has_no_outside() {
+    fn a_whole_photo_frame_draws_inside_and_turns_from_the_margin() {
         let full = Rect::full();
         let hit = |x: f32, y: f32| hit_test(full, (x, y), VIEW);
         assert_eq!(hit(0.5, 0.5), Some(Grab::Draw));
         assert_eq!(hit(0.3, 0.7), Some(Grab::Draw));
-        // The edges still resize, and a press past the photo does nothing.
+        // The edges still resize, and a press in the margin turns the photo.
         assert_eq!(hit(1.0, 0.5), Some(Grab::Handle(Handle::Right)));
         assert_eq!(hit(0.0, 0.0), Some(Grab::Handle(Handle::TopLeft)));
-        assert_eq!(hit(1.4, 0.5), None);
+        assert_eq!(hit(1.4, 0.5), Some(Grab::Rotate));
+        assert_eq!(hit(-0.2, 1.3), Some(Grab::Rotate));
         assert!(is_full(full));
         assert!(!is_full(Rect::new(0.0, 0.0, 0.98, 1.0)));
     }
@@ -1118,6 +1137,78 @@ mod tests {
         // The canvas is back to the photo's own size, so a frame fits again.
         s.set_aspect(Some(Aspect::Original));
         assert!(near(rect_ratio(s.draft().rect, SOURCE), 1.5, 1e-3));
+    }
+
+    #[test]
+    fn a_press_in_the_margin_of_a_whole_photo_straightens_it() {
+        for turns in 0..4u8 {
+            for aspect in [
+                Aspect::Original,
+                Aspect::Square,
+                Aspect::ThreeTwo,
+                Aspect::SixteenNine,
+            ] {
+                let mut s = session(Rect::full());
+                s.set_aspect(Some(aspect));
+                for _ in 0..turns {
+                    s.rotate(true);
+                }
+                let size = edit_core::crop::turned_size(SOURCE, turns);
+                let before = s.draft().rect;
+                // Left of the photo, in the margin.
+                assert!(s.begin_drag((-0.15, 0.5), VIEW), "{turns} {aspect:?}");
+                assert!(s.is_rotating());
+                for target in [(-0.15, 0.6), (-0.15, 0.7), (-0.15, 0.4)] {
+                    s.drag_to(target);
+                    let (angle, r) = (s.draft().rotation_degrees, s.draft().rect);
+                    assert!(angle != 0.0);
+                    assert!(rect_fits(r, angle, size), "{turns} {aspect:?} {angle}");
+                    // Same shape as before, and as large as it can be: a bit
+                    // bigger would stick out of the turned photo.
+                    assert!(
+                        near(rect_ratio(r, size), rect_ratio(before, size), 2e-3),
+                        "{turns} {aspect:?}: {r:?}"
+                    );
+                    let c = (r.x + r.w / 2.0, r.y + r.h / 2.0);
+                    let bigger =
+                        Rect::new(c.0 - r.w * 0.505, c.1 - r.h * 0.505, r.w * 1.01, r.h * 1.01);
+                    assert!(!rect_fits(bigger, angle, size), "{turns} {aspect:?}: {r:?}");
+                }
+                s.end_drag();
+                assert!(s.result().is_some());
+                // Reset puts the angle and frame back.
+                s.reset();
+                assert_eq!(s.draft().rotation_degrees, 0.0);
+                assert_eq!(s.result(), None);
+            }
+        }
+    }
+
+    #[test]
+    fn turning_back_lets_the_frame_grow_again() {
+        let mut s = session(Rect::full());
+        assert!(s.begin_drag((1.2, 0.5), VIEW));
+        s.drag_to((1.2, 0.7));
+        let shrunk = s.draft().rect;
+        assert!(shrunk.w < 0.95);
+        s.drag_to((1.2, 0.5));
+        let back = s.draft().rect;
+        assert!(
+            near(back.w as f64, 1.0, 1e-3) && near(back.h as f64, 1.0, 1e-3),
+            "{back:?}"
+        );
+        assert_eq!(s.draft().rotation_degrees, 0.0);
+    }
+
+    #[test]
+    fn a_margin_press_beside_a_smaller_frame_keeps_it_inside() {
+        let mut s = session(Rect::new(0.3, 0.3, 0.4, 0.4));
+        assert!(s.begin_drag((1.3, 0.5), VIEW));
+        s.drag_to((1.3, 0.8));
+        let (angle, r) = (s.draft().rotation_degrees, s.draft().rect);
+        assert!(angle > 3.0);
+        assert!(rect_fits(r, angle, SOURCE));
+        assert!(r.w <= 0.4 + 1e-6);
     }
 
     #[test]

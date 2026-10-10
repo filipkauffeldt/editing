@@ -483,3 +483,48 @@ fn a_thumbnail_follows_the_crop_once_it_is_committed(cx: &mut TestAppContext) {
         .unwrap();
     assert!(cut.0 > cut.1, "{cut:?}");
 }
+
+#[gpui_kit::test]
+fn dragging_in_the_margin_straightens_an_uncropped_photo(cx: &mut TestAppContext) {
+    let rig = rig(cx);
+    enter_crop(cx, &rig, true);
+    let full = draft(cx, &rig);
+    assert_eq!(full.rect, edit_core::Rect::full());
+    let source = (600.0, 400.0);
+
+    // Press above the photo and pull right: the photo turns clockwise and the
+    // frame shrinks to the largest one of the same shape that fits.
+    drag(cx, &rig, (0.3, -0.03), (0.7, -0.03));
+    let turned = draft(cx, &rig);
+    assert!(turned.rotation_degrees > 3.0, "{turned:?}");
+    assert!(
+        rect_fits(turned.rect, turned.rotation_degrees, source),
+        "{turned:?}"
+    );
+    assert!(turned.rect.w < 0.98 && turned.rect.h < 0.98, "{turned:?}");
+    assert!(
+        (rect_ratio(turned.rect, source) - 1.5).abs() < 0.01,
+        "{turned:?}"
+    );
+
+    // The slider row follows, and applying saves the straightened crop.
+    cx.simulate_keystrokes(rig.handle, "enter");
+    settle(cx, &rig, |b| !b.crop_active());
+    let row = rig
+        .catalog
+        .get_edit(rig.item_id)
+        .unwrap()
+        .expect("an edit row");
+    let stored: Crop = serde_json::from_str(&row.crop_json.expect("a crop")).unwrap();
+    assert!((stored.rotation_degrees - turned.rotation_degrees).abs() < 1e-3);
+
+    // Escape cancels a draft that was only straightened.
+    enter_crop(cx, &rig, false);
+    drag(cx, &rig, (0.7, -0.03), (0.3, -0.03));
+    assert!(draft(cx, &rig).rotation_degrees < -3.0);
+    cx.simulate_keystrokes(rig.handle, "escape");
+    settle(cx, &rig, |b| !b.crop_active());
+    let row = rig.catalog.get_edit(rig.item_id).unwrap().unwrap();
+    let kept: Crop = serde_json::from_str(&row.crop_json.unwrap()).unwrap();
+    assert!((kept.rotation_degrees - stored.rotation_degrees).abs() < 1e-3);
+}
