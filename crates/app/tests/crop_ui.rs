@@ -353,3 +353,178 @@ fn dragging_outside_the_frame_turns_the_photo_and_x_flips_the_frame(cx: &mut Tes
         "{after:?}"
     );
 }
+
+/// The painted canvas's width over height.
+fn canvas_ratio(cx: &mut TestAppContext, rig: &Rig) -> f32 {
+    let (_, _, w, h) = cx
+        .update(|cx| rig.browser.read(cx).canvas_image_frame())
+        .expect("the image has painted");
+    w / h
+}
+
+fn click_button(cx: &mut TestAppContext, rig: &Rig, id: &'static str) {
+    cx.update_window(rig.handle, |_, window, cx| {
+        window.render_frame(cx);
+        window.click(id, cx);
+    })
+    .unwrap();
+    settle(cx, rig, |_| true);
+}
+
+#[gpui_kit::test]
+fn the_rotate_keys_turn_the_canvas_and_the_frame(cx: &mut TestAppContext) {
+    let rig = rig(cx);
+    enter_crop(cx, &rig, true);
+    assert!(canvas_ratio(cx, &rig) > 1.4, "starts landscape");
+
+    cx.simulate_keystrokes(rig.handle, "r");
+    settle(cx, &rig, |_| true);
+    let right = draft(cx, &rig);
+    assert_eq!(right.quarter_turns, 1);
+    assert!(canvas_ratio(cx, &rig) < 0.7, "the canvas is portrait now");
+    // Original follows the turned photo: the whole frame is still the photo.
+    assert_eq!(right.aspect, Some(Aspect::Original));
+    assert!(
+        (rect_ratio(right.rect, (400.0, 600.0)) - 2.0 / 3.0).abs() < 0.01,
+        "{right:?}"
+    );
+
+    cx.simulate_keystrokes(rig.handle, "shift-r");
+    cx.simulate_keystrokes(rig.handle, "shift-r");
+    settle(cx, &rig, |_| true);
+    let left = draft(cx, &rig);
+    assert_eq!(left.quarter_turns, 3);
+    assert!(canvas_ratio(cx, &rig) < 0.7);
+
+    cx.simulate_keystrokes(rig.handle, "r");
+    settle(cx, &rig, |_| true);
+    assert_eq!(draft(cx, &rig).quarter_turns, 0);
+    assert!(canvas_ratio(cx, &rig) > 1.4, "back to landscape");
+}
+
+#[gpui_kit::test]
+fn the_rotate_buttons_and_reset_work_and_the_turn_is_saved(cx: &mut TestAppContext) {
+    let rig = rig(cx);
+    enter_crop(cx, &rig, true);
+
+    click_button(cx, &rig, "crop-rotate-right");
+    assert_eq!(draft(cx, &rig).quarter_turns, 1);
+    // A straighten after a turn keeps the frame inside the turned photo.
+    cx.update(|cx| rig.browser.update(cx, |b, cx| b.straighten_to(5.0, cx)));
+    settle(cx, &rig, |_| true);
+    let straightened = draft(cx, &rig);
+    assert!(
+        rect_fits(straightened.rect, 5.0, (400.0, 600.0)),
+        "{straightened:?}"
+    );
+
+    click_button(cx, &rig, "crop-rotate-left");
+    click_button(cx, &rig, "crop-rotate-left");
+    assert_eq!(draft(cx, &rig).quarter_turns, 3);
+    click_button(cx, &rig, "crop-reset");
+    let reset = draft(cx, &rig);
+    assert_eq!(reset.quarter_turns, 0);
+    assert_eq!(reset.rotation_degrees, 0.0);
+    assert!(
+        canvas_ratio(cx, &rig) > 1.4,
+        "reset restores the landscape canvas"
+    );
+
+    // Turn, apply, and the catalog row carries the turn.
+    click_button(cx, &rig, "crop-rotate-right");
+    cx.simulate_keystrokes(rig.handle, "enter");
+    settle(cx, &rig, |b| !b.crop_active());
+    let row = rig
+        .catalog
+        .get_edit(rig.item_id)
+        .unwrap()
+        .expect("an edit row");
+    let stored: Crop = serde_json::from_str(&row.crop_json.expect("a crop")).unwrap();
+    assert_eq!(stored.quarter_turns, 1);
+}
+
+#[gpui_kit::test]
+fn a_thumbnail_follows_the_crop_once_it_is_committed(cx: &mut TestAppContext) {
+    let rig = rig(cx);
+    cx.simulate_keystrokes(rig.handle, "g");
+    settle(cx, &rig, |b| b.thumb_size(b.visible()[0].item_id).is_some());
+    let landscape = cx
+        .update(|cx| rig.browser.read(cx).thumb_size(rig.item_id))
+        .expect("a thumbnail");
+    assert!(landscape.0 > landscape.1, "{landscape:?}");
+
+    enter_crop(cx, &rig, false);
+    cx.simulate_keystrokes(rig.handle, "r");
+    settle(cx, &rig, |_| true);
+    // Only a committed crop reaches the thumbnail, not the draft.
+    let during = cx.update(|cx| rig.browser.read(cx).thumb_size(rig.item_id));
+    assert_eq!(during, Some(landscape));
+
+    cx.simulate_keystrokes(rig.handle, "enter");
+    settle(cx, &rig, |b| {
+        b.thumb_size(rig.item_id).is_some_and(|(w, h)| h > w)
+    });
+    let portrait = cx
+        .update(|cx| rig.browser.read(cx).thumb_size(rig.item_id))
+        .unwrap();
+    assert!(portrait.1 > portrait.0, "{portrait:?}");
+
+    // Cropping the turned photo to its top half changes it again.
+    enter_crop(cx, &rig, false);
+    cx.update(|cx| rig.browser.update(cx, |b, cx| b.set_crop_aspect(None, cx)));
+    drag(cx, &rig, (0.995, 0.995), (0.995, 0.5));
+    cx.simulate_keystrokes(rig.handle, "enter");
+    settle(cx, &rig, |b| {
+        b.thumb_size(rig.item_id)
+            .is_some_and(|(w, h)| (h as f32 / w as f32) < 1.0)
+    });
+    let cut = cx
+        .update(|cx| rig.browser.read(cx).thumb_size(rig.item_id))
+        .unwrap();
+    assert!(cut.0 > cut.1, "{cut:?}");
+}
+
+#[gpui_kit::test]
+fn dragging_in_the_margin_straightens_an_uncropped_photo(cx: &mut TestAppContext) {
+    let rig = rig(cx);
+    enter_crop(cx, &rig, true);
+    let full = draft(cx, &rig);
+    assert_eq!(full.rect, edit_core::Rect::full());
+    let source = (600.0, 400.0);
+
+    // Press above the photo and pull right: the photo turns clockwise and the
+    // frame shrinks to the largest one of the same shape that fits.
+    drag(cx, &rig, (0.3, -0.03), (0.7, -0.03));
+    let turned = draft(cx, &rig);
+    assert!(turned.rotation_degrees > 3.0, "{turned:?}");
+    assert!(
+        rect_fits(turned.rect, turned.rotation_degrees, source),
+        "{turned:?}"
+    );
+    assert!(turned.rect.w < 0.98 && turned.rect.h < 0.98, "{turned:?}");
+    assert!(
+        (rect_ratio(turned.rect, source) - 1.5).abs() < 0.01,
+        "{turned:?}"
+    );
+
+    // The slider row follows, and applying saves the straightened crop.
+    cx.simulate_keystrokes(rig.handle, "enter");
+    settle(cx, &rig, |b| !b.crop_active());
+    let row = rig
+        .catalog
+        .get_edit(rig.item_id)
+        .unwrap()
+        .expect("an edit row");
+    let stored: Crop = serde_json::from_str(&row.crop_json.expect("a crop")).unwrap();
+    assert!((stored.rotation_degrees - turned.rotation_degrees).abs() < 1e-3);
+
+    // Escape cancels a draft that was only straightened.
+    enter_crop(cx, &rig, false);
+    drag(cx, &rig, (0.7, -0.03), (0.3, -0.03));
+    assert!(draft(cx, &rig).rotation_degrees < -3.0);
+    cx.simulate_keystrokes(rig.handle, "escape");
+    settle(cx, &rig, |b| !b.crop_active());
+    let row = rig.catalog.get_edit(rig.item_id).unwrap().unwrap();
+    let kept: Crop = serde_json::from_str(&row.crop_json.unwrap()).unwrap();
+    assert!((kept.rotation_degrees - stored.rotation_degrees).abs() < 1e-3);
+}

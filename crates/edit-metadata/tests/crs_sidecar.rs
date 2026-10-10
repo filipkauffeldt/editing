@@ -37,6 +37,7 @@ fn demo_crop() -> Crop {
         rotation_degrees: 0.0,
         aspect: None,
         aspect_flipped: false,
+        quarter_turns: 0,
     }
 }
 

@@ -329,6 +329,7 @@ mod tests {
                 rotation_degrees: 1.5,
                 aspect: None,
                 aspect_flipped: false,
+                quarter_turns: 0,
             }),
         }
     }

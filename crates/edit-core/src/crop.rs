@@ -10,6 +10,11 @@ use crate::geometry::Rect;
 /// the same size, and [`Crop::rect`] is the crop frame in that rotated
 /// canvas, normalized to `w × h`. The frame stays fixed on screen while the
 /// image turns under it, and it must lie inside the rotated image.
+///
+/// [`Crop::quarter_turns`] comes first: the oriented image is turned by whole
+/// clockwise quarter turns, and everything else (the straighten angle, the
+/// frame, the aspect lock) lives in that turned image, whose width and height
+/// swap on an odd count.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct Crop {
     /// Normalized crop frame in the straightened canvas. At angle 0 this is
@@ -25,6 +30,10 @@ pub struct Crop {
     /// photo's other orientation. Ignored without a lock and for 1:1.
     #[serde(default)]
     pub aspect_flipped: bool,
+    /// Whole clockwise quarter turns applied to the oriented image before
+    /// anything else, 0 to 3. Rows saved before the rotate step load as 0.
+    #[serde(default)]
+    pub quarter_turns: u8,
 }
 
 impl Default for Crop {
@@ -34,6 +43,7 @@ impl Default for Crop {
             rotation_degrees: 0.0,
             aspect: None,
             aspect_flipped: false,
+            quarter_turns: 0,
         }
     }
 }
@@ -90,6 +100,26 @@ pub const MIN_EDGE: f32 = 0.02;
 
 /// Largest straighten angle in degrees, matching the develop engine.
 pub const MAX_ANGLE: f32 = 45.0;
+
+/// `rect` after the whole image turns a quarter clockwise (or back), in the
+/// normalized coordinates of the turned image. The straighten angle is
+/// unchanged by a quarter turn, since both turn about the image centre.
+pub fn turn_rect(rect: Rect, clockwise: bool) -> Rect {
+    if clockwise {
+        Rect::new(1.0 - rect.y - rect.h, rect.x, rect.h, rect.w)
+    } else {
+        Rect::new(rect.y, 1.0 - rect.x - rect.w, rect.h, rect.w)
+    }
+}
+
+/// The pixel size of an image of `size` after `quarter_turns`.
+pub fn turned_size(size: (f64, f64), quarter_turns: u8) -> (f64, f64) {
+    if !quarter_turns.is_multiple_of(2) {
+        (size.1, size.0)
+    } else {
+        size
+    }
+}
 
 /// Pixels of slack when testing whether a corner lies inside the image, so
 /// f32 rects at a few thousand pixels do not flicker around an exact fit.
@@ -249,7 +279,16 @@ impl Crop {
 
     /// Whether the crop changes nothing.
     pub fn is_identity(&self) -> bool {
-        self.rect == Rect::full() && self.rotation_degrees == 0.0
+        self.rect == Rect::full()
+            && self.rotation_degrees == 0.0
+            && self.quarter_turns.is_multiple_of(4)
+    }
+
+    /// The frame as it lies in the image before the quarter turns, for
+    /// formats that have no key for them. The straighten angle is the same
+    /// either side of a quarter turn.
+    pub fn unturned_rect(&self) -> Rect {
+        (0..self.quarter_turns % 4).fold(self.rect, |rect, _| turn_rect(rect, false))
     }
 
     /// The crop with its frame pulled inside the rotated `source` image.
@@ -422,6 +461,7 @@ mod tests {
             rotation_degrees: -3.25,
             aspect: Some(Aspect::FourThree),
             aspect_flipped: true,
+            quarter_turns: 3,
         };
         let json = serde_json::to_string(&crop).unwrap();
         assert_eq!(serde_json::from_str::<Crop>(&json).unwrap(), crop);
@@ -450,5 +490,72 @@ mod tests {
         let crop: Crop = serde_json::from_str(json).unwrap();
         assert!(!crop.aspect_flipped);
         assert_eq!(crop.aspect, Some(Aspect::ThreeTwo));
+        assert_eq!(crop.quarter_turns, 0, "rows from before rotate load as 0");
+    }
+
+    #[test]
+    fn a_crop_saved_with_quarter_turns_keeps_them() {
+        let json = r#"{"rect":{"x":0,"y":0,"w":1,"h":1},"rotation_degrees":0.0,"aspect":null,"quarter_turns":1}"#;
+        let crop: Crop = serde_json::from_str(json).unwrap();
+        assert_eq!(crop.quarter_turns, 1);
+        assert!(!crop.is_identity(), "a bare turn is still an edit");
+    }
+
+    #[test]
+    fn a_quarter_turn_moves_the_frame_with_the_picture() {
+        // A frame in the top-left corner of a landscape image sits in the
+        // top-right of the portrait one after a clockwise turn.
+        let rect = Rect::new(0.0, 0.0, 0.5, 0.25);
+        let cw = turn_rect(rect, true);
+        assert_eq!(cw, Rect::new(0.75, 0.0, 0.25, 0.5));
+        assert_eq!(turn_rect(rect, false), Rect::new(0.0, 0.5, 0.25, 0.5));
+        // Four turns come home, and the two directions undo each other.
+        let start = Rect::new(0.1, 0.2, 0.3, 0.4);
+        let round = (0..4).fold(start, |r, _| turn_rect(r, true));
+        assert!(near(round.x as f64, 0.1, 1e-6) && near(round.h as f64, 0.4, 1e-6));
+        let back = turn_rect(turn_rect(start, true), false);
+        assert!(near(back.x as f64, 0.1, 1e-6) && near(back.w as f64, 0.3, 1e-6));
+    }
+
+    #[test]
+    fn a_turned_frame_keeps_its_pixels_and_swaps_its_ratio() {
+        let source = (6000.0, 4000.0);
+        let rect = Rect::new(0.1, 0.2, 0.5, 0.4);
+        for clockwise in [true, false] {
+            let turned = turn_rect(rect, clockwise);
+            let size = turned_size(source, 1);
+            assert_eq!(size, (4000.0, 6000.0));
+            assert!(near(
+                rect_ratio(turned, size),
+                1.0 / rect_ratio(rect, source),
+                1e-5
+            ));
+            assert!(rect_fits(turned, 0.0, size));
+        }
+        assert_eq!(turned_size(source, 2), source);
+        assert_eq!(turned_size(source, 3), (4000.0, 6000.0));
+    }
+
+    #[test]
+    fn the_unturned_frame_fits_the_straightened_original() {
+        // A turned frame that fits stays a fitting frame once the turn is
+        // taken back out, at the same straighten angle.
+        let source = (600.0, 400.0);
+        let turned_size = (400.0, 600.0);
+        let rect = Rect::new(0.3, 0.3, 0.3, 0.2);
+        let angle = 7.0;
+        let turned = turn_rect(rect, true);
+        assert!(rect_fits(turned, angle, turned_size));
+        let crop = Crop {
+            rect: turned,
+            rotation_degrees: angle,
+            quarter_turns: 1,
+            ..Crop::default()
+        };
+        let before = crop.unturned_rect();
+        assert!(near(before.x as f64, rect.x as f64, 1e-6));
+        assert!(near(before.y as f64, rect.y as f64, 1e-6));
+        assert!(near(before.w as f64, rect.w as f64, 1e-6));
+        assert!(rect_fits(before, angle, source));
     }
 }

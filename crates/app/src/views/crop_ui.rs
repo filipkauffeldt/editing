@@ -18,17 +18,17 @@ use std::sync::Arc;
 use edit_core::{Aspect, Rect, RenderSize};
 use gpui_kit::component::button::{Button, ButtonVariants as _};
 use gpui_kit::component::label::Label;
-use gpui_kit::component::slider::{
-    Slider as StraightenSlider, SliderEvent, SliderState, SliderValue,
-};
+use gpui_kit::component::slider::{SliderEvent, SliderState, SliderValue};
 use gpui_kit::component::{
-    ActiveTheme as _, Disableable as _, IconName, Selectable as _, Sizable as _, h_flex, v_flex,
+    ActiveTheme as _, Disableable as _, Icon, Selectable as _, Sizable as _, h_flex, v_flex,
 };
 use gpui_kit::*;
 use image::RgbaImage;
 
 use super::{Browser, Mode, PROXY_DRAG_LONG_EDGE, PROXY_RELEASE_LONG_EDGE};
+use crate::assets::{ROTATE_LEFT_ICON, ROTATE_RIGHT_ICON};
 use crate::crop::{CropSession, Grab, Handle};
+use crate::slider_row::SliderRow;
 
 /// Where the canvas last painted the image, in window pixels. The pointer
 /// maps into the straightened canvas through it.
@@ -186,6 +186,8 @@ impl Browser {
         }
         self.want_smart_preview();
         self.crop = Some(CropSession::enter(self.develop.crop()));
+        self.crop_render_turns = self.develop.crop().map_or(0, |crop| crop.quarter_turns % 4);
+        self.crop_base_turns = self.crop_render_turns;
         self.straightened_image = false;
         self.crop_base = None;
         self.crop_base_image = None;
@@ -240,11 +242,18 @@ impl Browser {
         }
     }
 
-    /// The crop and framing the next render uses: the whole uncropped photo
-    /// in crop mode, the committed crop otherwise.
+    /// The crop and framing the next render uses: the whole photo in crop
+    /// mode (carrying only the quarter turns it entered with, so the canvas is
+    /// the turned photo), the committed crop otherwise.
     pub(super) fn render_crop(&self) -> (Option<edit_core::Crop>, bool) {
         match &self.crop {
-            Some(_) => (None, true),
+            Some(_) => {
+                let turned = (self.crop_render_turns != 0).then(|| edit_core::Crop {
+                    quarter_turns: self.crop_render_turns,
+                    ..edit_core::Crop::default()
+                });
+                (turned, true)
+            }
             None => (self.develop.crop().cloned(), false),
         }
     }
@@ -259,10 +268,28 @@ impl Browser {
     /// The uncropped render landed: it becomes the crop canvas. A small copy
     /// for live straightening is made off the UI thread.
     pub(super) fn set_crop_base(&mut self, frame: edit_core::Frame, cx: &mut Context<Self>) {
-        let (width, height) = (frame.width, frame.height);
-        let Some(base) = RgbaImage::from_raw(width, height, frame.pixels) else {
+        let Some(base) = RgbaImage::from_raw(frame.width, frame.height, frame.pixels) else {
             return;
         };
+        self.crop_base_turns = self.crop_render_turns;
+        self.install_base(base, cx);
+    }
+
+    /// Make `base` the canvas image, turned from the quarter turns it has to
+    /// the draft's, then refresh everything derived from it.
+    fn install_base(&mut self, base: RgbaImage, cx: &mut Context<Self>) {
+        let want = self
+            .crop
+            .as_ref()
+            .map_or(0, |s| s.draft().quarter_turns % 4);
+        let base = match (want + 4 - self.crop_base_turns % 4) % 4 {
+            1 => image::imageops::rotate90(&base),
+            2 => image::imageops::rotate180(&base),
+            3 => image::imageops::rotate270(&base),
+            _ => base,
+        };
+        self.crop_base_turns = want;
+        let (width, height) = base.dimensions();
         let base = Arc::new(base);
         if let Some(session) = self.crop.as_mut() {
             session.set_source(width, height);
@@ -292,6 +319,27 @@ impl Browser {
             .ok();
         })
         .detach();
+    }
+
+    /// `R` and `Shift+R`: turn the picture a quarter right or left, frame and all.
+    /// Waits for the canvas, which the turn is applied to.
+    pub fn rotate_crop(&mut self, clockwise: bool, cx: &mut Context<Self>) {
+        if !self.crop_ready() {
+            return;
+        }
+        let Some(session) = self.crop.as_mut() else {
+            return;
+        };
+        session.rotate(clockwise);
+        self.realign_base(cx);
+    }
+
+    /// Turn the canvas image to the draft's quarter turns.
+    fn realign_base(&mut self, cx: &mut Context<Self>) {
+        if let Some(base) = self.crop_base.clone() {
+            self.install_base((*base).clone(), cx);
+        }
+        cx.notify();
     }
 
     /// Put the photo turned to `degrees` on the canvas. At zero it is the
@@ -506,6 +554,7 @@ impl Browser {
         };
         session.reset();
         self.straighten_dragging = false;
+        self.realign_base(cx);
         self.show_turned(0.0, false, cx);
         cx.notify();
     }
@@ -537,6 +586,7 @@ impl Browser {
             .as_ref()
             .map(|s| (s.draft().aspect, s.draft().rotation_degrees))
             .unwrap_or((None, 0.0));
+        let ready = self.crop_ready();
         let theme = cx.theme();
         let (bg, fg, border, muted) = (
             theme.sidebar,
@@ -596,54 +646,69 @@ impl Browser {
                             .justify_between()
                             .child(Label::new("Aspect ratio").text_xs().text_color(muted))
                             .child(
-                                Button::new("crop-flip")
-                                    .ghost()
-                                    .xsmall()
-                                    .label("Flip")
-                                    .tooltip("Landscape or portrait (X)")
-                                    .on_click(cx.listener(|this, _: &ClickEvent, _, cx| {
-                                        this.flip_crop_orientation(cx);
-                                    })),
-                            ),
-                    )
-                    .children(preset_rows),
-            )
-            .child(
-                v_flex()
-                    .gap_1()
-                    .child(
-                        h_flex()
-                            .w_full()
-                            .items_center()
-                            .justify_between()
-                            .child(Label::new("Straighten").text_xs())
-                            .child(
                                 h_flex()
                                     .items_center()
                                     .gap_1()
                                     .child(
-                                        Label::new(format!("{angle:+.1}°"))
-                                            .text_xs()
-                                            .text_color(muted),
-                                    )
-                                    .child(
-                                        Button::new("crop-straighten-reset")
+                                        Button::new("crop-rotate-left")
                                             .ghost()
                                             .xsmall()
-                                            .icon(IconName::Undo2)
-                                            .tooltip("Reset straighten")
-                                            .disabled(angle == 0.0)
+                                            .icon(Icon::empty().path(ROTATE_LEFT_ICON))
+                                            .tooltip("Rotate left (Shift+R)")
+                                            .disabled(!ready)
                                             .on_click(cx.listener(
                                                 |this, _: &ClickEvent, _, cx| {
-                                                    this.on_straighten(0.0, true, cx);
-                                                    this.straighten_dragging = false;
-                                                    cx.notify();
+                                                    this.rotate_crop(false, cx);
+                                                },
+                                            )),
+                                    )
+                                    .child(
+                                        Button::new("crop-rotate-right")
+                                            .ghost()
+                                            .xsmall()
+                                            .icon(Icon::empty().path(ROTATE_RIGHT_ICON))
+                                            .tooltip("Rotate right (R)")
+                                            .disabled(!ready)
+                                            .on_click(cx.listener(
+                                                |this, _: &ClickEvent, _, cx| {
+                                                    this.rotate_crop(true, cx);
+                                                },
+                                            )),
+                                    )
+                                    .child(
+                                        Button::new("crop-flip")
+                                            .ghost()
+                                            .xsmall()
+                                            .label("Flip")
+                                            .tooltip("Landscape or portrait (X)")
+                                            .on_click(cx.listener(
+                                                |this, _: &ClickEvent, _, cx| {
+                                                    this.flip_crop_orientation(cx);
                                                 },
                                             )),
                                     ),
                             ),
                     )
-                    .child(StraightenSlider::new(&self.straighten)),
+                    .children(preset_rows),
+            )
+            .child(
+                SliderRow::new("crop", "straighten", "Straighten", &self.straighten)
+                    .value(
+                        Label::new(format!("{angle:+.1}°"))
+                            .text_xs()
+                            .text_color(muted),
+                    )
+                    .at_default(angle == 0.0)
+                    .on_reset({
+                        let browser = cx.entity();
+                        move |_, cx| {
+                            browser.update(cx, |this, cx| {
+                                this.on_straighten(0.0, true, cx);
+                                this.straighten_dragging = false;
+                                cx.notify();
+                            });
+                        }
+                    }),
             )
             .child(
                 h_flex()

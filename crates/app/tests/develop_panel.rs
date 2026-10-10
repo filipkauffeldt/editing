@@ -391,3 +391,49 @@ fn the_preset_menu_imports_and_exports_and_escape_closes_it(cx: &mut TestAppCont
     assert!(xml.contains("crs:PresetType=\"Normal\""));
     assert!(xml.contains("crs:Exposure2012=\"+0.50\""));
 }
+
+fn header_gaps(cx: &mut TestAppContext, rig: &Rig) -> Vec<f32> {
+    let keys: Vec<&str> = app::panel::PANEL.iter().map(|s| s.key).collect();
+    let tops: Vec<f32> = cx
+        .update_window(rig.handle, |_, window, cx| {
+            window.render_frame(cx);
+            keys.iter()
+                .map(|key| {
+                    let id: &'static str =
+                        Box::leak(format!("develop-section-reset-{key}").into_boxed_str());
+                    let top: f32 = window.find(id).bounds().top().into();
+                    top
+                })
+                .collect()
+        })
+        .unwrap();
+    tops.windows(2).map(|w| w[1] - w[0]).collect()
+}
+
+fn let_animations_finish(cx: &mut TestAppContext, rig: &Rig) {
+    for _ in 0..60 {
+        settle(cx, rig, |_| true);
+        cx.executor()
+            .advance_clock(std::time::Duration::from_millis(50));
+        std::thread::sleep(std::time::Duration::from_millis(20));
+    }
+}
+
+#[gpui_kit::test]
+fn collapsed_sections_stay_one_row_apart_however_many_are_open(cx: &mut TestAppContext) {
+    let rig = open_single(cx);
+    let panel = cx.update(|cx| rig.browser.read(cx).develop_panel());
+    for open in [&["detail"][..], &[][..]] {
+        cx.update(|cx| panel.update(cx, |p, cx| p.set_open(open, cx)));
+        let_animations_finish(cx, &rig);
+        let gaps = header_gaps(cx, &rig);
+        // A collapsed row is its title line and a separator, about 33 px.
+        // With nothing open the rows used to spread over the whole sidebar.
+        let collapsed: Vec<f32> = gaps.iter().copied().filter(|g| *g < 100.0).collect();
+        assert!(!collapsed.is_empty());
+        assert!(
+            collapsed.iter().all(|g| (30.0..=36.0).contains(g)),
+            "open {open:?}: {gaps:?}"
+        );
+    }
+}

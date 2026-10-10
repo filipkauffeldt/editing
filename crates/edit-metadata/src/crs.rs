@@ -167,7 +167,7 @@ pub fn crop_attributes(crop: Option<&Crop>) -> Vec<(String, String)> {
     let Some(crop) = crop else {
         return vec![("HasCrop".into(), "False".into())];
     };
-    let rect = crop.rect.clamped();
+    let rect = crop.unturned_rect().clamped();
     let cropped = rect != edit_core::Rect::full() || crop.rotation_degrees != 0.0;
     if !cropped {
         return vec![("HasCrop".into(), "False".into())];
@@ -536,6 +536,7 @@ mod tests {
             rotation_degrees: 0.0,
             aspect: None,
             aspect_flipped: false,
+            quarter_turns: 0,
         };
         assert_eq!(
             crop_attributes(Some(&full)),
@@ -550,6 +551,7 @@ mod tests {
             rotation_degrees: 0.0,
             aspect: None,
             aspect_flipped: false,
+            quarter_turns: 0,
         };
         let attrs: std::collections::HashMap<_, _> =
             crop_attributes(Some(&crop)).into_iter().collect();
@@ -567,6 +569,7 @@ mod tests {
             rotation_degrees: -3.5,
             aspect: Some(edit_core::Aspect::ThreeTwo),
             aspect_flipped: false,
+            quarter_turns: 0,
         };
         let attrs: std::collections::HashMap<_, _> =
             crop_attributes(Some(&crop)).into_iter().collect();
@@ -578,11 +581,37 @@ mod tests {
             rotation_degrees: 2.0,
             aspect: None,
             aspect_flipped: false,
+            quarter_turns: 0,
         };
         let attrs: std::collections::HashMap<_, _> =
             crop_attributes(Some(&tilted)).into_iter().collect();
         assert_eq!(attrs["HasCrop"], "True");
         assert_eq!(attrs["CropAngle"], "2");
+    }
+
+    #[test]
+    fn quarter_turns_stay_out_of_the_sidecar_but_the_region_stays_right() {
+        // Top-left 0.5 x 0.25 of the photo, seen after one clockwise turn.
+        let turned = Crop {
+            rect: Rect::new(0.75, 0.0, 0.25, 0.5),
+            quarter_turns: 1,
+            ..Crop::default()
+        };
+        let attrs: std::collections::HashMap<_, _> =
+            crop_attributes(Some(&turned)).into_iter().collect();
+        assert_eq!(attrs["HasCrop"], "True");
+        assert_eq!(attrs["CropLeft"], "0");
+        assert_eq!(attrs["CropRight"], "0.5");
+        assert_eq!(attrs["CropBottom"], "0.25");
+        // A bare turn crops nothing in the file's own frame.
+        let bare = Crop {
+            quarter_turns: 2,
+            ..Crop::default()
+        };
+        assert_eq!(
+            crop_attributes(Some(&bare)),
+            vec![("HasCrop".to_owned(), "False".to_owned())]
+        );
     }
 
     #[test]

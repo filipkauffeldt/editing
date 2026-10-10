@@ -109,6 +109,31 @@ fn bgra_image(mut rgba: image::RgbaImage) -> Arc<RenderImage> {
     Arc::new(RenderImage::new([image::Frame::new(rgba)]))
 }
 
+/// The crop JSON an item's edit holds: an edit not yet in the catalog wins
+/// over the row. `None` is uncropped (or unreadable).
+fn stored_crop_json(catalog: &Catalog, unsaved: Option<EditJson>, item_id: i64) -> Option<String> {
+    match unsaved {
+        Some(edit) => edit.crop,
+        None => catalog.get_edit(item_id).ok().flatten()?.crop_json,
+    }
+}
+
+/// A camera preview for display, cut to `crop_json` when it holds a crop
+/// (cropped, straightened and turned), with its long edge at most `edge`.
+fn view_of(path: &Path, crop_json: Option<&str>, edge: u32) -> Option<image::RgbaImage> {
+    let crop = crop_json
+        .and_then(|json| serde_json::from_str::<Crop>(json).ok())
+        .filter(|crop| !crop.is_identity());
+    let Some(crop) = crop else {
+        return BrowsePreviewProvider::decode_preview(path, Some(edge));
+    };
+    // Decode large enough that the frame, not the whole photo, has `edge`.
+    let share = crop.rect.w.max(crop.rect.h).max(0.05) as f64;
+    let decode = ((edge as f64 / share).ceil() as u32).clamp(edge, 4096);
+    let full = BrowsePreviewProvider::decode_preview(path, Some(decode))?;
+    Some(edit_render::straighten::crop_preview(&full, &crop, edge))
+}
+
 gpui_kit::actions!(
     browser,
     [
@@ -135,6 +160,8 @@ gpui_kit::actions!(
         ApplyCrop,
         CancelCrop,
         FlipCrop,
+        RotateCropLeft,
+        RotateCropRight,
         CopySettings,
         PasteSettings,
         ApplyPrevious,
@@ -199,6 +226,11 @@ pub struct Browser {
     thumbs: HashMap<i64, Arc<RenderImage>>,
     thumb_order: VecDeque<i64>,
     thumb_pending: HashSet<i64>,
+    /// The crop JSON each cached thumbnail was cut with, so a changed crop
+    /// is noticed. Entries leave with the thumbnail.
+    thumb_crops: HashMap<i64, Option<String>>,
+    /// Items whose crop changed while their thumbnail was being cut.
+    thumb_stale: HashSet<i64>,
     /// Queue thumb job id → photo path, resolved from the job payload on
     /// `Started` so progress/completion can mark the right cell.
     thumb_jobs: HashMap<JobId, String>,
@@ -254,6 +286,8 @@ pub struct Browser {
     previews: HashMap<i64, Arc<RenderImage>>,
     preview_order: VecDeque<i64>,
     preview_pending: HashSet<i64>,
+    preview_crops: HashMap<i64, Option<String>>,
+    preview_stale: HashSet<i64>,
     /// Whether the develop buffer holds unsaved slider changes.
     develop_dirty: bool,
     /// Diagnostics for the develop panel status line.
@@ -270,6 +304,10 @@ pub struct Browser {
     /// The uncropped render crop mode paints, and the same image ready to
     /// paint; a small copy of it is what a moving angle turns.
     crop_base: Option<Arc<image::RgbaImage>>,
+    /// Clockwise quarter turns the crop canvas image has had applied (the render's own plus later rotates).
+    crop_base_turns: u8,
+    /// Quarter turns the uncropped crop-mode render was asked to carry.
+    crop_render_turns: u8,
     crop_base_image: Option<Arc<RenderImage>>,
     crop_small: Option<Arc<image::RgbaImage>>,
     /// Newest straighten request for the background worker.
@@ -334,6 +372,8 @@ impl Browser {
             KeyBinding::new("enter", ApplyCrop, Some("!Input")),
             KeyBinding::new("escape", CancelCrop, Some("!Input")),
             KeyBinding::new("x", FlipCrop, Some("!Input")),
+            KeyBinding::new("shift-r", RotateCropLeft, Some("!Input")),
+            KeyBinding::new("r", RotateCropRight, Some("!Input")),
             KeyBinding::new("ctrl-c", CopySettings, Some("!Input")),
             KeyBinding::new("ctrl-v", PasteSettings, Some("!Input")),
             KeyBinding::new("ctrl-alt-v", ApplyPrevious, Some("!Input")),
@@ -358,6 +398,8 @@ impl Browser {
             thumbs: HashMap::new(),
             thumb_order: VecDeque::new(),
             thumb_pending: HashSet::new(),
+            thumb_crops: HashMap::new(),
+            thumb_stale: HashSet::new(),
             thumb_jobs: HashMap::new(),
             meta_jobs: HashMap::new(),
             ingest_jobs: HashMap::new(),
@@ -384,6 +426,8 @@ impl Browser {
             previews: HashMap::new(),
             preview_order: VecDeque::new(),
             preview_pending: HashSet::new(),
+            preview_crops: HashMap::new(),
+            preview_stale: HashSet::new(),
             develop_dirty: false,
             develop_status: String::new(),
             crop: None,
@@ -392,6 +436,8 @@ impl Browser {
             straightened_image: false,
             crop_frame: Rc::new(Cell::new(None)),
             crop_base: None,
+            crop_base_turns: 0,
+            crop_render_turns: 0,
             crop_base_image: None,
             crop_small: None,
             crop_turn: Latest::default(),
@@ -441,6 +487,14 @@ impl Browser {
     /// Number of display rows after filter/sort.
     pub fn row_count(&self) -> usize {
         self.rows.len()
+    }
+
+    /// Pixel size `(width, height)` of an item's cached thumbnail, for tests.
+    pub fn thumb_size(&self, item_id: i64) -> Option<(u32, u32)> {
+        self.thumbs.get(&item_id).map(|image| {
+            let size = image.size(0);
+            (size.width.0 as u32, size.height.0 as u32)
+        })
     }
 
     /// Thumbnail state of one display item, for tests and badges.
@@ -1076,31 +1130,77 @@ impl Browser {
     /// queued. Reads and decodes off-thread; the entity inserts the frame
     /// and re-renders on completion.
     fn request_thumb(&mut self, cx: &mut Context<Self>, item_id: i64, path: String) {
-        if self.thumbs.contains_key(&item_id) || !self.thumb_pending.insert(item_id) {
+        if self.thumbs.contains_key(&item_id) {
             return;
         }
+        self.spawn_thumb(cx, item_id, path);
+    }
+
+    /// Cut one thumbnail off-thread, from the camera preview and the item's
+    /// stored crop. The crop it was cut with is remembered with it.
+    fn spawn_thumb(&mut self, cx: &mut Context<Self>, item_id: i64, path: String) {
+        if !self.thumb_pending.insert(item_id) {
+            return;
+        }
+        let catalog = Arc::clone(&self.catalog);
+        let unsaved = self.unsaved.get(&item_id).cloned();
         cx.spawn(async move |this, cx| {
-            let rgba = cx
+            let retry = path.clone();
+            let built = cx
                 .background_executor()
                 .spawn(async move {
-                    BrowsePreviewProvider::decode_preview(Path::new(&path), Some(THUMB_LONG_EDGE))
+                    let crop = stored_crop_json(&catalog, unsaved, item_id);
+                    let image = view_of(Path::new(&path), crop.as_deref(), THUMB_LONG_EDGE)?;
+                    Some((image, crop))
                 })
                 .await;
-            if let Some(rgba) = rgba {
-                this.update(cx, |this, cx| {
-                    this.insert_thumb(item_id, rgba);
-                    cx.notify();
-                })
-                .ok();
-            } else {
-                this.update(cx, |this, cx| {
-                    this.thumb_pending.remove(&item_id);
-                    cx.notify();
-                })
-                .ok();
-            }
+            this.update(cx, |this, cx| {
+                match built {
+                    Some((rgba, crop)) => {
+                        this.insert_thumb(item_id, rgba);
+                        this.thumb_crops.insert(item_id, crop);
+                    }
+                    None => {
+                        this.thumb_pending.remove(&item_id);
+                    }
+                }
+                // The crop changed while this one was being cut.
+                if this.thumb_stale.remove(&item_id) {
+                    this.spawn_thumb(cx, item_id, retry);
+                }
+                cx.notify();
+            })
+            .ok();
         })
         .detach();
+    }
+
+    /// A stored edit landed with this crop. A cached thumbnail or preview cut
+    /// with another crop is cut again; the old one stays up until the new
+    /// one is ready, and nothing runs while the crop is only being dragged.
+    fn note_crop_written(&mut self, item_id: i64, crop: &Option<String>, cx: &mut Context<Self>) {
+        let Some(path) = self
+            .items
+            .iter()
+            .find(|row| row.item_id == item_id)
+            .map(|row| row.display_path.clone())
+        else {
+            return;
+        };
+        if self.thumb_pending.contains(&item_id) {
+            self.thumb_stale.insert(item_id);
+        } else if self.thumbs.contains_key(&item_id) && self.thumb_crops.get(&item_id) != Some(crop)
+        {
+            self.spawn_thumb(cx, item_id, path.clone());
+        }
+        if self.preview_pending.contains(&item_id) {
+            self.preview_stale.insert(item_id);
+        } else if self.previews.contains_key(&item_id)
+            && self.preview_crops.get(&item_id) != Some(crop)
+        {
+            self.spawn_preview(cx, item_id, path);
+        }
+        cx.notify();
     }
 
     /// Insert a decoded frame, evicting the oldest entries past the cap.
@@ -1112,6 +1212,7 @@ impl Browser {
             && let Some(old) = self.thumb_order.pop_front()
         {
             self.thumbs.remove(&old);
+            self.thumb_crops.remove(&old);
         }
         if let Some(pos) = self.thumb_order.iter().position(|id| *id == item_id) {
             self.thumb_order.remove(pos);
@@ -1124,29 +1225,50 @@ impl Browser {
     /// Decode the camera preview at single-view size off-thread, unless
     /// cached or already queued.
     fn request_preview(&mut self, cx: &mut Context<Self>, item_id: i64, path: String) {
-        if self.previews.contains_key(&item_id) || !self.preview_pending.insert(item_id) {
+        if self.previews.contains_key(&item_id) {
             return;
         }
+        self.spawn_preview(cx, item_id, path);
+    }
+
+    /// The camera preview of one item, cut to its stored crop.
+    fn spawn_preview(&mut self, cx: &mut Context<Self>, item_id: i64, path: String) {
+        if !self.preview_pending.insert(item_id) {
+            return;
+        }
+        let catalog = Arc::clone(&self.catalog);
+        let unsaved = self.unsaved.get(&item_id).cloned();
         cx.spawn(async move |this, cx| {
-            let rgba = cx
+            let retry = path.clone();
+            let built = cx
                 .background_executor()
                 .spawn(async move {
-                    BrowsePreviewProvider::decode_preview(
+                    let crop = stored_crop_json(&catalog, unsaved, item_id);
+                    let image = view_of(
                         Path::new(&path),
-                        Some(PROXY_RELEASE_LONG_EDGE as u32),
-                    )
+                        crop.as_deref(),
+                        PROXY_RELEASE_LONG_EDGE as u32,
+                    )?;
+                    Some((image, crop))
                 })
                 .await;
             this.update(cx, |this, cx| {
                 this.preview_pending.remove(&item_id);
-                if let Some(rgba) = rgba {
-                    if this.previews.len() >= PREVIEW_CACHE_CAP
+                if let Some((rgba, crop)) = built {
+                    if !this.previews.contains_key(&item_id)
+                        && this.previews.len() >= PREVIEW_CACHE_CAP
                         && let Some(old) = this.preview_order.pop_front()
                     {
                         this.previews.remove(&old);
+                        this.preview_crops.remove(&old);
                     }
+                    this.preview_order.retain(|id| *id != item_id);
                     this.preview_order.push_back(item_id);
                     this.previews.insert(item_id, bgra_image(rgba));
+                    this.preview_crops.insert(item_id, crop);
+                }
+                if this.preview_stale.remove(&item_id) {
+                    this.spawn_preview(cx, item_id, retry);
                 }
                 cx.notify();
             })
@@ -1406,6 +1528,7 @@ impl Browser {
         {
             Ok(()) => {
                 self.unsaved.remove(&item);
+                self.note_crop_written(item, &json.crop, cx);
                 self.write_sidecar(item, json, cx);
             }
             Err(e) => {
@@ -1753,6 +1876,7 @@ impl Browser {
     /// item (review M1).
     fn persist_current_edit(&mut self, cx: &mut Context<Self>) {
         for (item_id, edit) in self.commit_catalog() {
+            self.note_crop_written(item_id, &edit.crop, cx);
             self.write_sidecar(item_id, edit, cx);
         }
         cx.notify();
@@ -2464,6 +2588,12 @@ impl Render for Browser {
                     }))
                     .on_action(cx.listener(|this, _: &FlipCrop, _, cx| {
                         this.flip_crop_orientation(cx);
+                    }))
+                    .on_action(cx.listener(|this, _: &RotateCropLeft, _, cx| {
+                        this.rotate_crop(false, cx);
+                    }))
+                    .on_action(cx.listener(|this, _: &RotateCropRight, _, cx| {
+                        this.rotate_crop(true, cx);
                     }))
                     .on_action(cx.listener(|this, _: &ToggleView, _, cx| {
                         this.finish_crop(true, cx);

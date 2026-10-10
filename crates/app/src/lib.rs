@@ -19,6 +19,7 @@ pub mod panel;
 pub mod preset_store;
 pub mod preview;
 pub mod sidebar;
+pub mod slider_row;
 pub mod smart;
 pub mod templates;
 pub mod transfer;
