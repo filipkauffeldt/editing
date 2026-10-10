@@ -54,6 +54,26 @@ pub enum PanelEvent {
     ExportPreset,
     /// Pick the folder presets are kept in.
     ChoosePresetFolder,
+    /// Open the copy dialog for the current photo.
+    CopySettings,
+    PasteSettings,
+    /// Apply the last applied groups again.
+    ApplyPrevious,
+    /// Open the sync dialog for the selection.
+    SyncSettings,
+    /// Stop applying settings to the selection.
+    StopApplying,
+}
+
+/// Which settings transfer commands can run now.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct TransferAvailability {
+    pub copy: bool,
+    pub paste: bool,
+    pub previous: bool,
+    pub sync: bool,
+    /// A run is applying settings to the selection.
+    pub running: bool,
 }
 
 /// One line of the preset list.
@@ -161,6 +181,7 @@ pub struct DevelopPanel {
     /// The preset last picked from the list.
     picked: Option<SharedString>,
     menu_open: bool,
+    transfer: TransferAvailability,
     menu_focus: Option<FocusHandle>,
     wb_select: Option<Entity<SelectState<SearchableVec<WbEntry>>>>,
     name_input: Option<Entity<InputState>>,
@@ -190,6 +211,7 @@ impl DevelopPanel {
             preset_select: None,
             picked: None,
             menu_open: false,
+            transfer: TransferAvailability::default(),
             menu_focus: None,
             wb_select: None,
             name_input: None,
@@ -235,6 +257,14 @@ impl DevelopPanel {
             });
         }
         if changed {
+            cx.notify();
+        }
+    }
+
+    /// Which transfer commands the menu enables.
+    pub fn set_transfer(&mut self, transfer: TransferAvailability, cx: &mut Context<Self>) {
+        if self.transfer != transfer {
+            self.transfer = transfer;
             cx.notify();
         }
     }
@@ -475,6 +505,7 @@ impl DevelopPanel {
             .as_ref()
             .is_some_and(|key| key.starts_with("user:"));
         let editable = self.editable;
+        let transfer = self.transfer;
         let focus = self.menu_focus.clone();
         let open_focus = focus.clone();
         Popover::new("develop-preset-menu")
@@ -526,6 +557,38 @@ impl DevelopPanel {
                     .when_some(focus.clone(), |list, handle| list.track_focus(&handle))
                     .w_48()
                     .gap(spacing.xs)
+                    .child(item(
+                        "develop-copy-settings",
+                        "Copy settings…",
+                        transfer.copy,
+                        PanelEvent::CopySettings,
+                    ))
+                    .child(item(
+                        "develop-paste-settings",
+                        "Paste settings",
+                        transfer.paste,
+                        PanelEvent::PasteSettings,
+                    ))
+                    .child(item(
+                        "develop-apply-previous",
+                        "Apply previous",
+                        transfer.previous,
+                        PanelEvent::ApplyPrevious,
+                    ))
+                    .child(item(
+                        "develop-sync-settings",
+                        "Sync to selection…",
+                        transfer.sync,
+                        PanelEvent::SyncSettings,
+                    ))
+                    .when(transfer.running, |list| {
+                        list.child(item(
+                            "develop-stop-applying",
+                            "Stop applying",
+                            true,
+                            PanelEvent::StopApplying,
+                        ))
+                    })
                     .child(item(
                         "develop-preset-import",
                         "Import presets…",
